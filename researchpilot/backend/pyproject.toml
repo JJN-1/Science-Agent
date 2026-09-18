@@ -1,0 +1,25 @@
+[project]
+name = "researchpilot-backend"
+version = "0.1.0"
+description = "ResearchPilot backend - 科研全链路多 Agent 系统"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
+    "sqlalchemy>=2.0",
+    "alembic>=1.13",
+    "pydantic>=2.7",
+    "pyyaml>=6.0",
+    "platformdirs>=4.2",
+    "structlog>=24.1",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.2",
+    "httpx>=0.27",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
