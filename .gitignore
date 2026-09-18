@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+.pytest_cache/
+
+# Node
+node_modules/
+frontend/dist/
+
+# 数据与日志
+*.db
+*.db-wal
+*.db-shm
+logs/
+
+# 临时脚本与产物
+tmp/
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
