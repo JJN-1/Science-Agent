@@ -18,6 +18,9 @@ logs/
 # 临时脚本与产物
 tmp/
 
+# Command Code 本地状态
+.commandcode/
+
 # IDE / OS
 .idea/
 .vscode/
