@@ -109,10 +109,49 @@ class Orchestrator:
 
     def run_pipeline(self, session: Session, project_id: int,
                      stage_ids: list[str] | None = None) -> list[int]:
-        """顺序调度：按 STAGE_ORDER 执行已注册的阶段，任一失败即中断。"""
-        ids = stage_ids or STAGE_ORDER
+        """顺序调度：按 STAGE_ORDER 执行已注册的阶段。
+
+        任一阶段抛错即向上传播；遇 ``paused``（预算熔断）则**立即中断**，并把
+        后续阶段标记为 ``skipped``（FIX-07）。旧实现会带着一个未决审批继续往下跑，
+        堆出一串暂停与审批，治理语义完全失效。
+        """
+        ids = list(stage_ids or STAGE_ORDER)
         run_ids: list[int] = []
-        for stage_id in ids:
-            if self.registry.has(stage_id):
-                run_ids.append(self.run_stage(session, project_id, stage_id))
+        for index, stage_id in enumerate(ids):
+            if not self.registry.has(stage_id):
+                continue
+            run_id = self.run_stage(session, project_id, stage_id)
+            run_ids.append(run_id)
+            run = runs_dao.get_run(session, run_id)
+            if run is not None and run.status == "paused":
+                self._skip_remaining(
+                    session, project_id, ids[index + 1:],
+                    paused_stage_id=stage_id, paused_run_id=run_id,
+                )
+                break
         return run_ids
+
+    def _skip_remaining(self, session: Session, project_id: int,
+                        remaining: list[str], *, paused_stage_id: str,
+                        paused_run_id: int) -> None:
+        """把暂停点之后的阶段标记为 skipped，并留一条决策日志说明原因。"""
+        skipped = [sid for sid in remaining if self.registry.has(sid)]
+        if not skipped:
+            return
+        for stage_id in skipped:
+            checkpoint_dao.save_checkpoint(
+                session, project_id=project_id, stage_id=stage_id, status="skipped",
+                snapshot={
+                    "stage_id": stage_id,
+                    "reason": "上游阶段暂停（paused），未执行",
+                    "paused_stage_id": paused_stage_id,
+                    "paused_run_id": paused_run_id,
+                },
+            )
+        decisions_dao.add(
+            session, project_id=project_id, run_id=paused_run_id,
+            stage_id=paused_stage_id, agent_id=self.registry.get(paused_stage_id).agent_id,
+            decision=f"{paused_stage_id} 暂停，跳过后续 {len(skipped)} 个阶段",
+            reason="预算熔断需人工审批，避免连环暂停",
+            decided_by="system",
+        )

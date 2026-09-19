@@ -102,6 +102,37 @@ def test_run_pipeline_executes_in_order(session, orchestrator):
     assert versions == [1, 1, 2, 3, 4, 5, 6, 7]
 
 
+def test_run_pipeline_stops_on_paused_and_skips_rest(session, gateway):
+    """FIX-07：一次预算熔断只产生 1 条审批，后续阶段标记 skipped。
+
+    修复前 pipeline 会带着未决审批继续往下跑，堆出一串暂停与审批，
+    治理语义（一次熔断 = 一次决策）完全失效。
+    """
+    from app.store.dao import agents as agents_dao
+    from app.store.dao import approvals as approvals_dao
+
+    registry = StageRegistry()
+    register_all(registry)
+    orchestrator = Orchestrator(registry, gateway)
+    project = projects_dao.create(session, title="pipeline 暂停")
+    agents_dao.upsert(session, agent_id="scout", name="Scout", tier="plan",
+                      budget_steps=0, budget_cost=100.0)
+    session.flush()
+
+    run_ids = orchestrator.run_pipeline(session, project.id)
+    assert len(run_ids) == 1  # S1 暂停即中断
+    assert runs_dao.get_run(session, run_ids[0]).status == "paused"
+    assert len(approvals_dao.list_by_status(session, project_id=project.id)) == 1
+
+    statuses = {c.stage_id: c.status for c in cp_dao.list_for_project(session, project.id)}
+    assert statuses["S1"] == "paused"
+    for stage_id in ("S2", "S3", "S4", "S5", "S6", "S7", "S8"):
+        assert statuses[stage_id] == "skipped"
+
+    rows = decisions_dao.list_for_project(session, project.id)
+    assert any("跳过后续" in r.decision for r in rows)
+
+
 def test_budget_exceeded_pauses_run_and_creates_approval(session, gateway):
     """US-205：Agent 级步数熔断 → run 暂停 + 审批请求。"""
     from app.store.dao import agents as agents_dao
