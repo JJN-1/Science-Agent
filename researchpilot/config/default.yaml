@@ -4,3 +4,28 @@ app:
 
 log:
   level: INFO
+
+# ── AI 接入层（方案 §8）────────────────────────
+# 默认指向 mock provider：零配置首启即可演示完整治理链路。
+# 配置真实模型：在设置界面录入 Key（写入 Windows 凭据管理器），
+# 或在用户 config.yaml 增加 openai_compat 类型 provider 并调整 routing。
+ai:
+  providers:
+    mock:
+      type: mock
+      model: mock-small
+      vendor: mock
+      capabilities: [json_object]
+      price_per_1k: {input: 0.0, output: 0.0}
+  routing:
+    extract:    [{provider: mock, model: mock-small}]
+    plan:       [{provider: mock, model: mock-small}]
+    critique:   [{provider: mock, model: mock-small}]
+    synthesize: [{provider: mock, model: mock-small}]
+    write:      [{provider: mock, model: mock-small}]
+  budget:
+    project_total: 50.0   # 单项目总额（元）
+    project_daily: 10.0   # 单项目每日额度（元）
+  circuit:
+    failure_threshold: 5  # 连续失败次数 → 熔断
+    cooldown_seconds: 300 # 冷却时长（秒）

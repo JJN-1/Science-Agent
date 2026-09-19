@@ -1,0 +1,47 @@
+from __future__ import annotations
+
+from app.ai.base import (
+    ChatProvider,
+    ChatRequest,
+    ChatResponse,
+    ProviderUnavailable,
+    QuotaExceeded,
+    RateLimited,
+)
+
+
+class MockProvider(ChatProvider):
+    """确定性假模型：驱动测试与零配置首启，可配置失败与延迟。"""
+
+    def __init__(self, name: str, cfg: dict) -> None:
+        self.name = name
+        self.model = cfg.get("model", "mock-small")
+        self.vendor = cfg.get("vendor", "mock")
+        self.capabilities = frozenset(cfg.get("capabilities", ["json_object"]))
+        self.price = cfg.get("price_per_1k", {"input": 0.0, "output": 0.0})
+        self._healthy = cfg.get("healthy", True)
+        self._fail_times = int(cfg.get("fail_times", 0))
+        self._fail_with = cfg.get("fail_with", "unavailable")  # unavailable|rate_limited|quota
+        self._latency_ms = int(cfg.get("latency_ms", 0))
+        self._response = cfg.get("response", '{"items": []}')
+        self._calls = 0
+
+    def complete(self, request: ChatRequest) -> ChatResponse:
+        self._calls += 1
+        if self._calls <= self._fail_times:
+            if self._fail_with == "rate_limited":
+                raise RateLimited(f"{self.name} rate limited")
+            if self._fail_with == "quota":
+                raise QuotaExceeded(f"{self.name} quota exceeded")
+            raise ProviderUnavailable(f"{self.name} unavailable")
+        return ChatResponse(
+            text=self._response,
+            provider=self.name,
+            model=self.model,
+            prompt_tokens=len(" ".join(m.content for m in request.messages)) // 4,
+            completion_tokens=len(self._response) // 4,
+            latency_ms=self._latency_ms,
+        )
+
+    def health(self) -> bool:
+        return self._healthy
