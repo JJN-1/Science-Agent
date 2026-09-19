@@ -7,7 +7,14 @@ interface CommandBarProps {
   onRun: (stageId: string) => void
 }
 
-/** 底部命令行：输入 run S1 或点阶段建议 chip 触发阶段 */
+/** 占位阶段的提示文案（US-307），SessionPage 复用。 */
+export function placeholderHint(stage: StageInfo): string {
+  return stage.planned_sprint
+    ? `占位实现，Sprint ${stage.planned_sprint} 交付`
+    : '占位实现，尚未排期'
+}
+
+/** 底部命令行：输入 run S1 或点阶段建议 chip 触发阶段；占位阶段置灰不可点 */
 export default function CommandBar({ stages, disabled, onRun }: CommandBarProps) {
   const [value, setValue] = useState('')
 
@@ -33,10 +40,10 @@ export default function CommandBar({ stages, disabled, onRun }: CommandBarProps)
           {stages.map((s) => (
             <button
               key={s.stage_id}
-              className="chip"
-              disabled={disabled}
+              className={s.implemented ? 'chip' : 'chip chip-placeholder'}
+              disabled={disabled || !s.implemented}
               onClick={() => onRun(s.stage_id)}
-              title={s.description}
+              title={s.implemented ? s.description : placeholderHint(s)}
             >
               {s.stage_id} {s.name}
             </button>

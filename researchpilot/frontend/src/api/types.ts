@@ -13,6 +13,8 @@ export interface StageInfo {
   agent_id: string
   name: string
   description: string
+  implemented: boolean
+  planned_sprint: number | null
 }
 
 export interface AgentStep {

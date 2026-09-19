@@ -35,6 +35,8 @@ class StageOut(BaseModel):
     agent_id: str
     name: str
     description: str
+    implemented: bool
+    planned_sprint: int | None = None
 
 
 class RunOut(BaseModel):

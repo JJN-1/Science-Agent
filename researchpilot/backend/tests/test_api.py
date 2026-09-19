@@ -38,6 +38,23 @@ def test_health(client):
     assert resp.json() == {"status": "ok"}
 
 
+def test_stages_expose_implementation_marker(client):
+    """US-307：/api/stages 必须暴露 implemented / planned_sprint，
+    否则前端无法区分「真实阶段」与「占位阶段」，会把占位结果当成正式产出。
+    """
+    stages = client.get("/api/stages").json()
+    assert len(stages) == 8
+
+    by_id = {s["stage_id"]: s for s in stages}
+    assert by_id["S1"]["implemented"] is True
+    assert by_id["S1"]["planned_sprint"] is None
+
+    for stage_id, planned in [("S2", 6), ("S3", 7), ("S4", 8),
+                              ("S5", 9), ("S6", 10), ("S7", 11), ("S8", 11)]:
+        assert by_id[stage_id]["implemented"] is False, stage_id
+        assert by_id[stage_id]["planned_sprint"] == planned, stage_id
+
+
 def test_project_stage_run_trajectory_flow(client):
     created = client.post("/api/projects", json={"title": "接口演示", "goal": "G"})
     assert created.status_code == 201

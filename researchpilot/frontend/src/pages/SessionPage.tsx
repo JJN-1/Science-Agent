@@ -12,7 +12,7 @@ import type {
 } from '../api/types'
 import ApprovalCard from '../components/ApprovalCard'
 import RunBlock from '../components/RunBlock'
-import CommandBar from '../components/CommandBar'
+import CommandBar, { placeholderHint } from '../components/CommandBar'
 
 interface SysEvent {
   id: number
@@ -74,8 +74,15 @@ export default function SessionPage() {
 
   const handleRun = async (stageId: string) => {
     if (runningStage) return
-    if (stageId === '?' || !stages.some((s) => s.stage_id === stageId)) {
+    const target = stages.find((s) => s.stage_id === stageId)
+    if (stageId === '?' || !target) {
       setSysEvents((evts) => [...evts, { id: sysSeq, text: `未知命令，试试：run ${stages[0]?.stage_id ?? 'S1'}` }])
+      setSysSeq((n) => n + 1)
+      return
+    }
+    // US-307：占位阶段不可直接运行，避免占位实现被当成已有能力
+    if (!target.implemented) {
+      setSysEvents((evts) => [...evts, { id: sysSeq, text: `${target.stage_id} ${target.name}：${placeholderHint(target)}` }])
       setSysSeq((n) => n + 1)
       return
     }

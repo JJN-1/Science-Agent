@@ -581,6 +581,18 @@ a:hover {
   border-color: var(--accent);
   color: var(--accent);
 }
+/* 占位阶段（US-307）：虚线边框 + 降透明度，且不响应 hover 强调 */
+.chip-placeholder {
+  border-style: dashed;
+}
+.chip:disabled {
+  cursor: not-allowed;
+  opacity: 0.45;
+}
+.chip:disabled:hover {
+  border-color: var(--border-strong);
+  color: var(--dim);
+}
 .chip:focus-visible,
 .btn:focus-visible,
 .side-item:focus-visible {

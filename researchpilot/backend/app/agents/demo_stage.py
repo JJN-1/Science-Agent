@@ -6,16 +6,17 @@ from app.orchestration.base import BlackboardWrite, StageAgent
 from app.orchestration.orchestrator import StageRegistry
 from app.store.dao import projects as projects_dao
 
-# 8 个阶段：S1 已接入真实模型调用（Sprint 2 演示路径），S2–S8 为占位实现
+# 8 个阶段：(stage_id, agent_id, name, description, implemented, planned_sprint)
+# S1 已接入真实模型调用；S2–S8 为占位实现，planned_sprint 为计划交付冲刺（US-307）
 STAGE_DEFS = [
-    ("S1", "scout", "选题发现", "扫描领域图谱寻找空白点，生成候选研究问题"),
-    ("S2", "librarian", "文献综述", "多源检索、解析、精读卡片与带溯源问答"),
-    ("S3", "formalizer", "假设形式化", "候选问题转化为可证伪假设与变量表"),
-    ("S4", "designer", "实验设计", "实验方案、对照组与样本量估算"),
-    ("S5", "executor", "执行采集", "条件执行：真实跑实验或交付方案包"),
-    ("S6", "analyst", "分析解读", "统计检验、图表与结果对比"),
-    ("S7", "writer", "写作成稿", "带证据锚点的结构化草稿"),
-    ("S8", "publisher", "投稿复现", "期刊匹配、复现包打包与校验"),
+    ("S1", "scout", "选题发现", "扫描领域图谱寻找空白点，生成候选研究问题", True, None),
+    ("S2", "librarian", "文献综述", "多源检索、解析、精读卡片与带溯源问答", False, 6),
+    ("S3", "formalizer", "假设形式化", "候选问题转化为可证伪假设与变量表", False, 7),
+    ("S4", "designer", "实验设计", "实验方案、对照组与样本量估算", False, 8),
+    ("S5", "executor", "执行采集", "条件执行：真实跑实验或交付方案包", False, 9),
+    ("S6", "analyst", "分析解读", "统计检验、图表与结果对比", False, 10),
+    ("S7", "writer", "写作成稿", "带证据锚点的结构化草稿", False, 11),
+    ("S8", "publisher", "投稿复现", "期刊匹配、复现包打包与校验", False, 11),
 ]
 
 QUESTIONS_SCHEMA = {
@@ -39,11 +40,16 @@ QUESTIONS_SCHEMA = {
 
 
 class DemoStage(StageAgent):
-    def __init__(self, stage_id: str, agent_id: str, name: str, description: str) -> None:
+    """占位阶段：产出占位黑板对象后即完成，`implemented=False` 供界面置灰。"""
+
+    def __init__(self, stage_id: str, agent_id: str, name: str, description: str,
+                 planned_sprint: int | None = None) -> None:
         self.stage_id = stage_id
         self.agent_id = agent_id
         self.name = name
         self.description = description
+        self.implemented = False
+        self.planned_sprint = planned_sprint
 
     def run(self, ctx) -> list[BlackboardWrite]:  # noqa: ANN001
         ctx.think(f"[{self.stage_id} {self.name}] 占位阶段运行：{self.description}")
@@ -113,8 +119,11 @@ class ScoutStage(StageAgent):
 
 
 def register_all(registry: StageRegistry) -> None:
-    for stage_id, agent_id, name, description in STAGE_DEFS:
-        if stage_id == "S1":
+    for stage_id, agent_id, name, description, implemented, planned_sprint in STAGE_DEFS:
+        if implemented:
             registry.register(ScoutStage())
         else:
-            registry.register(DemoStage(stage_id, agent_id, name, description))
+            registry.register(
+                DemoStage(stage_id, agent_id, name, description,
+                          planned_sprint=planned_sprint)
+            )

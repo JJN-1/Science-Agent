@@ -20,6 +20,10 @@ class StageAgent(ABC):
     agent_id: str
     name: str
     description: str = ""
+    # 是否为真实实现。False 表示占位阶段，界面置灰并拒绝直接运行（US-307）。
+    implemented: bool = True
+    # 占位阶段的计划交付冲刺编号，供界面提示「Sprint N 交付」。
+    planned_sprint: int | None = None
 
     @abstractmethod
     def run(self, ctx) -> list[BlackboardWrite]:  # noqa: ANN001

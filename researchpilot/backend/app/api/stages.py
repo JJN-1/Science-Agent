@@ -24,6 +24,8 @@ def list_stages(request: Request) -> list[StageOut]:
             agent_id=agent.agent_id,
             name=agent.name,
             description=agent.description,
+            implemented=agent.implemented,
+            planned_sprint=agent.planned_sprint,
         )
         for agent in orchestrator.registry.all()
     ]
