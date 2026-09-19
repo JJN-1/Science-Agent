@@ -118,6 +118,8 @@ def test_providers_health(client):
     rows = client.get("/api/settings/providers").json()
     assert rows[0]["name"] == "mock"
     assert rows[0]["healthy"] is True
+    assert rows[0]["health"] == "ok"  # FIX-04：新增三态字段
+    assert rows[0]["detail"] is None
     assert "json_object" in rows[0]["capabilities"]
 
 

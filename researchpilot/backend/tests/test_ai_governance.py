@@ -2,8 +2,14 @@ from __future__ import annotations
 
 import pytest
 
-from app.ai.base import CircuitOpen, ProviderUnavailable
-from app.ai.registry import ProviderRegistry
+from app.ai.base import (
+    HEALTH_DOWN,
+    HEALTH_OK,
+    HEALTH_UNCONFIGURED,
+    CircuitOpen,
+    ProviderUnavailable,
+)
+from app.ai.registry import PROVIDER_TYPES, ProviderRegistry
 from app.ai.routing import RouteCandidate, RoutingError, Router
 from app.store.dao import agents as agents_dao
 from app.store.dao import approvals as approvals_dao
@@ -34,15 +40,79 @@ def _config(**provider_overrides) -> dict:
 
 # ── ProviderRegistry ─────────────────────────────
 
-def test_unhealthy_provider_excluded():
+def test_unhealthy_provider_kept_but_flagged():
+    """FIX-04：不健康的 provider 不再被静默剔除，而是保留并以健康状态标注。
+
+    旧行为是直接 `continue` 丢掉，于是 Router 紧接着报「引用了不存在的 provider」，
+    应用启动失败且错误指向错误方向。
+    """
     reg = ProviderRegistry.from_config(_config(healthy=False))
-    assert "a" not in reg.names()
-    assert reg.names() == ["b"]
+    assert reg.names() == ["a", "b"]  # 仍然在注册表里
+    report = {row["name"]: row for row in reg.health_report()}
+    assert report["a"]["health"] == HEALTH_DOWN
+    assert report["a"]["healthy"] is False
+    assert report["a"]["detail"]  # 带可操作提示
+    assert report["b"]["health"] == HEALTH_OK
+    with pytest.raises(ProviderUnavailable):
+        reg.check_available("a")  # 调用点才判定不可用
 
 
 def test_unknown_provider_type_rejected():
     with pytest.raises(ValueError, match="未知 provider 类型"):
         ProviderRegistry.from_config(_config(type="magic"))
+
+
+def test_openai_compat_provider_registered():
+    """FIX-01：真实模型 provider 必须能注册，否则配了真实模型应用直接起不来。"""
+    assert "openai_compat" in PROVIDER_TYPES
+    cfg = {
+        "ai": {
+            "providers": {
+                "deepseek": {
+                    "type": "openai_compat", "model": "deepseek-chat",
+                    "vendor": "deepseek", "base_url": "https://api.deepseek.com/v1",
+                    "api_key_ref": "deepseek",
+                }
+            },
+            "routing": {},
+        }
+    }
+    reg = ProviderRegistry.from_config(cfg)  # 不得抛异常
+    assert reg.names() == ["deepseek"]
+    row = reg.health_report()[0]
+    assert row["health"] == HEALTH_UNCONFIGURED  # 未录 Key 属于「待配置」而非「故障」
+    assert "API Key" in row["detail"]
+
+
+def test_openai_compat_config_to_router_integration(monkeypatch):
+    """FIX-01/04 集成：配置文件 → ProviderRegistry → Router 全链路。
+
+    这正是此前完全缺失、导致 P0-1 不可见的测试类型（所有测试都只用 mock）。
+    """
+    monkeypatch.setattr(
+        "app.ai.providers.openai_compat.keyring.get_password",
+        lambda svc, ref: None,  # 模拟「配置写好了但 Key 还没录」
+    )
+    cfg = {
+        "ai": {
+            "providers": {
+                "mock": {"type": "mock", "model": "m", "vendor": "mock",
+                         "capabilities": ["json_object"]},
+                "acme": {"type": "openai_compat", "model": "acme-1", "vendor": "acme",
+                         "base_url": "https://api.acme.test/v1", "api_key_ref": "acme"},
+            },
+            "routing": {
+                "extract": [{"provider": "mock", "model": "m"}],
+                "plan": [{"provider": "acme", "model": "acme-1"}],
+                "critique": [{"provider": "mock", "model": "m"}],
+                "synthesize": [{"provider": "mock", "model": "m"}],
+                "write": [{"provider": "mock", "model": "m"}],
+            },
+        }
+    }
+    reg = ProviderRegistry.from_config(cfg)
+    router = Router.from_config(cfg, reg.providers_map())  # 不得抛「不存在的 provider」
+    assert router.candidates("plan")[0].provider == "acme"
 
 
 def test_circuit_breaker_trips_and_recovers():
@@ -59,11 +129,20 @@ def test_circuit_breaker_trips_and_recovers():
     reg.check_available("a")
 
 
-def test_reload_replaces_providers():
+def test_reload_picks_up_config_changes():
+    """FIX-04 之后 health 不再决定 provider 的进出，热重载语义回归「跟随配置变化」。"""
     reg = ProviderRegistry.from_config(_config())
-    delta = reg.reload(_config(healthy=False))  # a 不健康被剔除，b 保留
+    assert reg.names() == ["a", "b"]
+
+    shrunk = _config()
+    shrunk["ai"]["providers"].pop("a")
+    delta = reg.reload(shrunk)
     assert reg.names() == ["b"]
-    assert delta["removed"] == ["a"]
+    assert delta == {"removed": ["a"], "added": []}
+
+    delta = reg.reload(_config())
+    assert reg.names() == ["a", "b"]
+    assert delta == {"removed": [], "added": ["a"]}
 
 
 def test_snapshot_freezes_models():

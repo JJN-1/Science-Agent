@@ -3,7 +3,16 @@ from __future__ import annotations
 import httpx
 import pytest
 
-from app.ai.base import ChatMessage, ChatRequest, ProviderError, ProviderUnavailable, RateLimited
+from app.ai.base import (
+    HEALTH_DOWN,
+    HEALTH_OK,
+    HEALTH_UNCONFIGURED,
+    ChatMessage,
+    ChatRequest,
+    ProviderError,
+    ProviderUnavailable,
+    RateLimited,
+)
 from app.ai.degrade import complete_with_degradation
 from app.ai.providers.openai_compat import OpenAICompatProvider
 
@@ -125,17 +134,58 @@ def test_response_format_only_with_capability():
 
 
 def test_health_ok_and_no_key(monkeypatch):
+    """FIX-04：健康三态——「没录 Key」是 unconfigured，不是 down。"""
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json={"data": []})
 
     monkeypatch.setattr(
         "app.ai.providers.openai_compat.keyring.get_password", lambda svc, ref: "sk"
     )
-    assert _provider(handler).health() is True
+    assert _provider(handler).health() == HEALTH_OK
+
     monkeypatch.setattr(
         "app.ai.providers.openai_compat.keyring.get_password", lambda svc, ref: None
     )
-    assert _provider(handler).health() is False
+    p = _provider(handler)
+    assert p.health() == HEALTH_UNCONFIGURED
+    assert "API Key" in p.unavailable_reason()  # 提示要能直接告诉用户怎么修
+
+
+def test_health_down_on_server_error():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(503, text="unavailable")
+
+    p = _provider(handler)
+    assert p.health() == HEALTH_DOWN
+    assert p.unavailable_reason()
+
+
+def test_health_down_on_network_error():
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("no route to host")
+
+    p = _provider(handler)
+    assert p.health() == HEALTH_DOWN
+
+
+def test_health_probe_cached_and_invalidated(monkeypatch):
+    """health() 每次真打网络会让设置页卡住数秒，因此结果要短期缓存。"""
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        return httpx.Response(200, json={"data": []})
+
+    monkeypatch.setattr(
+        "app.ai.providers.openai_compat.keyring.get_password", lambda svc, ref: "sk"
+    )
+    p = _provider(handler)
+    assert p.health() == HEALTH_OK
+    assert p.health() == HEALTH_OK
+    assert calls["n"] == 1  # 第二次命中缓存
+    p.invalidate_health()
+    p.health()
+    assert calls["n"] == 2
 
 
 # ── 降级链（US-202）────────────────────────────
@@ -174,6 +224,22 @@ def test_degrade_retry_with_error_then_success():
     assert resp.degraded == ["schema_prompt", "schema_retry"]
     assert calls["n"] == 2
     assert resp.text == '{"items": []}'
+
+
+def test_degrade_accepts_fenced_json_without_retry():
+    """FIX-06：带 ```json 围栏是正常输出，不该被判为校验失败而触发重试。"""
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        return httpx.Response(200, json=_ok('```json\n{"items": [1]}\n```'))
+
+    p = _provider(handler, capabilities=[])
+    resp = complete_with_degradation(
+        p, ChatRequest(messages=[ChatMessage(role="user", content="hi")], schema=SCHEMA)
+    )
+    assert calls["n"] == 1
+    assert "schema_retry" not in resp.degraded
 
 
 def test_degrade_double_failure_raises():

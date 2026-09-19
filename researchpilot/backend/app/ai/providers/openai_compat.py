@@ -7,6 +7,9 @@ import httpx
 import keyring
 
 from app.ai.base import (
+    HEALTH_DOWN,
+    HEALTH_OK,
+    HEALTH_UNCONFIGURED,
     ChatProvider,
     ChatRequest,
     ChatResponse,
@@ -14,11 +17,16 @@ from app.ai.base import (
     ProviderUnavailable,
     QuotaExceeded,
     RateLimited,
+    monotonic,
 )
 
 KEYRING_SERVICE = "ResearchPilot"
 
 RETRYABLE_STATUS = {429, 500, 502, 503, 504}
+
+# 健康探测结果缓存时长（秒）：health() 会发起真实网络请求，
+# 设置页每次打开都重新探测会让界面卡住数秒（§11.4 的轻量要求）。
+HEALTH_PROBE_TTL_S = 30.0
 
 
 class OpenAICompatProvider(ChatProvider):
@@ -41,9 +49,17 @@ class OpenAICompatProvider(ChatProvider):
         self.backoff_base = float(cfg.get("backoff_base", 1.0))
         self.api_key_ref = cfg.get("api_key_ref", name)
         self._transport = transport
+        self._health_cache: tuple[float, str] | None = None
+
+    def _peek_key(self) -> str | None:
+        """读取凭据；缺失或凭据后端不可用时返回 None，不抛异常。"""
+        try:
+            return keyring.get_password(KEYRING_SERVICE, self.api_key_ref) or None
+        except Exception:
+            return None
 
     def _api_key(self) -> str:
-        key = keyring.get_password(KEYRING_SERVICE, self.api_key_ref)
+        key = self._peek_key()
         if not key:
             raise ProviderUnavailable(
                 f"provider {self.name} 未配置 API Key（凭据管理器引用: {self.api_key_ref}）"
@@ -98,17 +114,46 @@ class OpenAICompatProvider(ChatProvider):
                 time.sleep(self.backoff_base * (2**attempt) + random.uniform(0, 0.5))
         raise last_error or ProviderUnavailable(f"{self.name} 调用失败")
 
-    def health(self) -> bool:
-        try:
-            key = self._api_key()
-        except ProviderError:
-            return False
+    def health(self) -> str:
+        """三态健康（FIX-04）：ok / unconfigured / down，结果短期缓存。
+
+        「没录 Key」必须是 unconfigured 而不是 down —— 否则注册表会把它当作坏后端
+        剔除，用户看到的会是「引用了不存在的 provider」这种指错方向的启动错误。
+        """
+        if self._health_cache is not None:
+            checked_at, state = self._health_cache
+            if monotonic() - checked_at < HEALTH_PROBE_TTL_S:
+                return state
+        state = self._probe_health()
+        self._health_cache = (monotonic(), state)
+        return state
+
+    def _probe_health(self) -> str:
+        key = self._peek_key()
+        if key is None:
+            return HEALTH_UNCONFIGURED
         try:
             with httpx.Client(
                 base_url=self.base_url, timeout=5.0, transport=self._transport,
                 follow_redirects=False,
             ) as client:
                 resp = client.get("/models", headers={"Authorization": f"Bearer {key}"})
-            return resp.status_code < 500
+            return HEALTH_OK if resp.status_code < 500 else HEALTH_DOWN
         except httpx.HTTPError:
-            return False
+            return HEALTH_DOWN
+
+    def invalidate_health(self) -> None:
+        """录入 / 更换 Key 后调用，使下一次 health() 立即重新探测。"""
+        self._health_cache = None
+
+    def unavailable_reason(self) -> str:
+        if self._peek_key() is None:
+            return (
+                f"provider {self.name} 尚未录入 API Key"
+                f"（凭据管理器引用: {self.api_key_ref}）。"
+                f"请打开「设置 · 模型后端」录入后重试。"
+            )
+        return (
+            f"provider {self.name} 当前不可达（{self.base_url}）。"
+            f"请检查网络、base_url 与 Key 是否有效。"
+        )

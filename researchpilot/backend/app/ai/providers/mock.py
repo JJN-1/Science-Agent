@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from app.ai.base import (
+    HEALTH_DOWN,
+    HEALTH_OK,
     ChatProvider,
     ChatRequest,
     ChatResponse,
@@ -43,5 +45,8 @@ class MockProvider(ChatProvider):
             latency_ms=self._latency_ms,
         )
 
-    def health(self) -> bool:
-        return self._healthy
+    def health(self) -> str:
+        return HEALTH_OK if self._healthy else HEALTH_DOWN
+
+    def unavailable_reason(self) -> str:
+        return f"mock provider {self.name} 被配置为不可用（healthy=false）"

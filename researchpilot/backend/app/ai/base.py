@@ -55,8 +55,22 @@ class CircuitOpen(ProviderUnavailable):
     code = "LLM-CIRCUIT-001"
 
 
+# ── 健康三态（FIX-04）─────────────────────────────
+# 旧实现把「未配置 Key」与「不可用」混为一谈：health() 返回 False 的 provider 会被
+# 注册表静默剔除，随后 Router 报「引用了不存在的 provider」——应用直接起不来，
+# 且错误完全不指向真正原因（缺 Key）。三态语义把「没配好」与「坏了」分开报告。
+HEALTH_OK = "ok"                      # 可正常调用
+HEALTH_UNCONFIGURED = "unconfigured"  # 配置存在但缺少凭据等，需用户补全
+HEALTH_DOWN = "down"                  # 探测失败 / 显式不可用
+
+HEALTH_STATES = (HEALTH_OK, HEALTH_UNCONFIGURED, HEALTH_DOWN)
+
+
 class ChatProvider(ABC):
-    """Provider 协议：声明能力与价格，health() 不健康不进注册表（§8.1）。"""
+    """Provider 协议：声明能力与价格，health() 返回三态健康状态（§8.1）。
+
+    注册表**不再因健康状态剔除** provider：健康只是元数据，能否调用在调用点判定。
+    """
 
     name: str
     model: str
@@ -69,8 +83,12 @@ class ChatProvider(ABC):
         """同步补全，失败抛 ProviderError 子类。"""
 
     @abstractmethod
-    def health(self) -> bool:
-        """健康检查（轻量、快速返回）。"""
+    def health(self) -> str:
+        """健康检查（轻量、快速返回），返回 HEALTH_OK / HEALTH_UNCONFIGURED / HEALTH_DOWN。"""
+
+    def unavailable_reason(self) -> str:
+        """不可调用时的可操作提示，交由上层直接展示给用户。"""
+        return f"provider {self.name} 当前不可用"
 
     def cost_of(self, prompt_tokens: int, completion_tokens: int) -> float:
         return prompt_tokens / 1000 * self.price.get("input", 0.0) + (

@@ -2,12 +2,22 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from app.ai.base import CircuitOpen, ChatProvider, monotonic
+from app.ai.base import (
+    HEALTH_OK,
+    CircuitOpen,
+    ChatProvider,
+    ProviderUnavailable,
+    monotonic,
+)
 from app.ai.providers.mock import MockProvider
+from app.ai.providers.openai_compat import OpenAICompatProvider
+from app.observability.logging import get_logger
+
+logger = get_logger("ai.registry")
 
 PROVIDER_TYPES: dict[str, type[ChatProvider]] = {
     "mock": MockProvider,
-    # openai_compat 在 US-202 加入
+    "openai_compat": OpenAICompatProvider,
 }
 
 
@@ -18,7 +28,12 @@ class CircuitState:
 
 
 class ProviderRegistry:
-    """Provider 注册表：健康过滤 + 熔断器 + 热重载（§8.1 / §8.4 / §11.4）。"""
+    """Provider 注册表：健康元数据 + 熔断器 + 热重载（§8.1 / §8.4 / §11.4）。
+
+    **不按健康状态剔除 provider**（FIX-04）。健康只是元数据，真正的可用性在
+    ``check_available()`` / 调用点判定。旧实现遇到未配 Key 的 provider 会静默剔除，
+    导致 Router 报「引用了不存在的 provider」——应用启动失败且错误指向错误方向。
+    """
 
     def __init__(self, providers: dict[str, ChatProvider], circuit: dict) -> None:
         self._providers = providers
@@ -36,10 +51,16 @@ class ProviderRegistry:
             ptype = pcfg.get("type")
             factory = PROVIDER_TYPES.get(ptype)
             if factory is None:
-                raise ValueError(f"未知 provider 类型: {ptype} (provider={name})")
+                known = ", ".join(sorted(PROVIDER_TYPES))
+                raise ValueError(
+                    f"未知 provider 类型: {ptype} (provider={name})；已支持: {known}"
+                )
             provider = factory(name, pcfg)
-            if not provider.health():
-                continue  # 不健康的后端不进入注册表
+            state = provider.health()
+            if state != HEALTH_OK:
+                # 保留并告警，而不是剔除：配置已写好但 Key 还没录是完全正常的中间状态。
+                logger.warning("provider_not_ready", provider=name,
+                               health=state, reason=provider.unavailable_reason())
             providers[name] = provider
         return cls(providers, ai_cfg.get("circuit", {}))
 
@@ -59,7 +80,7 @@ class ProviderRegistry:
         for name in self.names():
             p = self._providers[name]
             st = self._circuits[name]
-            healthy = p.health() and not self._is_open(st)
+            state = p.health()  # provider 侧有 TTL 缓存，不会每次真打网络
             rows.append(
                 {
                     "name": name,
@@ -67,8 +88,10 @@ class ProviderRegistry:
                     "model": p.model,
                     "vendor": p.vendor,
                     "capabilities": sorted(p.capabilities),
-                    "healthy": healthy,
+                    "health": state,
+                    "healthy": state == HEALTH_OK and not self._is_open(st),
                     "circuit_failures": st.failures,
+                    "detail": None if state == HEALTH_OK else p.unavailable_reason(),
                 }
             )
         return rows
@@ -84,9 +107,19 @@ class ProviderRegistry:
         return True
 
     def check_available(self, name: str) -> None:
+        """调用点可用性判定：健康不达标或处于熔断冷却期都不可用。
+
+        抛出的 ProviderUnavailable 携带可操作提示，降级链会据此切换到下一个候选。
+        """
+        provider = self.get(name)
+        state = provider.health()
+        if state != HEALTH_OK:
+            raise ProviderUnavailable(provider.unavailable_reason())
         st = self._circuits.get(name)
         if st is not None and self._is_open(st):
-            raise CircuitOpen(f"provider {name} 处于熔断冷却期")
+            raise CircuitOpen(
+                f"provider {name} 处于熔断冷却期（冷却 {self.cooldown:.0f}s）"
+            )
 
     def record_success(self, name: str) -> None:
         st = self._circuits.setdefault(name, CircuitState())
@@ -102,8 +135,11 @@ class ProviderRegistry:
             st.opened_at = monotonic()
 
     # ── 热重载（§8.4 全局级）────────────────────
-    def reload(self, cfg: dict) -> dict[str, str]:
-        """按新配置重建注册表，返回 {旧: 新} 的名称映射供审计。"""
+    def reload(self, cfg: dict) -> dict[str, list[str]]:
+        """按新配置重建注册表，返回 {removed: [...], added: [...]} 供审计。
+
+        注意：熔断状态目前随重建而重置（FIX-05 待修，需持久化到 app_config）。
+        """
         old_names = set(self._providers)
         fresh = ProviderRegistry.from_config(cfg)
         self._providers = fresh._providers

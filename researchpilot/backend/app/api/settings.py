@@ -83,10 +83,17 @@ def get_routing(request: Request) -> dict:
 
 
 @router.put("/providers/{name}/key")
-def set_provider_key(name: str, body: ProviderKey) -> dict:
+def set_provider_key(name: str, body: ProviderKey, request: Request) -> dict:
     """API Key 写入 Windows 凭据管理器（§8.4），config 不落明文。"""
     try:
         keyring.set_password(KEYRING_SERVICE, name, body.key)
     except Exception as exc:  # keyring 后端不可用（如无桌面环境）
         raise HTTPException(status_code=500, detail=f"凭据写入失败: {exc}") from None
+    # 让下一次 health() 立即重新探测，而不是等 TTL 过期（FIX-04）
+    registry = getattr(request.app.state, "ai_registry", None)
+    if registry is not None and name in registry.names():
+        provider = registry.get(name)
+        invalidate = getattr(provider, "invalidate_health", None)
+        if callable(invalidate):
+            invalidate()
     return {"provider": name, "stored": True}
