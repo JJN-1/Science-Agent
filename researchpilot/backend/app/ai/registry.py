@@ -4,8 +4,8 @@ from dataclasses import dataclass
 
 from app.ai.base import (
     HEALTH_OK,
-    CircuitOpen,
     ChatProvider,
+    CircuitOpen,
     ProviderUnavailable,
     monotonic,
 )

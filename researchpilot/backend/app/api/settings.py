@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import keyring
-
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 from sqlalchemy.orm import Session

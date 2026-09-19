@@ -5,7 +5,7 @@
 """
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from fastapi.testclient import TestClient
@@ -16,7 +16,6 @@ from app.store.dao import grants as grants_dao
 from app.store.dao import projects as projects_dao
 from app.store.dao import runs as runs_dao
 from app.store.dao import usage as usage_dao
-
 
 # ── DAO / BudgetManager 层 ───────────────────────
 
@@ -32,7 +31,7 @@ def test_grants_scoped_and_expirable(session):
     assert grants_dao.granted(session, project.id, "agent_steps", agent_id="other") == 0
     assert grants_dao.granted(session, project.id, "agent_cost", agent_id="scout") == 0
 
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     grants_dao.create(session, project_id=project.id, scope="project_total",
                       amount=99, expires_at=now - timedelta(hours=1))
     session.flush()
@@ -66,7 +65,7 @@ def test_budget_effective_limit_includes_grants(session):
 
     grants_dao.create(
         session, project_id=project.id, scope="agent_steps", amount=20,
-        agent_id="scout", expires_at=datetime.now(timezone.utc) + timedelta(hours=24),
+        agent_id="scout", expires_at=datetime.now(UTC) + timedelta(hours=24),
     )
     session.flush()
     manager.check(session, project.id, "scout", run.id)  # 豁免生效 → 不再熔断

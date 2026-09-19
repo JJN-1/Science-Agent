@@ -10,7 +10,7 @@ from app.ai.base import (
     ProviderUnavailable,
 )
 from app.ai.registry import PROVIDER_TYPES, ProviderRegistry
-from app.ai.routing import RouteCandidate, RoutingError, Router
+from app.ai.routing import RouteCandidate, Router, RoutingError
 from app.store.dao import agents as agents_dao
 from app.store.dao import approvals as approvals_dao
 from app.store.dao import decisions as decisions_dao

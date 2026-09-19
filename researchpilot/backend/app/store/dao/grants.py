@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -36,7 +36,7 @@ def _is_active(grant: BudgetGrant, now: datetime) -> bool:
         return True
     expires_at = grant.expires_at
     if expires_at.tzinfo is None:  # SQLite 存的是 naive UTC
-        expires_at = expires_at.replace(tzinfo=timezone.utc)
+        expires_at = expires_at.replace(tzinfo=UTC)
     return expires_at > now
 
 
@@ -48,7 +48,7 @@ def granted(session: Session, project_id: int, scope: str,
     )
     if agent_id is not None:
         stmt = stmt.where(BudgetGrant.agent_id == agent_id)
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     return float(sum(g.amount for g in session.scalars(stmt).all() if _is_active(g, now)))
 
 

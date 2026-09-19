@@ -5,8 +5,8 @@ import json
 
 from sqlalchemy.orm import Session
 
-from app.ai.base import ChatMessage, ChatProvider, ChatRequest, ChatResponse, ProviderError
-from app.ai.budget import BudgetExceeded, BudgetManager
+from app.ai.base import ChatMessage, ChatRequest, ChatResponse, ProviderError
+from app.ai.budget import BudgetManager
 from app.ai.degrade import complete_with_degradation
 from app.ai.registry import ProviderRegistry
 from app.ai.routing import Router

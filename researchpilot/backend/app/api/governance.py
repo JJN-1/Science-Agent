@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
@@ -137,7 +137,7 @@ def _decide_and_resume(approval_id: int, request: Request, session: Session,
         amount = float(detail.get("suggested_grant") or policy.get(scope, 0.0))
     amount = float(amount)
 
-    expires_at = datetime.now(timezone.utc) + timedelta(hours=GRANT_TTL_HOURS)
+    expires_at = datetime.now(UTC) + timedelta(hours=GRANT_TTL_HOURS)
     grant = grants_dao.create(
         session, project_id=project_id, scope=scope, amount=amount,
         agent_id=detail.get("agent_id"), approval_id=approval.id,

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -37,6 +37,6 @@ def decide(session: Session, approval_id: int, status: str) -> Approval | None:
     if row is None:
         return None
     row.status = status
-    row.decided_at = datetime.now(timezone.utc)  # 补记审批时间，此前一直为 NULL
+    row.decided_at = datetime.now(UTC)  # 补记审批时间，此前一直为 NULL
     session.flush()
     return row

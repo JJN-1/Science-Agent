@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from datetime import UTC
+
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
@@ -25,14 +27,14 @@ def add_step(session: Session, *, run_id: int, kind: str, content: dict) -> Agen
 
 
 def finish_run(session: Session, *, run_id: int, status: str, error: str | None = None) -> AgentRun | None:
-    from datetime import datetime, timezone
+    from datetime import datetime
 
     run = session.get(AgentRun, run_id)
     if run is None:
         return None
     run.status = status
     run.error = error
-    run.finished_at = datetime.now(timezone.utc)
+    run.finished_at = datetime.now(UTC)
     session.flush()
     return run
 

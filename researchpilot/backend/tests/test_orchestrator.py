@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import pytest
+from sqlalchemy import text
 
 from app.agents.demo_stage import register_all
 from app.orchestration.base import StageAgent
@@ -10,7 +11,6 @@ from app.store.dao import checkpoints as cp_dao
 from app.store.dao import decisions as decisions_dao
 from app.store.dao import projects as projects_dao
 from app.store.dao import runs as runs_dao
-from sqlalchemy import text
 
 
 @pytest.fixture
