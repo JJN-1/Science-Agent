@@ -33,7 +33,7 @@ researchpilot/
 ```bash
 cd backend
 python -m uv sync          # 创建 .venv 并安装依赖
-python -m uv run pytest    # 运行测试（46 个用例）
+python -m uv run pytest    # 运行测试（81 个用例）
 python -m uv run uvicorn app.main:app --reload
 ```
 
@@ -53,9 +53,12 @@ npm run dev
 
 - 默认零配置指向 **mock provider**，可完整演示档位路由、成本记账、预算熔断与审批
 - 接真实模型：左侧「⚙ 设置 · 模型后端」→ 录入 API Key（写入 **Windows 凭据管理器**，不落盘明文）→ 在用户 `config.yaml` 增加 `openai_compat` 类型 provider → 修改档位路由 → 「⟳ 热重载」立即生效，无需重启
+- **Provider 健康为三态**：`ok` / `unconfigured`（配置已写好但还没录 Key）/ `down`。未配置的后端不会导致启动失败，运行时会返回可操作提示
 - 五档位路由：`extract` / `plan` / `critique` / `synthesize` / `write`，critique 档强制跨厂商（交叉验证约束）
 - 能力降级：缺 JSON 模式自动注入 schema 至 prompt，校验失败携错重试一次；全程记录 `degraded` 标记
-- 预算治理：项目总额/每日额度 + Agent 级步数/成本上限；超限 run 自动**暂停**并在流内弹出审批卡片，批准后恢复重跑
+- 输出解析容忍代码围栏、前后缀与尾随逗号；解析失败时把**原始输出**写入轨迹
+- 预算治理：项目总额/每日额度 + Agent 级步数/成本上限；超限 run 自动**暂停**并在流内弹出审批卡片
+- 审批生效方式：批准会签发一条带额度与有效期的**预算豁免**（`budget_grants`，默认 24h），有效限额 = 配置限额 + 未过期豁免，可在审批时覆盖额度
 
 ## 已实现
 
@@ -81,6 +84,7 @@ npm run dev
 | GET | `/api/projects/{id}/runs` / `/api/runs/{id}` | 运行记录 / 轨迹明细 |
 | GET | `/api/projects/{id}/blackboard` / `/checkpoints` | 黑板对象 / 检查点 |
 | GET | `/api/projects/{id}/decisions` | 决策与失败尝试日志 |
+| GET | `/api/projects/{id}/budget-grants` | 预算豁免审计（额度 / 审批单 / 有效期） |
 | GET | `/api/usage/summary?project_id=&dim=` | 成本三维归因 |
 | GET/POST | `/api/approvals` · `/api/approvals/{id}/approve|reject` | 审批流转 |
 | GET | `/api/settings/providers` · `/api/settings/routing` | 后端健康 / 档位路由 |
@@ -92,3 +96,16 @@ npm run dev
 
 - 数据可用环境变量 `RESEARCHPILOT_DATA_DIR` 重定向（测试使用）。
 - 阶段 Agent：S1 已接入真实模型调用（plan 档结构化生成研究问题），S2–S8 为占位实现，Sprint 3 起逐个替换。
+- 阶段失败时，失败现场（`agent_runs.status=failed`、checkpoint、`failed_attempt` 决策、解析失败的原始输出）**都会落库**，前端会话流内可直接看到错误原因。
+- `POST /stages/{id}/run` 在模型后端不可用时返回 `503`，body 为 `{"detail": {"code": "...", "message": "..."}}`，message 是可直接照做的修复指引。
+
+## 技术债修复记录（Sprint 3 前置）
+
+| 编号 | 问题 | 处置 |
+|---|---|---|
+| FIX-01 | `openai_compat` 从未注册，配了真实模型应用直接起不来 | 注册该类型 + 补「配置 → 注册表 → 路由」集成测试 |
+| FIX-02 | 批准预算后不产生任何豁免，形成「批准→再熔断」死循环 | 新增 `budget_grants` 表与有效限额计算，批准签发带额度/有效期的豁免 |
+| FIX-04 | 未配 Key 被当作「不健康」静默剔除，报错指向错误方向 | `health()` 改三态，注册表不再剔除 provider，运行期给可操作提示 |
+| FIX-06 | JSON 输出裸奔解析，代码围栏/前后缀直接判失败 | 抽出 `extract_json()`，解析失败保留原始输出 |
+| FIX-07 | `run_pipeline` 遇 paused 不中断，堆出连环审批 | 暂停即中断，后续阶段标记 `skipped` |
+| 附带 | 阶段失败时失败轨迹被事务回滚全部丢失 | 端点先提交失败记录再返回错误 |
