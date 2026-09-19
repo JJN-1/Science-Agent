@@ -207,3 +207,38 @@ class ProviderSwitchLog(Base):
     new: Mapped[str | None] = mapped_column(Text, nullable=True)
     source: Mapped[str] = mapped_column(String(64), default="api")
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+
+class AppConfig(Base):
+    """运行期状态持久化（§11.4，FIX-05）：键值对，value 为 JSON。
+
+    用途之一是熔断状态（key = ``circuit:<provider>``）。此前熔断只在进程内存里，
+    重启即全部清零——被熔断的后端会在重启后立刻重新挨一遍失败。
+    """
+
+    __tablename__ = "app_config"
+
+    key: Mapped[str] = mapped_column(String(128), primary_key=True)
+    value: Mapped[dict] = mapped_column(JSON)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)
+
+
+class LlmCache(Base):
+    """跨重启的模型响应缓存（FIX-05）。
+
+    此前缓存是 `LlmGateway` 里的进程内 dict：重启即失效，且上限 256 条按插入顺序淘汰。
+    落库后带 TTL（默认 7 天），过期即失效并由 `purge_expired` 清理。
+
+    ``cache_key`` 由 (provider, model, tier, messages, schema) 规范化哈希而来，
+    因此「哪个后端作答」就是键的一部分——降级作答的结果不会再记到首候选名下。
+    """
+
+    __tablename__ = "llm_cache"
+
+    cache_key: Mapped[str] = mapped_column(String(64), primary_key=True)
+    provider: Mapped[str] = mapped_column(String(64))
+    model: Mapped[str] = mapped_column(String(128))
+    tier: Mapped[str] = mapped_column(String(32))
+    response: Mapped[dict] = mapped_column(JSON)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    expires_at: Mapped[datetime] = mapped_column(DateTime, index=True)

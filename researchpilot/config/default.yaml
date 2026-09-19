@@ -37,3 +37,9 @@ ai:
   circuit:
     failure_threshold: 5  # 连续失败次数 → 熔断
     cooldown_seconds: 300 # 冷却时长（秒）
+
+  # 模型响应缓存（FIX-05）：落 llm_cache 表，跨重启有效。
+  # 键由 (provider, model, tier, messages, schema) 规范化哈希得到。
+  cache:
+    enabled: true
+    ttl_seconds: 604800   # 7 天

@@ -97,4 +97,14 @@ class ChatProvider(ABC):
 
 
 def monotonic() -> float:
+    """进程内单调时钟：测延迟、算 TTL 都该用它。"""
     return time.monotonic()
+
+
+def wall_clock() -> float:
+    """跨进程可比的挂钟时间戳，仅用于需要落库的时间差。
+
+    熔断的 ``opened_at`` 必须用它：``monotonic()`` 的零点随进程而变，
+    落库再读回来得到的是毫无意义的差值，冷却期判定会整个失效。
+    """
+    return time.time()

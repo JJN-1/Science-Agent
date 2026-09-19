@@ -15,6 +15,7 @@ from app.config import ensure_data_dir, load_config
 from app.observability.logging import get_logger, setup_logging
 from app.orchestration.orchestrator import Orchestrator, StageRegistry
 from app.store.dao import agents as agents_dao
+from app.store.dao import llm_cache as llm_cache_dao
 from app.store.db import database_path, make_engine, make_session_factory
 from app.store.migrations import upgrade_to_head
 
@@ -34,9 +35,14 @@ async def lifespan(app: FastAPI):
     app.state.config = config
 
     # AI 接入层（US-201/206）：健康过滤 + 档位路由 + 预算
+    ai_cfg = config.get("ai", {}) or {}
     ai_registry = AIProviderRegistry.from_config(config)
     router = Router.from_config(config, ai_registry.providers_map())
-    gateway = LlmGateway(ai_registry, router, BudgetManager(config.get("ai", {}).get("budget", {})))
+    gateway = LlmGateway(
+        ai_registry, router,
+        BudgetManager(ai_cfg.get("budget", {})),
+        ai_cfg.get("cache", {}),
+    )
     app.state.ai_registry = ai_registry
     app.state.router = router
     app.state.gateway = gateway
@@ -45,13 +51,15 @@ async def lifespan(app: FastAPI):
     register_all(registry)
     app.state.orchestrator = Orchestrator(registry, gateway)
 
-    # agents 表播种（US-201 契约：档位/预算随 Agent 定义）
+    # agents 表播种（US-201 契约：档位/预算随 Agent 定义）+ 运行期状态恢复（FIX-05）
     with session_factory() as session:
         for agent in registry.all():
             agents_dao.upsert(
                 session, agent_id=agent.agent_id, name=agent.name,
                 tier=agents_dao.STAGE_TIERS.get(agent.stage_id, "extract"),
             )
+        ai_registry.load_circuits(session)      # 熔断状态跨重启保留
+        llm_cache_dao.purge_expired(session)    # 清掉过期缓存
         session.commit()
 
     logger.info("startup_complete", data_dir=str(root),

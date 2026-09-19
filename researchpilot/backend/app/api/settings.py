@@ -41,7 +41,7 @@ def reload_providers(request: Request,
     config = load_config()
     registry = request.app.state.ai_registry
     before = registry.snapshot()
-    delta = registry.reload(config)
+    delta = registry.reload(config, session)
     session.add(ProviderSwitchLog(
         scope="global", old=",".join(before), new=",".join(registry.snapshot()),
         source="api_reload",
