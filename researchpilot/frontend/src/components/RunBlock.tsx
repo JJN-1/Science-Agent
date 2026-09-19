@@ -134,8 +134,15 @@ export default function RunBlock({ run, steps, writes, running }: RunBlockProps)
             <span className="glyph" aria-hidden="true">⎿</span>
             <span className="kind">{step.kind === 'llm_call' ? 'llm' : KIND_LABEL[step.kind] ?? step.kind}</span>
             <span className="body">
-              {isLlmCall(step) && <LlmMeta step={step} />}
-              {text && text.length <= 120 ? (
+              {isLlmCall(step) ? (
+                <>
+                  <LlmMeta step={step} />
+                  <details>
+                    <summary>模型输出</summary>
+                    <pre className="jsonpre">{String(step.content.text ?? '')}</pre>
+                  </details>
+                </>
+              ) : text && text.length <= 120 ? (
                 <span className="md-inline">{text}</span>
               ) : text ? (
                 <Markdown text={text} />
