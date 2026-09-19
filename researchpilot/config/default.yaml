@@ -22,6 +22,7 @@ log:
 #   price         每 1K token 的 {input, output} 单价
 #   timeout_s     覆盖默认超时（秒）
 #   extra_headers / extra_body  透传字段
+#   delay_ms      仅 mock：真实睡眠的毫秒数，用来模拟长任务（验证流式进度）
 ai:
   providers:
     mock:

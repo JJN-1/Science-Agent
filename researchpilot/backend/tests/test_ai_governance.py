@@ -1,14 +1,19 @@
 from __future__ import annotations
 
+import time
+
 import pytest
 
 from app.ai.base import (
     HEALTH_DOWN,
     HEALTH_OK,
     HEALTH_UNCONFIGURED,
+    ChatMessage,
+    ChatRequest,
     CircuitOpen,
     ProviderUnavailable,
 )
+from app.ai.providers.mock import MockProvider
 from app.ai.registry import PROVIDER_TYPES, ProviderRegistry
 from app.ai.routing import RouteCandidate, Router, RoutingError
 from app.store.dao import agents as agents_dao
@@ -269,3 +274,22 @@ def test_agents_upsert_idempotent(session):
     rows = agents_dao.list_all(session)
     assert len(rows) == 1
     assert rows[0].tier == "extract"
+
+
+def test_mock_delay_ms_actually_sleeps():
+    """delay_ms 是真延迟，不是元数据。
+
+    US-311 / US-304 的前端验收都说「长任务全程有进度」——没有真实延迟，
+    任务一瞬间就跑完了，流式进度根本无从观察。
+    """
+    provider = MockProvider("mock", {"models": ["m"], "delay_ms": 80})
+    request = ChatRequest(messages=[ChatMessage(role="user", content="hi")])
+
+    started = time.monotonic()
+    provider.complete(request)
+    elapsed = time.monotonic() - started
+
+    assert elapsed >= 0.06, f"delay_ms 未生效（耗时 {elapsed * 1000:.0f}ms）"
+    assert MockProvider("mock", {"models": ["m"]}).complete(request).latency_ms == 0
+
+

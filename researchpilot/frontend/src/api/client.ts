@@ -52,6 +52,8 @@ export const api = {
   createProject: (data: { title: string; domain: string; goal: string }) =>
     request<Project>('/projects', { method: 'POST', body: JSON.stringify(data) }),
   getProject: (id: number) => request<Project>(`/projects/${id}`),
+  updateProject: (id: number, data: { goal?: string; title?: string; status?: string }) =>
+    request<Project>(`/projects/${id}`, { method: 'PATCH', body: JSON.stringify(data) }),
   listStages: () => request<StageInfo[]>('/stages'),
   runStage: (projectId: number, stageId: string) =>
     request<{ run_id: number; status: string }>(

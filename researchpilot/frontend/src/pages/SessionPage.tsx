@@ -12,7 +12,7 @@ import type {
 } from '../api/types'
 import ApprovalCard from '../components/ApprovalCard'
 import RunBlock from '../components/RunBlock'
-import CommandBar, { placeholderHint } from '../components/CommandBar'
+import CommandBar, { placeholderHint, type Command } from '../components/CommandBar'
 
 interface SysEvent {
   id: number
@@ -72,18 +72,21 @@ export default function SessionPage() {
     void load()
   }, [load])
 
+  const pushSysEvent = (text: string) => {
+    setSysEvents((evts) => [...evts, { id: sysSeq, text }])
+    setSysSeq((n) => n + 1)
+  }
+
   const handleRun = async (stageId: string) => {
     if (runningStage) return
     const target = stages.find((s) => s.stage_id === stageId)
-    if (stageId === '?' || !target) {
-      setSysEvents((evts) => [...evts, { id: sysSeq, text: `未知命令，试试：run ${stages[0]?.stage_id ?? 'S1'}` }])
-      setSysSeq((n) => n + 1)
+    if (!target) {
+      pushSysEvent(`未知阶段：${stageId}。可用：${stages.map((s) => s.stage_id).join(' / ')}`)
       return
     }
     // US-307：占位阶段不可直接运行，避免占位实现被当成已有能力
     if (!target.implemented) {
-      setSysEvents((evts) => [...evts, { id: sysSeq, text: `${target.stage_id} ${target.name}：${placeholderHint(target)}` }])
-      setSysSeq((n) => n + 1)
+      pushSysEvent(`${target.stage_id} ${target.name}：${placeholderHint(target)}`)
       return
     }
     setRunningStage(stageId)
@@ -91,12 +94,41 @@ export default function SessionPage() {
       await api.runStage(projectId, stageId)
     } catch {
       // 阶段失败时后端记录 failed run，流内会显示 ✗ 与错误信息
-      setSysEvents((evts) => [...evts, { id: sysSeq, text: `${stageId} 运行失败，详见流内记录` }])
-      setSysSeq((n) => n + 1)
+      pushSysEvent(`${stageId} 运行失败，详见流内记录`)
     } finally {
       setRunningStage(null)
       await load()
     }
+  }
+
+  /** 命令行入口（US-311）：自由文本按「研究目标」处理，落到 goal 后直接触发 S1。 */
+  const handleCommand = async (command: Command) => {
+    if (command.kind === 'unknown') {
+      pushSysEvent(command.text)
+      return
+    }
+    if (command.kind === 'goal') {
+      if (runningStage) return
+      const scout = stages.find((s) => s.stage_id === 'S1')
+      if (!scout?.implemented) {
+        pushSysEvent('S1 选题发现尚不可用，暂时无法从研究目标入手')
+        return
+      }
+      setRunningStage('S1')
+      try {
+        // 先落 goal 再跑：S1 的提示词读的就是 project.goal，
+        // 顺序反了这一轮就跑在旧目标上。
+        await api.updateProject(projectId, { goal: command.text })
+        await api.runStage(projectId, 'S1')
+      } catch (err) {
+        pushSysEvent(err instanceof ApiError ? err.message : '启动 S1 失败')
+      } finally {
+        setRunningStage(null)
+        await load()
+      }
+      return
+    }
+    await handleRun(command.stageId)
   }
 
   const handleApproval = async (approvalId: number, action: 'approve' | 'reject') => {
@@ -198,7 +230,7 @@ export default function SessionPage() {
         </div>
       </div>
 
-      <CommandBar stages={stages} disabled={runningStage !== null} onRun={handleRun} />
+      <CommandBar stages={stages} disabled={runningStage !== null} onCommand={handleCommand} />
     </div>
   )
 }
