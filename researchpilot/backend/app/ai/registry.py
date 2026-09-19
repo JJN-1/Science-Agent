@@ -51,6 +51,9 @@ class ProviderRegistry:
     def names(self) -> list[str]:
         return sorted(self._providers)
 
+    def providers_map(self) -> dict[str, ChatProvider]:
+        return dict(self._providers)
+
     def health_report(self) -> list[dict]:
         rows = []
         for name in self.names():

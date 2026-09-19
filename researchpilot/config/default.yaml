@@ -17,6 +17,7 @@ ai:
       vendor: mock
       capabilities: [json_object]
       price_per_1k: {input: 0.0, output: 0.0}
+      response: '{"questions": [{"question": "如何提升图神经网络推荐模型的可解释性", "rationale": "现有 GNN 推荐方法决策过程不透明，缺乏可解释性研究", "score": 0.82}, {"question": "图神经网络推荐系统中的过平滑问题的缓解策略", "rationale": "层数加深导致性能下降，是 GNN 推荐的主要瓶颈", "score": 0.75}, {"question": "基于对比学习的图神经网络冷启动推荐", "rationale": "冷启动场景下结构信息利用不足", "score": 0.68}]}'
   routing:
     extract:    [{provider: mock, model: mock-small}]
     plan:       [{provider: mock, model: mock-small}]

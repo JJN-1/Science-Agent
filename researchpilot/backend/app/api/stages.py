@@ -9,6 +9,7 @@ from app.orchestration.orchestrator import Orchestrator
 from app.store.dao import blackboard as blackboard_dao
 from app.store.dao import checkpoints as checkpoint_dao
 from app.store.dao import projects as projects_dao
+from app.store.dao import runs as runs_dao
 
 router = APIRouter(tags=["stages"])
 
@@ -37,7 +38,8 @@ def run_stage(project_id: int, stage_id: str, request: Request,
         run_id = orchestrator.run_stage(session, project_id, stage_id)
     except KeyError:
         raise HTTPException(status_code=404, detail=f"未知阶段: {stage_id}") from None
-    return RunStageResponse(run_id=run_id, status="succeeded")
+    run = runs_dao.get_run(session, run_id)
+    return RunStageResponse(run_id=run_id, status=run.status if run else "unknown")
 
 
 @router.get("/api/projects/{project_id}/blackboard")

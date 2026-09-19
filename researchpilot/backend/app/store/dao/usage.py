@@ -64,6 +64,16 @@ def project_spend_today(session: Session, project_id: int) -> float:
     )
 
 
+def run_cost(session: Session, run_id: int) -> float:
+    return float(
+        session.scalar(
+            select(func.coalesce(func.sum(LlmUsage.cost), 0.0)).where(
+                LlmUsage.run_id == run_id
+            )
+        )
+    )
+
+
 def summary_by(session: Session, project_id: int, dim: str) -> list[dict]:
     """三维归因：dim ∈ {stage, agent, provider}。"""
     columns = {"stage": LlmUsage.stage_id, "agent": LlmUsage.agent_id,

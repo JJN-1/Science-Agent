@@ -7,16 +7,27 @@ from app.main import create_app
 
 
 @pytest.fixture
-def client(engine, session_factory):
+def client(engine, session_factory, ai_config):
     app = create_app()
     app.state.engine = engine
     app.state.session_factory = session_factory
     from app.agents.demo_stage import register_all
+    from app.ai.budget import BudgetManager
+    from app.ai.client import LlmGateway
+    from app.ai.registry import ProviderRegistry
+    from app.ai.routing import Router
     from app.orchestration.orchestrator import Orchestrator, StageRegistry
+
+    ai_registry = ProviderRegistry.from_config(ai_config)
+    router = Router.from_config(ai_config, ai_registry.providers_map())
+    gateway = LlmGateway(ai_registry, router, BudgetManager(ai_config["ai"]["budget"]))
+    app.state.ai_registry = ai_registry
+    app.state.router = router
+    app.state.gateway = gateway
 
     registry = StageRegistry()
     register_all(registry)
-    app.state.orchestrator = Orchestrator(registry)
+    app.state.orchestrator = Orchestrator(registry, gateway)
     with TestClient(app) as c:
         yield c
 

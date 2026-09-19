@@ -6,10 +6,15 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.agents.demo_stage import register_all
+from app.ai.budget import BudgetManager
+from app.ai.client import LlmGateway
+from app.ai.registry import ProviderRegistry as AIProviderRegistry
+from app.ai.routing import Router
 from app.api import projects, runs, stages
 from app.config import ensure_data_dir, load_config
 from app.observability.logging import get_logger, setup_logging
 from app.orchestration.orchestrator import Orchestrator, StageRegistry
+from app.store.dao import agents as agents_dao
 from app.store.db import database_path, make_engine, make_session_factory
 from app.store.migrations import upgrade_to_head
 
@@ -24,11 +29,33 @@ async def lifespan(app: FastAPI):
     engine = make_engine(database_path(root))
     upgrade_to_head(engine)  # 幂等迁移，保证零配置首启即可用
     app.state.engine = engine
-    app.state.session_factory = make_session_factory(engine)
+    session_factory = make_session_factory(engine)
+    app.state.session_factory = session_factory
+    app.state.config = config
+
+    # AI 接入层（US-201/206）：健康过滤 + 档位路由 + 预算
+    ai_registry = AIProviderRegistry.from_config(config)
+    router = Router.from_config(config, ai_registry.providers_map())
+    gateway = LlmGateway(ai_registry, router, BudgetManager(config.get("ai", {}).get("budget", {})))
+    app.state.ai_registry = ai_registry
+    app.state.router = router
+    app.state.gateway = gateway
+
     registry = StageRegistry()
     register_all(registry)
-    app.state.orchestrator = Orchestrator(registry)
-    logger.info("startup_complete", data_dir=str(root))
+    app.state.orchestrator = Orchestrator(registry, gateway)
+
+    # agents 表播种（US-201 契约：档位/预算随 Agent 定义）
+    with session_factory() as session:
+        for agent in registry.all():
+            agents_dao.upsert(
+                session, agent_id=agent.agent_id, name=agent.name,
+                tier=agents_dao.STAGE_TIERS.get(agent.stage_id, "extract"),
+            )
+        session.commit()
+
+    logger.info("startup_complete", data_dir=str(root),
+                providers=ai_registry.names())
     yield
     engine.dispose()
 
