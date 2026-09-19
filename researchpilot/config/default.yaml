@@ -27,6 +27,13 @@ ai:
   budget:
     project_total: 50.0   # 单项目总额（元）
     project_daily: 10.0   # 单项目每日额度（元）
+    # 批准预算熔断后追加的额度（有效限额 = 配置限额 + 未过期豁免）。
+    # 审批单会带出建议值，用户在审批时可覆盖。
+    approval_grant:
+      project_total: 50.0
+      project_daily: 10.0
+      agent_steps: 20
+      agent_cost: 2.0
   circuit:
     failure_threshold: 5  # 连续失败次数 → 熔断
     cooldown_seconds: 300 # 冷却时长（秒）

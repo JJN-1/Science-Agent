@@ -60,12 +60,18 @@ class Orchestrator:
                 ctx.write_blackboard(w.obj_type, w.payload, w.evidence)
         except BudgetExceeded as exc:
             # US-205：预算熔断 → 暂停 + 审批请求（不算失败）
+            # 审批单里带上 agent_id 与建议豁免额度：批准后据此写入 budget_grants，
+            # 让「批准 → 恢复」成为真实因果（FIX-02）。
+            budget_mgr = getattr(self.gateway, "budget", None)
+            suggested = budget_mgr.suggested_grant(exc.kind) if budget_mgr else 0.0
             runs_dao.finish_run(session, run_id=run.id, status="paused")
             approvals_dao.create(
                 session, project_id=project_id, kind="budget", run_id=run.id,
                 detail={
                     "source": exc.kind,
                     "stage_id": stage_id,
+                    "agent_id": agent.agent_id,
+                    "suggested_grant": suggested,
                     **exc.detail,
                 },
             )

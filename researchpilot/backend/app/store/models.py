@@ -170,6 +170,32 @@ class Approval(Base):
     decided_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
 
+class BudgetGrant(Base):
+    """预算豁免（FIX-02）：人工批准后追加的额度，使批准真正生效。
+
+    旧实现里批准只是把 approvals.status 改成 approved，预算计数分文未动，
+    重跑立刻再次熔断 —— 审批卡住 → 批准 → 又熔断的死循环。豁免是那条缺失的因果链。
+
+    有效限额 = 配置限额 + Σ(未过期豁免.amount)，可按 scope 分别作用于
+    项目总额 / 项目每日额度 / Agent 步数 / Agent 成本。
+    """
+
+    __tablename__ = "budget_grants"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    project_id: Mapped[int] = mapped_column(
+        ForeignKey("projects.id", ondelete="CASCADE"), index=True
+    )
+    scope: Mapped[str] = mapped_column(String(32), index=True)
+    agent_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    amount: Mapped[float] = mapped_column(default=0.0)
+    approval_id: Mapped[int | None] = mapped_column(
+        ForeignKey("approvals.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+
 class ProviderSwitchLog(Base):
     """后端切换审计（US-206）。"""
 
