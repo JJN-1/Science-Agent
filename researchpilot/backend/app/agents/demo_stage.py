@@ -1,8 +1,7 @@
 from __future__ import annotations
 
-import json
-
 from app.ai.base import ChatMessage
+from app.ai.json_utils import extract_json
 from app.orchestration.base import BlackboardWrite, StageAgent
 from app.orchestration.orchestrator import StageRegistry
 from app.store.dao import projects as projects_dao
@@ -63,6 +62,20 @@ class DemoStage(StageAgent):
         ]
 
 
+def _parse_questions(ctx, raw: str) -> list[dict]:  # noqa: ANN001
+    """解析 S1 的结构化输出；失败时把原始输出落进轨迹，便于事后排查（FIX-06）。"""
+    try:
+        parsed = extract_json(raw)
+    except ValueError as exc:
+        ctx.record("error", {"text": f"S1 结构化输出解析失败：{exc}", "raw": raw})
+        raise
+    if not isinstance(parsed, dict):
+        ctx.record("error", {"text": "S1 结构化输出不是 JSON 对象", "raw": raw})
+        raise ValueError("S1 结构化输出不是 JSON 对象")
+    questions = parsed.get("questions", [])
+    return questions if isinstance(questions, list) else []
+
+
 class ScoutStage(StageAgent):
     """S1 选题发现：plan 档位结构化生成候选研究问题（Sprint 2 演示路径）。"""
 
@@ -85,7 +98,7 @@ class ScoutStage(StageAgent):
             ],
             schema=QUESTIONS_SCHEMA,
         )
-        questions = json.loads(response.text).get("questions", [])
+        questions = _parse_questions(ctx, response.text)
         ctx.decide(
             f"生成 {len(questions)} 个候选研究问题",
             reason="plan 档位结构化输出，待 S3 形式化为可证伪假设",

@@ -9,6 +9,7 @@ from app.ai.base import (
     ChatResponse,
     ProviderError,
 )
+from app.ai.json_utils import extract_json
 
 
 def _system_prompt_with_schema(schema: dict) -> str:
@@ -19,10 +20,11 @@ def _system_prompt_with_schema(schema: dict) -> str:
 
 
 def _try_parse(text: str) -> bool:
+    """FIX-06：走 extract_json，容忍代码围栏、前后缀与尾随逗号。"""
     try:
-        json.loads(text)
+        extract_json(text)
         return True
-    except (ValueError, TypeError):
+    except ValueError:
         return False
 
 
@@ -62,7 +64,10 @@ def complete_with_degradation(provider: ChatProvider, request: ChatRequest) -> C
         )
         response = provider.complete(retry_request)
         if not _try_parse(response.text):
-            raise ProviderError("LLM-SCHEMA-001: 结构化输出两次校验失败")
+            raise ProviderError(
+                "LLM-SCHEMA-001: 结构化输出两次校验失败；"
+                f"原始输出片段: {response.text[:200]!r}"
+            )
 
     response.degraded = degraded + response.degraded
     return response
