@@ -68,6 +68,42 @@ class RunDetailOut(RunOut):
     steps: list[StepOut] = []
 
 
-class RunStageResponse(BaseModel):
-    run_id: int
+class JobAccepted(BaseModel):
+    """受理回执（FIX-03）：受理只承诺「已排队」，不等于「已跑完」。"""
+
+    job_id: int
     status: str
+
+
+class JobOut(BaseModel):
+    """作业快照，供轮询回退与排查使用。"""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    project_id: int
+    kind: str
+    stage_id: str | None
+    status: str
+    run_id: int | None
+    error: str | None
+    params: dict
+    created_at: datetime
+    started_at: datetime | None
+    finished_at: datetime | None
+
+
+class JobEventOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    seq: int
+    type: str
+    payload: dict
+    created_at: datetime
+
+
+class PipelineRunRequest(BaseModel):
+    """可选：只跑指定的阶段子集，缺省按 STAGE_ORDER 跑全部已注册阶段。"""
+
+    stage_ids: list[str] | None = None

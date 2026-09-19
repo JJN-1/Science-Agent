@@ -55,7 +55,7 @@ def test_stages_expose_implementation_marker(client):
         assert by_id[stage_id]["planned_sprint"] == planned, stage_id
 
 
-def test_project_stage_run_trajectory_flow(client):
+def test_project_stage_run_trajectory_flow(client, run_and_wait):
     created = client.post("/api/projects", json={"title": "接口演示", "goal": "G"})
     assert created.status_code == 201
     project_id = created.json()["id"]
@@ -63,9 +63,9 @@ def test_project_stage_run_trajectory_flow(client):
     stages = client.get("/api/stages").json()
     assert [s["stage_id"] for s in stages] == [f"S{i}" for i in range(1, 9)]
 
-    run_resp = client.post(f"/api/projects/{project_id}/stages/S2/run")
-    assert run_resp.status_code == 200
-    run_id = run_resp.json()["run_id"]
+    _, snapshot = run_and_wait(client, project_id, "S2")
+    assert snapshot["status"] == "succeeded"
+    run_id = snapshot["run_id"]
 
     detail = client.get(f"/api/runs/{run_id}").json()
     assert detail["status"] == "succeeded"
@@ -83,23 +83,25 @@ def test_project_stage_run_trajectory_flow(client):
     assert client.get("/api/runs/9999").status_code == 404
 
 
-def test_failed_stage_is_persisted_with_actionable_error(client):
+def test_failed_stage_is_persisted_with_actionable_error(client, run_and_wait):
     """失败的 run / checkpoint / failed_attempt 必须落库。
 
     修复前：get_session 在任何异常上统一 rollback，把 Orchestrator 刚写好的失败现场
     一并丢弃，前端「详见流内记录」指向空——最该留的失败轨迹反而没有。
+    现在这段责任在 worker 身上（受理接口手上没有可失败的阶段了）。
     """
     project_id = client.post(
         "/api/projects", json={"title": "失败落库", "goal": "G"}
     ).json()["id"]
     client.app.state.ai_registry.get("mock")._fail_times = 999  # 模型持续不可用
 
-    resp = client.post(f"/api/projects/{project_id}/stages/S1/run")
-    assert resp.status_code == 503
-    assert resp.json()["detail"]["code"] == "LLM-UNAVAIL-001"
+    _, snapshot = run_and_wait(client, project_id, "S1")
+    assert snapshot["status"] == "failed"
+    assert "unavailable" in (snapshot["error"] or "")
 
     runs = client.get(f"/api/projects/{project_id}/runs").json()
     assert len(runs) == 1 and runs[0]["status"] == "failed"
+    assert runs[0]["id"] == snapshot["run_id"]  # 失败作业仍指向失败现场
 
     detail = client.get(f"/api/runs/{runs[0]['id']}").json()
     assert "unavailable" in (detail["error"] or "")
@@ -110,7 +112,7 @@ def test_failed_stage_is_persisted_with_actionable_error(client):
             client.get(f"/api/projects/{project_id}/decisions").json()] == ["failed_attempt"]
 
 
-def test_unparseable_output_is_kept_in_trajectory(client):
+def test_unparseable_output_is_kept_in_trajectory(client, run_and_wait):
     """FIX-06：解析失败时原始输出必须留在轨迹里，否则无从排查模型到底吐了什么。"""
     project_id = client.post(
         "/api/projects", json={"title": "输出解析", "goal": "G"}
@@ -118,7 +120,8 @@ def test_unparseable_output_is_kept_in_trajectory(client):
     # 合法 JSON 但不是对象 → 通过 schema 校验却在 S1 解析阶段失败，正好命中该分支
     client.app.state.ai_registry.get("mock")._response = "[1, 2, 3]"
 
-    assert client.post(f"/api/projects/{project_id}/stages/S1/run").status_code == 500
+    _, snapshot = run_and_wait(client, project_id, "S1")
+    assert snapshot["status"] == "failed"
 
     runs = client.get(f"/api/projects/{project_id}/runs").json()
     detail = client.get(f"/api/runs/{runs[0]['id']}").json()
@@ -127,39 +130,16 @@ def test_unparseable_output_is_kept_in_trajectory(client):
     assert errors[0]["content"]["raw"] == "[1, 2, 3]"
 
 
-def test_lifespan_wires_the_async_job_layer(client):
-    """FIX-03：应用启动即挂上作业层，worker 真的会在后台把作业跑到终态。
+def test_lifespan_wires_the_async_job_layer(client, run_and_wait):
+    """FIX-03：应用启动即挂上作业层，worker 真的会在后台把作业跑到终态。"""
+    assert client.app.state.job_runner is not None
+    project_id = client.post(
+        "/api/projects", json={"title": "异步冒烟", "goal": "图神经网络推荐"}
+    ).json()["id"]
 
-    这里绕开 HTTP 直接走 ``app.state.job_runner``，因为 run 的受理接口在
-    下一步（SSE 那一版）才切过去；本测试要钉的是「应用启动后作业层可用」。
-    """
-    import time
+    job_id, snapshot = run_and_wait(client, project_id, "S1")
+    assert snapshot["status"] == "succeeded", snapshot["error"]
 
-    from app.store.dao import jobs as jobs_dao
-    from app.store.dao import projects as projects_dao
-
-    state = client.app.state
-    assert state.job_runner is not None
-    factory = state.session_factory
-
-    with factory() as session:
-        project = projects_dao.create(session, title="异步冒烟", goal="图神经网络推荐")
-        session.commit()
-        job = state.job_runner.submit(
-            session, project_id=project.id, kind="stage", stage_id="S1",
-        )
-        job_id = job.id
-
-    deadline = time.monotonic() + 20
-    while time.monotonic() < deadline:
-        with factory() as session:
-            row = jobs_dao.get(session, job_id)
-            if jobs_dao.is_terminal(row):
-                break
-        time.sleep(0.05)
-
-    with factory() as session:
-        row = jobs_dao.get(session, job_id)
-        assert row.status == "succeeded", row.error
-        assert [e.type for e in jobs_dao.events_after(session, job_id)][-1] == "job.succeeded"
-        assert jobs_dao.events_after(session, job_id)[0].type == "job.queued"
+    events = client.get(f"/api/jobs/{job_id}/events").json()
+    assert events[0]["type"] == "job.queued"
+    assert events[-1]["type"] == "job.succeeded"

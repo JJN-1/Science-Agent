@@ -44,9 +44,9 @@ def _make_project(client) -> int:
 
 # ── US-204：决策日志 ─────────────────────────────
 
-def test_decisions_recorded_and_listed(client):
+def test_decisions_recorded_and_listed(client, run_and_wait):
     project_id = _make_project(client)
-    client.post(f"/api/projects/{project_id}/stages/S1/run")
+    run_and_wait(client, project_id, "S1")
     rows = client.get(f"/api/projects/{project_id}/decisions").json()
     assert len(rows) == 1
     assert rows[0]["kind"] == "decision"
@@ -56,9 +56,9 @@ def test_decisions_recorded_and_listed(client):
 
 # ── US-203：成本归因 ─────────────────────────────
 
-def test_usage_summary_by_agent(client):
+def test_usage_summary_by_agent(client, run_and_wait):
     project_id = _make_project(client)
-    client.post(f"/api/projects/{project_id}/stages/S1/run")
+    run_and_wait(client, project_id, "S1")
     data = client.get(f"/api/usage/summary?project_id={project_id}&dim=agent").json()
     assert data["dim"] == "agent"
     assert data["rows"][0]["key"] == "scout"
@@ -69,7 +69,7 @@ def test_usage_summary_by_agent(client):
 
 # ── US-205：审批暂停与恢复 ────────────────────────
 
-def test_budget_pause_and_approve_resume(client, session_factory):
+def test_budget_pause_and_approve_resume(client, session_factory, run_and_wait):
     from app.store.dao import agents as agents_dao
 
     project_id = _make_project(client)
@@ -78,8 +78,8 @@ def test_budget_pause_and_approve_resume(client, session_factory):
         agent.budget_steps = 0
         s.commit()
 
-    resp = client.post(f"/api/projects/{project_id}/stages/S1/run")
-    assert resp.json()["status"] == "paused"
+    _, job = run_and_wait(client, project_id, "S1")
+    assert job["status"] == "paused"
 
     pending = client.get(f"/api/approvals?project_id={project_id}").json()
     assert len(pending) == 1 and pending[0]["status"] == "pending"
@@ -96,7 +96,7 @@ def test_budget_pause_and_approve_resume(client, session_factory):
     assert detail["status"] == "succeeded"
 
 
-def test_reject_approval(client, session_factory):
+def test_reject_approval(client, session_factory, run_and_wait):
     from app.store.dao import agents as agents_dao
 
     project_id = _make_project(client)
@@ -104,7 +104,7 @@ def test_reject_approval(client, session_factory):
         agent = agents_dao.get_by_agent_id(s, "scout")
         agent.budget_steps = 0
         s.commit()
-    client.post(f"/api/projects/{project_id}/stages/S1/run")
+    run_and_wait(client, project_id, "S1")
     pending = client.get(f"/api/approvals?project_id={project_id}").json()
     rejected = client.post(f"/api/approvals/{pending[0]['id']}/reject", json={}).json()
     assert rejected["status"] == "rejected"

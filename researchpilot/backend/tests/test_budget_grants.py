@@ -118,7 +118,7 @@ def client(engine, session_factory, ai_config):
         yield c
 
 
-def _pause_scout(client, session_factory) -> tuple[int, list]:
+def _pause_scout(client, session_factory, wait_job) -> tuple[int, list]:
     """把 scout 步数预算压到 0 触发一次熔断，返回 (project_id, pending_approvals)。"""
     project_id = client.post(
         "/api/projects", json={"title": "预算项目", "goal": "G"}
@@ -127,17 +127,21 @@ def _pause_scout(client, session_factory) -> tuple[int, list]:
         agent = agents_dao.get_by_agent_id(s, "scout")  # lifespan 已播种
         agent.budget_steps = 0
         s.commit()
-    assert client.post(f"/api/projects/{project_id}/stages/S1/run").json()["status"] == "paused"
+    resp = client.post(f"/api/projects/{project_id}/stages/S1/run")
+    assert resp.status_code == 202  # 受理即返回，不再阻塞
+    assert wait_job(client, resp.json()["job_id"])["status"] == "paused"
     return project_id, client.get(f"/api/approvals?project_id={project_id}").json()
 
 
-def test_approve_issues_grant_and_resumes_without_manual_budget_edit(client, session_factory):
+def test_approve_issues_grant_and_resumes_without_manual_budget_edit(
+    client, session_factory, wait_job
+):
     """FIX-02 回归：批准本身必须恢复运行。
 
     修复前：批准只改 approvals.status，预算计数分文未动，重跑立刻再次熔断 ——
     表现为「批准 → 又弹一条新审批」的无限循环，演示时靠手工改库才走通。
     """
-    project_id, pending = _pause_scout(client, session_factory)
+    project_id, pending = _pause_scout(client, session_factory, wait_job)
     assert len(pending) == 1
     assert pending[0]["detail"]["suggested_grant"] == 20
     assert pending[0]["detail"]["agent_id"] == "scout"
@@ -152,7 +156,8 @@ def test_approve_issues_grant_and_resumes_without_manual_budget_edit(client, ses
     # 不再堆新的 pending 审批
     assert client.get(f"/api/approvals?project_id={project_id}").json() == []
     # 豁免有效期内持续生效
-    assert client.post(f"/api/projects/{project_id}/stages/S1/run").json()["status"] == "succeeded"
+    resumed = client.post(f"/api/projects/{project_id}/stages/S1/run")
+    assert wait_job(client, resumed.json()["job_id"])["status"] == "succeeded"
 
     grants = client.get(f"/api/projects/{project_id}/budget-grants").json()
     assert len(grants) == 1
@@ -160,9 +165,9 @@ def test_approve_issues_grant_and_resumes_without_manual_budget_edit(client, ses
     assert grants[0]["amount"] == 20
 
 
-def test_grant_amount_is_a_real_constraint(client, session_factory):
+def test_grant_amount_is_a_real_constraint(client, session_factory, wait_job):
     """豁免额度是真约束而非「放行开关」：批 0 额度，重跑仍然熔断。"""
-    project_id, pending = _pause_scout(client, session_factory)
+    project_id, pending = _pause_scout(client, session_factory, wait_job)
     approved = client.post(
         f"/api/approvals/{pending[0]['id']}/approve", json={"grant_amount": 0}
     ).json()
@@ -170,8 +175,8 @@ def test_grant_amount_is_a_real_constraint(client, session_factory):
     assert client.get(f"/api/runs/{approved['new_run_id']}").json()["status"] == "paused"
 
 
-def test_approve_accepts_explicit_grant_amount(client, session_factory):
-    project_id, pending = _pause_scout(client, session_factory)
+def test_approve_accepts_explicit_grant_amount(client, session_factory, wait_job):
+    project_id, pending = _pause_scout(client, session_factory, wait_job)
     approved = client.post(
         f"/api/approvals/{pending[0]['id']}/approve", json={"grant_amount": 3.5}
     ).json()
@@ -179,9 +184,9 @@ def test_approve_accepts_explicit_grant_amount(client, session_factory):
     assert client.get(f"/api/runs/{approved['new_run_id']}").json()["status"] == "succeeded"
 
 
-def test_approval_records_decision_audit(client, session_factory):
+def test_approval_records_decision_audit(client, session_factory, wait_job):
     """谁批的、批了多少、有效期多久，都要能从决策日志里查出来。"""
-    project_id, pending = _pause_scout(client, session_factory)
+    project_id, pending = _pause_scout(client, session_factory, wait_job)
     client.post(f"/api/approvals/{pending[0]['id']}/approve", json={"note": "同意加预算"})
     rows = client.get(f"/api/projects/{project_id}/decisions").json()
     audits = [r for r in rows if r["decided_by"] == "user"]
@@ -193,9 +198,9 @@ def test_approval_records_decision_audit(client, session_factory):
     assert decided[0]["decided_at"] is not None
 
 
-def test_approval_survives_a_failed_resume(client, session_factory):
+def test_approval_survives_a_failed_resume(client, session_factory, wait_job):
     """重跑失败不能把人的批准动作一起回滚——审批单「回到待审」是最让人困惑的状态。"""
-    project_id, pending = _pause_scout(client, session_factory)
+    project_id, pending = _pause_scout(client, session_factory, wait_job)
     client.app.state.ai_registry.get("mock")._fail_times = 999  # 让重跑时的模型调用失败
 
     approved = client.post(f"/api/approvals/{pending[0]['id']}/approve", json={}).json()
@@ -208,8 +213,8 @@ def test_approval_survives_a_failed_resume(client, session_factory):
     assert len(client.get(f"/api/projects/{project_id}/budget-grants").json()) == 1
 
 
-def test_reject_does_not_issue_grant(client, session_factory):
-    project_id, pending = _pause_scout(client, session_factory)
+def test_reject_does_not_issue_grant(client, session_factory, wait_job):
+    project_id, pending = _pause_scout(client, session_factory, wait_job)
     rejected = client.post(f"/api/approvals/{pending[0]['id']}/reject", json={}).json()
     assert "grant" not in rejected
     assert client.get(f"/api/projects/{project_id}/budget-grants").json() == []

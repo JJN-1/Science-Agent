@@ -3,14 +3,12 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy.orm import Session
 
-from app.ai.base import ProviderError
 from app.api.deps import get_session
-from app.api.schemas import RunStageResponse, StageOut
+from app.api.schemas import JobAccepted, PipelineRunRequest, StageOut
 from app.orchestration.orchestrator import Orchestrator
 from app.store.dao import blackboard as blackboard_dao
 from app.store.dao import checkpoints as checkpoint_dao
 from app.store.dao import projects as projects_dao
-from app.store.dao import runs as runs_dao
 
 router = APIRouter(tags=["stages"])
 
@@ -31,33 +29,51 @@ def list_stages(request: Request) -> list[StageOut]:
     ]
 
 
-@router.post("/api/projects/{project_id}/stages/{stage_id}/run", response_model=RunStageResponse)
+@router.post("/api/projects/{project_id}/stages/{stage_id}/run",
+             response_model=JobAccepted, status_code=202)
 def run_stage(project_id: int, stage_id: str, request: Request,
-              session: Session = Depends(get_session)) -> RunStageResponse:
+              session: Session = Depends(get_session)) -> JobAccepted:
+    """受理一次阶段运行（FIX-03）：立刻返回 ``job_id``，执行交给作业层。
+
+    受理不阻塞是这条接口的全部意义 —— 分钟级的阶段会撞 HTTP 超时，而且
+    用户全程看不到进度。进度从 ``GET /api/jobs/{id}/stream`` 订阅。
+
+    原先那段「失败先 commit 再抛 503」的特判随之消失：受理接口手上已经
+    什么都没有可失败的，失败现场的责任搬去了 worker（``JobRunner._settle_failed``）。
+    """
     if projects_dao.get(session, project_id) is None:
         raise HTTPException(status_code=404, detail="项目不存在")
     orchestrator: Orchestrator = request.app.state.orchestrator
-    try:
-        run_id = orchestrator.run_stage(session, project_id, stage_id)
-    except KeyError:
-        raise HTTPException(status_code=404, detail=f"未知阶段: {stage_id}") from None
-    except Exception as exc:
-        # Orchestrator 已经把失败状态（run=failed / checkpoint / failed_attempt / 原始输出）
-        # 写进了 session，但 get_session 在异常时统一 rollback，会把这些记录一并丢掉——
-        # 前端「详见流内记录」于是指向空，最该留的失败现场反而没了。
-        # 这里先提交失败记录，再返回结构化的可操作错误。
-        try:
-            session.commit()
-        except Exception:
-            session.rollback()
-        if isinstance(exc, ProviderError):
-            raise HTTPException(
-                status_code=503,
-                detail={"code": exc.code, "message": str(exc)},
-            ) from None
-        raise HTTPException(status_code=500, detail=f"阶段执行失败: {exc}") from None
-    run = runs_dao.get_run(session, run_id)
-    return RunStageResponse(run_id=run_id, status=run.status if run else "unknown")
+    if not orchestrator.registry.has(stage_id):
+        raise HTTPException(status_code=404, detail=f"未知阶段: {stage_id}")
+
+    job = request.app.state.job_runner.submit(
+        session, project_id=project_id, kind="stage", stage_id=stage_id,
+    )
+    return JobAccepted(job_id=job.id, status=job.status)
+
+
+@router.post("/api/projects/{project_id}/pipeline/run",
+             response_model=JobAccepted, status_code=202)
+def run_pipeline(project_id: int, request: Request,
+                 payload: PipelineRunRequest | None = None,
+                 session: Session = Depends(get_session)) -> JobAccepted:
+    """受理一次全链路运行；可选只跑指定阶段子集。"""
+    if projects_dao.get(session, project_id) is None:
+        raise HTTPException(status_code=404, detail="项目不存在")
+    orchestrator: Orchestrator = request.app.state.orchestrator
+
+    stage_ids = list(payload.stage_ids) if payload and payload.stage_ids else None
+    if stage_ids is not None:
+        unknown = [sid for sid in stage_ids if not orchestrator.registry.has(sid)]
+        if unknown:
+            raise HTTPException(status_code=400, detail=f"未知阶段: {', '.join(unknown)}")
+
+    job = request.app.state.job_runner.submit(
+        session, project_id=project_id, kind="pipeline",
+        params={"stage_ids": stage_ids} if stage_ids else None,
+    )
+    return JobAccepted(job_id=job.id, status=job.status)
 
 
 @router.get("/api/projects/{project_id}/blackboard")

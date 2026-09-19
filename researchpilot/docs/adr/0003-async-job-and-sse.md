@@ -48,10 +48,25 @@ HTTP 连接可能被中间层超时切断、用户全程看不到进度、前端
 
 - 事件写入频率提高，SQLite 写放大上升，需要通过单 worker 串行化避免写锁争抢。
 - 进程中断会留下 `running` 状态的僵尸作业，必须依赖启动自愈（lifespan 内 `recover_orphans`）兜底。
-- `cancel` 只能作用于本进程内的 `asyncio.Task`，跨进程取消不支持。
+- `cancel` 只能取消**尚未开跑**的作业，跨进程取消不支持。
 
 ### 需要跟随的动作
 
 - lifespan 中接入 `recover_orphans()`，把遗留的 `running` 作业标记为 `failed(error="进程中断")` 并补发 `job.failed` 事件。
 - SSE 端点需发送心跳（`: ping`，15s）以穿过中间层空闲超时。
 - 前端 `EventSource` 连续订阅失败 2 次后降级为 1s 轮询 `GET /api/jobs/{id}`。
+
+## 实现补充（Sprint 3 落地时确定）
+
+| 主题 | 结论 | 理由 |
+|---|---|---|
+| SSE 帧形状 | 只发 `id:` + `data:`，事件类型放在 `data.type` 里，**不发 `event:` 字段** | 一旦写了 `event:`，浏览器只会触发同名监听器，通用 `onmessage` 不再响应；前端需要的是一条「什么都能收到」的流 |
+| `cancel` 的作用域 | 仅未开跑的作业（从队列摘除 + 落 `failed`） | 同步编排跑在 `anyio` 工作线程里，Python 无法安全中断它；硬取消只会留下「线程还在写、台账已判死」 |
+| worker 并发度 | 单 worker 串行（`asyncio.Queue` + 1 个消费协程） | SQLite 只有一个写者，并行只会把 wait 时间换成 timeout 风险；要并行得先换库 |
+| 执行线程 | `anyio.to_thread.run_sync` + 线程内自建 session | 编排层是同步 SQLAlchemy，与事件循环同线程会把整个服务卡死；请求 session 在受理那一刻就已结束 |
+| 队列入队 | 跨线程一律 `call_soon_threadsafe` | `asyncio.Queue.put_nowait` 的唤醒绑定事件循环，跨线程直调只会留下一个无人通知的 future，作业永远停在 `queued` |
+
+**命名陷阱**：作业状态是 `succeeded/failed/paused`，事件类型是 `job.succeeded/job.failed/job.paused`。
+两者字符串相近但不能互比 —— 曾因此在 SSE 终止条件里写出「永不退出」的流，靠
+`after_seq` 超过末条事件的用例才发现。判断作业是否终态请用
+`app.store.models.JOB_TERMINAL_STATUSES`，判断事件用 `app.jobs.events.TERMINAL_EVENT_TYPES`。

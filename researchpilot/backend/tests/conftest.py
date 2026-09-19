@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import time
+
 import pytest
 
 from app.store.db import make_engine, make_session_factory
@@ -75,3 +77,43 @@ def session(session_factory):
     yield s
     s.rollback()
     s.close()
+
+
+TERMINAL_JOB_STATUSES = ("succeeded", "failed", "paused")
+
+
+def _await_job(client, job_id: int, timeout: float) -> dict:
+    deadline = time.monotonic() + timeout
+    snapshot: dict = {}
+    while time.monotonic() < deadline:
+        snapshot = client.get(f"/api/jobs/{job_id}").json()
+        if snapshot["status"] in TERMINAL_JOB_STATUSES:
+            return snapshot
+        time.sleep(0.05)
+    raise AssertionError(f"作业 {job_id} 未在 {timeout}s 内结束：{snapshot}")
+
+
+@pytest.fixture
+def wait_job():
+    """等作业到终态后返回快照。
+
+    FIX-03 之后 ``POST .../run`` 只受理，测试必须自己等 —— 这正是「受理与执行
+    解耦」在测试侧的表现。
+    """
+    def _wait(client, job_id: int, timeout: float = 20.0) -> dict:
+        return _await_job(client, job_id, timeout)
+
+    return _wait
+
+
+@pytest.fixture
+def run_and_wait():
+    """受理一个阶段运行并等它结束，返回 ``(job_id, 快照)``。"""
+    def _run(client, project_id: int, stage_id: str,
+             timeout: float = 20.0) -> tuple[int, dict]:
+        resp = client.post(f"/api/projects/{project_id}/stages/{stage_id}/run")
+        assert resp.status_code == 202, resp.text
+        job_id = resp.json()["job_id"]
+        return job_id, _await_job(client, job_id, timeout)
+
+    return _run
