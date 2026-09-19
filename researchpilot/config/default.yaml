@@ -7,16 +7,29 @@ log:
 
 # ── AI 接入层（方案 §8）────────────────────────
 # 默认指向 mock provider：零配置首启即可演示完整治理链路。
-# 配置真实模型：在设置界面录入 Key（写入 Windows 凭据管理器），
-# 或在用户 config.yaml 增加 openai_compat 类型 provider 并调整 routing。
+#
+# 接入自己的模型：打开「设置 · 模型后端」，用接入表单新增一个 provider 并录入 Key
+# （Key 写入 Windows 凭据管理器，不落配置文件）。表单写入的就是本文件同名的键，
+# 只是存放在用户 config.yaml 里并深度覆盖此处。
+#
+# provider 配置字段（对应设置页的接入表单）：
+#   type          mock / openai_compat        必填
+#   base_url      OpenAI 兼容端点根地址        非 mock 必填
+#   models        可用模型 ID 列表             必填
+#   vendor        厂商标识                     必填（critique 档据此做跨厂商校验）
+#   api_key_ref   凭据管理器引用名             可留空 = 该端点无需鉴权
+#   capabilities  json_object/tools/stream/vision
+#   price         每 1K token 的 {input, output} 单价
+#   timeout_s     覆盖默认超时（秒）
+#   extra_headers / extra_body  透传字段
 ai:
   providers:
     mock:
       type: mock
-      model: mock-small
+      models: [mock-small]
       vendor: mock
       capabilities: [json_object]
-      price_per_1k: {input: 0.0, output: 0.0}
+      price: {input: 0.0, output: 0.0}
       response: '{"questions": [{"question": "如何提升图神经网络推荐模型的可解释性", "rationale": "现有 GNN 推荐方法决策过程不透明，缺乏可解释性研究", "score": 0.82}, {"question": "图神经网络推荐系统中的过平滑问题的缓解策略", "rationale": "层数加深导致性能下降，是 GNN 推荐的主要瓶颈", "score": 0.75}, {"question": "基于对比学习的图神经网络冷启动推荐", "rationale": "冷启动场景下结构信息利用不足", "score": 0.68}]}'
   routing:
     extract:    [{provider: mock, model: mock-small}]

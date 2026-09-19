@@ -9,6 +9,7 @@ from app.ai.base import (
     ProviderUnavailable,
     QuotaExceeded,
     RateLimited,
+    resolve_models,
 )
 
 
@@ -17,10 +18,11 @@ class MockProvider(ChatProvider):
 
     def __init__(self, name: str, cfg: dict) -> None:
         self.name = name
-        self.model = cfg.get("model", "mock-small")
+        self.models = resolve_models(name, cfg)
+        self.model = self.models[0]
         self.vendor = cfg.get("vendor", "mock")
         self.capabilities = frozenset(cfg.get("capabilities", ["json_object"]))
-        self.price = cfg.get("price_per_1k", {"input": 0.0, "output": 0.0})
+        self.price = cfg.get("price") or cfg.get("price_per_1k") or {"input": 0.0, "output": 0.0}
         self._healthy = cfg.get("healthy", True)
         self._fail_times = int(cfg.get("fail_times", 0))
         self._fail_with = cfg.get("fail_with", "unavailable")  # unavailable|rate_limited|quota

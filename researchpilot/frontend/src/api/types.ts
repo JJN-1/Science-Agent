@@ -91,14 +91,54 @@ export interface Approval {
   decided_at: string | null
 }
 
+export type HealthState = 'ok' | 'unconfigured' | 'down' | string
+
+/** provider 来源：内置（default.yaml）/ 用户接入（config.yaml）/ 仅运行期 */
+export type ProviderSource = 'builtin' | 'user' | 'runtime'
+
 export interface ProviderHealth {
   name: string
   type: string
   model: string
+  models: string[]
   vendor: string
   capabilities: string[]
+  price: { input: number; output: number }
+  health: HealthState
   healthy: boolean
   circuit_failures: number
+  detail: string | null
+  /** 引用位置，如 routing:plan / agent:scout */
+  referenced_by: string[]
+  source: ProviderSource
+  deletable: boolean
+}
+
+/** 接入表单提交体（US-312）；未提交的字段在 PATCH 时沿用现值 */
+export interface ProviderInput {
+  name?: string
+  type?: string
+  base_url?: string | null
+  models?: string[]
+  vendor?: string
+  api_key_ref?: string | null
+  capabilities?: string[]
+  price?: { input: number; output: number }
+  timeout_s?: number
+  extra_headers?: Record<string, string> | null
+  extra_body?: Record<string, unknown> | null
+}
+
+export interface ProviderTypes {
+  types: string[]
+  capabilities: string[]
+}
+
+export interface ProbeResult {
+  provider: string
+  ok: boolean
+  models: string[]
+  detail: string | null
 }
 
 export interface TierRoute {

@@ -159,8 +159,9 @@ def _providers(**overrides) -> dict:
     base = {"type": "mock", "model": "m", "vendor": "mock",
             "capabilities": ["json_object"]}
     out = {}
-    for name, cfg in {"a": base, **overrides}.items():
-        out[name] = MockProvider(name, cfg)
+    # 逐字段覆盖而非整体替换：用例只想改某一项，其余保持基线
+    for name, extra in {"a": {}, **overrides}.items():
+        out[name] = MockProvider(name, {**base, **extra})
     return out
 
 

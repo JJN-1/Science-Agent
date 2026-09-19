@@ -96,6 +96,21 @@ class ChatProvider(ABC):
         )
 
 
+def resolve_models(name: str, cfg: dict) -> list[str]:
+    """从配置解析模型清单：``models`` 优先，兼容旧的单数 ``model``。
+
+    provider 只承载「声明了哪些模型」；具体用哪个由档位路由的 (provider, model) 决定。
+    """
+    raw = cfg.get("models")
+    if raw is None:
+        single = cfg.get("model")
+        raw = [single] if single else []
+    models = [str(m).strip() for m in raw if str(m).strip()]
+    if not models:
+        raise ValueError(f"provider {name} 未声明任何模型（需要 models 列表）")
+    return models
+
+
 def monotonic() -> float:
     """进程内单调时钟：测延迟、算 TTL 都该用它。"""
     return time.monotonic()

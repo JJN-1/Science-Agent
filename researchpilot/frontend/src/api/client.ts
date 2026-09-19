@@ -3,8 +3,11 @@ import type {
   Approval,
   BlackboardItem,
   Decision,
+  ProbeResult,
   Project,
   ProviderHealth,
+  ProviderInput,
+  ProviderTypes,
   RunDetail,
   StageInfo,
   TierRoute,
@@ -72,6 +75,26 @@ export const api = {
       { method: 'POST', body: JSON.stringify({ note: '' }) },
     ),
   getProviders: () => request<ProviderHealth[]>('/settings/providers'),
+  createProvider: (data: ProviderInput) =>
+    request<{ provider: string; config: ProviderInput }>('/settings/providers', {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
+  updateProvider: (name: string, data: ProviderInput) =>
+    request<{ provider: string; config: ProviderInput }>(
+      `/settings/providers/${name}`,
+      { method: 'PATCH', body: JSON.stringify(data) },
+    ),
+  deleteProvider: (name: string) =>
+    request<{ provider: string; removed: boolean }>(`/settings/providers/${name}`, {
+      method: 'DELETE',
+    }),
+  probeModels: (name: string, data: { base_url?: string; api_key?: string } = {}) =>
+    request<ProbeResult>(`/settings/providers/${name}/probe-models`, {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
+  getProviderTypes: () => request<ProviderTypes>('/settings/provider-types'),
   reloadProviders: () =>
     request<{ providers: string[]; removed: string[]; added: string[] }>(
       '/settings/providers/reload',

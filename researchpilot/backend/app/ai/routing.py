@@ -123,3 +123,11 @@ class Router:
             tier: [{"provider": c.provider, "model": c.model} for c in chain]
             for tier, chain in self._routes.items()
         }
+
+    def replace(self, cfg: dict, providers: dict[str, ChatProvider]) -> None:
+        """按配置整体替换路由表，**原地更新**（US-312）。
+
+        `LlmGateway` 在构造时就持有了 Router 引用，替换实例会让它继续用旧路由；
+        原地改 `_routes` 才能保证「改配置即生效」。
+        """
+        self._routes = Router.from_config(cfg, providers)._routes

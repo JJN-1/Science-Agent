@@ -1,28 +1,38 @@
 import { useCallback, useEffect, useState } from 'react'
-import { App as AntdApp, Input, Modal, Table } from 'antd'
+import { App as AntdApp, Input, Modal, Popconfirm, Table } from 'antd'
 import { api, ApiError } from '../api/client'
-import type { ProviderHealth, TierRoute } from '../api/types'
+import type { ProviderHealth, ProviderTypes, TierRoute } from '../api/types'
+import ProviderForm, { healthLabel } from './ProviderForm'
 
 const TIERS = ['extract', 'plan', 'critique', 'synthesize', 'write'] as const
 
-/** 设置对话框（US-206）：后端健康、档位路由热切换、Key 录入、热重载 */
+const EMPTY_TYPES: ProviderTypes = { types: [], capabilities: [] }
+
+/** 设置对话框（US-206 / US-312）：模型后端接入、档位路由热切换、Key 录入、热重载 */
 export default function SettingsDialog({ open, onClose }: { open: boolean; onClose: () => void }) {
   const { message } = AntdApp.useApp()
   const [providers, setProviders] = useState<ProviderHealth[]>([])
   const [routing, setRouting] = useState<Record<string, TierRoute[]>>({})
   const [draft, setDraft] = useState<Record<string, TierRoute>>({})
   const [keys, setKeys] = useState<Record<string, string>>({})
+  const [types, setTypes] = useState<ProviderTypes>(EMPTY_TYPES)
+  const [editing, setEditing] = useState<ProviderHealth | 'new' | null>(null)
   const [loading, setLoading] = useState(false)
 
   const load = useCallback(async () => {
     setLoading(true)
     try {
-      const [p, r] = await Promise.all([api.getProviders(), api.getRouting()])
+      const [p, r, t] = await Promise.all([
+        api.getProviders(),
+        api.getRouting(),
+        api.getProviderTypes(),
+      ])
       setProviders(p)
       setRouting(r)
+      setTypes(t)
       setDraft(
         Object.fromEntries(
-          TIERS.map((t) => [t, r[t]?.[0] ?? { provider: '', model: '' }]),
+          TIERS.map((tier) => [tier, r[tier]?.[0] ?? { provider: '', model: '' }]),
         ) as Record<string, TierRoute>,
       )
     } catch (err) {
@@ -61,6 +71,16 @@ export default function SettingsDialog({ open, onClose }: { open: boolean; onClo
     }
   }
 
+  const remove = async (name: string) => {
+    try {
+      await api.deleteProvider(name)
+      message.success(`${name} 已移除`)
+      await load()
+    } catch (err) {
+      message.error(err instanceof ApiError ? err.message : '删除失败')
+    }
+  }
+
   const reload = async () => {
     try {
       const delta = await api.reloadProviders()
@@ -71,11 +91,15 @@ export default function SettingsDialog({ open, onClose }: { open: boolean; onClo
     }
   }
 
+  const closeForm = () => setEditing(null)
+
   return (
-    <Modal title="设置 · 模型后端与档位路由" open={open} onCancel={onClose} footer={null} width={720}>
+    <Modal title="设置 · 模型后端与档位路由" open={open} onCancel={onClose} footer={null} width={860}>
       <div className="settings-section">
         <div className="settings-head">
           <span>模型后端</span>
+          <span className="spacer" />
+          <button className="btn tiny" onClick={() => setEditing('new')}>＋ 接入新后端</button>
           <button className="btn tiny" onClick={reload}>⟳ 热重载</button>
         </div>
         <Table<ProviderHealth>
@@ -89,34 +113,93 @@ export default function SettingsDialog({ open, onClose }: { open: boolean; onClo
               title: '',
               dataIndex: 'healthy',
               width: 24,
-              render: (healthy: boolean) => (
-                <span className={`dot s-${healthy ? 'succeeded' : 'failed'}`} style={{ display: 'inline-block' }} />
+              render: (healthy: boolean, row: ProviderHealth) => (
+                <span
+                  className={`dot s-${healthy ? 'succeeded' : 'failed'}`}
+                  style={{ display: 'inline-block' }}
+                  title={row.detail ?? healthLabel(row.health)}
+                />
               ),
             },
-            { title: '名称', dataIndex: 'name', width: 100 },
-            { title: '类型', dataIndex: 'type', width: 130 },
-            { title: '模型', dataIndex: 'model', width: 120 },
-            { title: '厂商', dataIndex: 'vendor', width: 90 },
+            { title: '名称', dataIndex: 'name', width: 90 },
+            { title: '类型', dataIndex: 'type', width: 120 },
             {
-              title: 'API Key（写入凭据管理器）',
-              dataIndex: 'key',
-              render: (_: unknown, row: ProviderHealth) =>
-                row.type === 'MockProvider' ? (
-                  <span style={{ color: 'var(--faint)' }}>无需 Key</span>
-                ) : (
-                  <Input.Search
-                    size="small"
-                    type="password"
-                    placeholder="粘贴 API Key"
-                    value={keys[row.name] ?? ''}
-                    onChange={(e) => setKeys((k) => ({ ...k, [row.name]: e.target.value }))}
-                    onSearch={() => saveKey(row.name)}
-                    enterButton="保存"
-                  />
-                ),
+              title: '模型',
+              dataIndex: 'models',
+              render: (models: string[]) => models.join(', '),
+            },
+            { title: '厂商', dataIndex: 'vendor', width: 80 },
+            {
+              title: '状态',
+              dataIndex: 'health',
+              width: 100,
+              render: (health: string, row: ProviderHealth) =>
+                health === 'ok' && row.healthy ? '可用' : healthLabel(health),
+            },
+            {
+              title: '被引用',
+              dataIndex: 'referenced_by',
+              width: 120,
+              render: (refs: string[]) =>
+                refs.length ? refs.join('、') : <span style={{ color: 'var(--faint)' }}>无</span>,
+            },
+            {
+              title: '操作',
+              width: 110,
+              render: (_: unknown, row: ProviderHealth) => (
+                <span className="row-actions">
+                  <button
+                    className="btn tiny"
+                    disabled={row.source === 'builtin'}
+                    onClick={() => setEditing(row)}
+                  >
+                    编辑
+                  </button>
+                  <Popconfirm
+                    title={`移除 ${row.name}？`}
+                    description="被档位路由或 Agent 引用时会被拒绝。"
+                    okText="移除"
+                    cancelText="取消"
+                    disabled={!row.deletable}
+                    onConfirm={() => remove(row.name)}
+                  >
+                    <button className="btn tiny" disabled={!row.deletable}>删除</button>
+                  </Popconfirm>
+                </span>
+              ),
             },
           ]}
         />
+        <div className="settings-hint">
+          接入表单写入用户 config.yaml，保存即刻生效、无需重启。Key 只进 Windows 凭据管理器。
+        </div>
+      </div>
+
+      <div className="settings-section">
+        <div className="settings-head">
+          <span>API Key（写入凭据管理器）</span>
+        </div>
+        {providers.filter((p) => p.type !== 'MockProvider').length === 0 && (
+          <div className="settings-hint">当前没有需要密钥的后端。</div>
+        )}
+        {providers
+          .filter((p) => p.type !== 'MockProvider')
+          .map((row) => (
+            <div className="tier-row" key={row.name}>
+              <span className="tier-name">{row.name}</span>
+              <Input.Search
+                size="small"
+                type="password"
+                style={{ width: 320 }}
+                placeholder="粘贴 API Key"
+                value={keys[row.name] ?? ''}
+                onChange={(e) => setKeys((k) => ({ ...k, [row.name]: e.target.value }))}
+                onSearch={() => saveKey(row.name)}
+                enterButton="保存"
+              />
+              {row.detail && <span className="tier-current">{row.detail}</span>}
+            </div>
+          ))}
       </div>
 
       <div className="settings-section">
@@ -155,6 +238,28 @@ export default function SettingsDialog({ open, onClose }: { open: boolean; onClo
           </div>
         ))}
       </div>
+
+      <Modal
+        title={editing === 'new' ? '接入新模型后端' : `编辑 ${editing?.name ?? ''}`}
+        open={editing !== null}
+        onCancel={closeForm}
+        footer={null}
+        width={720}
+        destroyOnHidden
+      >
+        {editing !== null && (
+          <ProviderForm
+            key={editing === 'new' ? '__new__' : editing.name}
+            initial={editing === 'new' ? null : editing}
+            types={types}
+            onSaved={() => {
+              closeForm()
+              void load()
+            }}
+            onCancel={closeForm}
+          />
+        )}
+      </Modal>
     </Modal>
   )
 }

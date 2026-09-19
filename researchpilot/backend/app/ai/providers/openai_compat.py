@@ -17,6 +17,7 @@ from app.ai.base import (
     ProviderUnavailable,
     RateLimited,
     monotonic,
+    resolve_models,
 )
 
 KEYRING_SERVICE = "ResearchPilot"
@@ -38,32 +39,48 @@ class OpenAICompatProvider(ChatProvider):
 
     def __init__(self, name: str, cfg: dict, transport: httpx.BaseTransport | None = None) -> None:
         self.name = name
-        self.model = cfg["model"]
+        self.models = resolve_models(name, cfg)
+        self.model = self.models[0]
         self.vendor = cfg.get("vendor", "openai")
         self.capabilities = frozenset(cfg.get("capabilities", ["json_object", "tools"]))
-        self.price = cfg.get("price_per_1k", {"input": 0.0, "output": 0.0})
+        self.price = cfg.get("price") or cfg.get("price_per_1k") or {"input": 0.0, "output": 0.0}
         self.base_url = cfg["base_url"].rstrip("/")
         self.timeout_s = float(cfg.get("timeout_s", 120))
         self.max_retries = int(cfg.get("max_retries", 3))
         self.backoff_base = float(cfg.get("backoff_base", 1.0))
-        self.api_key_ref = cfg.get("api_key_ref", name)
+        ref = cfg.get("api_key_ref")
+        self.api_key_ref = name if ref is None else str(ref).strip()
+        # api_key_ref 显式留空 = 该端点无需鉴权（本地自建端点）
+        self.auth_required = bool(self.api_key_ref)
+        self.extra_headers = {str(k): str(v) for k, v in (cfg.get("extra_headers") or {}).items()}
+        self.extra_body = dict(cfg.get("extra_body") or {})
         self._transport = transport
         self._health_cache: tuple[float, str] | None = None
 
     def _peek_key(self) -> str | None:
         """读取凭据；缺失或凭据后端不可用时返回 None，不抛异常。"""
+        if not self.auth_required:
+            return None
         try:
             return keyring.get_password(KEYRING_SERVICE, self.api_key_ref) or None
         except Exception:
             return None
 
-    def _api_key(self) -> str:
+    def _api_key(self) -> str | None:
+        if not self.auth_required:
+            return None
         key = self._peek_key()
         if not key:
             raise ProviderUnavailable(
                 f"provider {self.name} 未配置 API Key（凭据管理器引用: {self.api_key_ref}）"
             )
         return key
+
+    def _headers(self) -> dict[str, str]:
+        key = self._api_key()
+        headers: dict[str, str] = {"Authorization": f"Bearer {key}"} if key else {}
+        headers.update(self.extra_headers)  # 本地端点可用自定义头替代 Bearer 鉴权
+        return headers
 
     def complete(self, request: ChatRequest) -> ChatResponse:
         payload: dict = {
@@ -86,7 +103,8 @@ class OpenAICompatProvider(ChatProvider):
         )
 
     def _post(self, payload: dict) -> dict:
-        headers = {"Authorization": f"Bearer {self._api_key()}"}
+        headers = self._headers()
+        body = {**payload, **self.extra_body}
         last_error: Exception | None = None
         for attempt in range(self.max_retries + 1):
             try:
@@ -94,7 +112,7 @@ class OpenAICompatProvider(ChatProvider):
                     base_url=self.base_url, timeout=self.timeout_s,
                     transport=self._transport, follow_redirects=False,
                 ) as client:
-                    resp = client.post("/chat/completions", json=payload, headers=headers)
+                    resp = client.post("/chat/completions", json=body, headers=headers)
                 if resp.status_code < 400:
                     return resp.json()
                 if resp.status_code in RETRYABLE_STATUS:
@@ -128,15 +146,14 @@ class OpenAICompatProvider(ChatProvider):
         return state
 
     def _probe_health(self) -> str:
-        key = self._peek_key()
-        if key is None:
+        if self.auth_required and self._peek_key() is None:
             return HEALTH_UNCONFIGURED
         try:
             with httpx.Client(
                 base_url=self.base_url, timeout=5.0, transport=self._transport,
                 follow_redirects=False,
             ) as client:
-                resp = client.get("/models", headers={"Authorization": f"Bearer {key}"})
+                resp = client.get("/models", headers=self._headers())
             return HEALTH_OK if resp.status_code < 500 else HEALTH_DOWN
         except httpx.HTTPError:
             return HEALTH_DOWN
@@ -145,8 +162,29 @@ class OpenAICompatProvider(ChatProvider):
         """录入 / 更换 Key 后调用，使下一次 health() 立即重新探测。"""
         self._health_cache = None
 
+    def list_remote_models(self, base_url: str | None = None,
+                           api_key: str | None = None) -> list[str]:
+        """探测端点可用模型（US-312）；只取 `id` 字段。
+
+        上游清单里没有能力与价格信息，因此返回值只用于给用户勾选模型 ID，
+        绝不据此推断 capabilities / price（设计 §8.1）。
+        """
+        url = (base_url or self.base_url).rstrip("/")
+        headers = {"Authorization": f"Bearer {api_key}"} if api_key else self._headers()
+        with httpx.Client(timeout=10.0, transport=self._transport,
+                          follow_redirects=False) as client:
+            resp = client.get(f"{url}/models", headers=headers)
+        if resp.status_code >= 400:
+            raise ProviderError(f"{self.name} 探测模型失败 HTTP {resp.status_code}")
+        data = resp.json()
+        items = data.get("data") if isinstance(data, dict) else None
+        if not isinstance(items, list):
+            raise ProviderError(f"{self.name} 的 /models 响应不是 OpenAI 兼容格式")
+        return [str(item["id"]) for item in items
+                if isinstance(item, dict) and item.get("id")]
+
     def unavailable_reason(self) -> str:
-        if self._peek_key() is None:
+        if self.auth_required and self._peek_key() is None:
             return (
                 f"provider {self.name} 尚未录入 API Key"
                 f"（凭据管理器引用: {self.api_key_ref}）。"

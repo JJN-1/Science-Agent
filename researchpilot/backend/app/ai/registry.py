@@ -54,7 +54,12 @@ class ProviderRegistry:
         }
 
     @classmethod
-    def from_config(cls, cfg: dict) -> ProviderRegistry:
+    def from_config(cls, cfg: dict, *, probe_health: bool = True) -> ProviderRegistry:
+        """按配置建实例。
+
+        ``probe_health=False`` 用于「试装」这类只关心结构是否合法的场景：
+        它跳过网络探测，避免一次配置校验打出一串真实请求。
+        """
         ai_cfg = cfg.get("ai", {})
         providers: dict[str, ChatProvider] = {}
         for name, pcfg in (ai_cfg.get("providers") or {}).items():
@@ -66,11 +71,12 @@ class ProviderRegistry:
                     f"未知 provider 类型: {ptype} (provider={name})；已支持: {known}"
                 )
             provider = factory(name, pcfg)
-            state = provider.health()
-            if state != HEALTH_OK:
-                # 保留并告警，而不是剔除：配置已写好但 Key 还没录是完全正常的中间状态。
-                logger.warning("provider_not_ready", provider=name,
-                               health=state, reason=provider.unavailable_reason())
+            if probe_health:
+                state = provider.health()
+                if state != HEALTH_OK:
+                    # 保留并告警，而不是剔除：配置已写好但 Key 还没录是完全正常的中间状态。
+                    logger.warning("provider_not_ready", provider=name,
+                                   health=state, reason=provider.unavailable_reason())
             providers[name] = provider
         return cls(providers, ai_cfg.get("circuit", {}))
 
@@ -96,8 +102,10 @@ class ProviderRegistry:
                     "name": name,
                     "type": type(p).__name__,
                     "model": p.model,
+                    "models": list(getattr(p, "models", [p.model])),
                     "vendor": p.vendor,
                     "capabilities": sorted(p.capabilities),
+                    "price": dict(p.price),
                     "health": state,
                     "healthy": state == HEALTH_OK and not self._is_open(name),
                     "circuit_failures": st.failures,
