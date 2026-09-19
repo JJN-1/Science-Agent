@@ -215,12 +215,16 @@ goldset:
 ### 4.1 分层
 
 ```
-界面层    React 18 + TS + Vite + Ant Design 5 ｜ AntV G6（图谱）｜ SSE 进度
-          阶段导航 · 黑板浏览器 · Agent 轨迹回放 · 人工检查点 · 报告视图
+界面层    React 19 + TS + Vite + Ant Design 6 ｜ AntV G6（图谱）｜ SSE 进度
+          会话流 · 计划卡片 · Agent 轨迹回放 · 人工检查点 · 报告视图
 ──────────────────────────────────────────────────────────────────────
 服务层    FastAPI（单进程，127.0.0.1，启动令牌校验）
           ├ 同步端点  检索 / 查询 / CRUD / 设置
-          └ 异步端点  阶段运行 / 执行实验 / 导出   立即返回 jobId
+          └ 异步端点  阶段运行 / 管道运行 / 执行实验 / 导出   立即返回 jobId
+──────────────────────────────────────────────────────────────────────
+内核层    Agent Kernel（阶段一）
+          任务拆解 · 工具注册表与调用循环 · 权限闸门 · 上下文装配 · 检查点恢复
+          对话式入口；S1–S8 确定性编排作为其一种技能
 ──────────────────────────────────────────────────────────────────────
 编排层    Orchestrator（Supervisor 模式）
           阶段调度 · 动态路径 · 回退边 · 检查点 · 人工中断点
@@ -255,8 +259,10 @@ AI 能力层 ①检索聚合 ②解析路由 ③向量检索 ④Agent 推理 ⑤
 Orchestrator（同进程 asyncio）
    ├─► 阶段 Agent ──► Blackboard（结构化共享状态，SQLite）
    ├─► 支撑 Agent ──► Curator（记忆）/ Critic（评审）/ Steward（治理）
-   └─► ProviderRegistry ──► 云端 API（默认）
-                            └ 可选：本地 Ollama（非交付必需）
+   └─► ProviderRegistry ──► 用户自定义模型后端（§8.1）
+                            ├ OpenAI 兼容端点
+                            ├ Anthropic 兼容端点
+                            └ 本地自建端点（如 Ollama，非交付必需）
 
 JobWorker ──► 沙箱子进程（受限令牌 + 目录白名单 + 资源配额 + 禁网）
 ```
@@ -265,9 +271,9 @@ JobWorker ──► 沙箱子进程（受限令牌 + 目录白名单 + 资源配
 
 | 阶段 | 形态 | 理由 |
 |---|---|---|
-| 开发期（Sprint 1–5） | 本地 Web 应用：`uvicorn` + `vite dev` | **不让打包阻塞敏捷迭代** |
-| 开发期（Sprint 6–7） | `vite build` + FastAPI 静态托管，单进程 | 提前暴露集成问题 |
-| 交付期（Sprint 8） | 桌面安装包（pywebview + python-build-standalone + Inno Setup） | 用户不接触命令行 |
+| 开发期（Sprint 1–9） | 本地 Web 应用：`uvicorn` + `vite dev` | **不让打包阻塞敏捷迭代** |
+| 开发期（Sprint 10） | `vite build` + FastAPI 静态托管，单进程 | 提前暴露集成问题 |
+| 交付期（Sprint 11） | 桌面安装包（pywebview + python-build-standalone + Inno Setup） | 用户不接触命令行 |
 
 **打包策略沿用可靠方案**：捆绑独立 CPython 运行时，源码 + venv 交付，不用 PyInstaller（隐藏导入复杂、启动慢、易被误报）。体积目标 < 300 MB。
 
@@ -645,23 +651,56 @@ Orchestrator 建立 Blackboard，加载领域包，生成初始路线图
 
 ## 8. AI 接入层
 
-### 8.1 四类 Provider 抽象
+### 8.1 Provider 抽象与注册表
 
-`ChatProvider` / `EmbeddingProvider` / `RerankProvider` / `ParseProvider`，统一由 `ProviderRegistry` 出口。每个 Provider 声明 `capabilities` 与 `health()`，不健康的后端不进入注册表。
+`ChatProvider` / `EmbeddingProvider` / `RerankProvider` / `ParseProvider`，统一由 `ProviderRegistry` 出口。每个 Provider 声明 `capabilities` 与 `health()`。
+
+**健康为三态**：`ok` / `unconfigured` / `down`。注册表保留全部已声明的 provider，**不按健康状态剔除**；可用性在调用点由 `check_available()` 判定，未达标时抛出的错误必须携带可操作提示（如「请先在设置页录入 API Key」）。
+
+**Provider 类型**
+
+| 类型 | 说明 | 端点 |
+|---|---|---|
+| `mock` | 确定性假模型，零配置首启与测试用 | 进程内 |
+| `openai_compat` | OpenAI 兼容 HTTP 端点，`base_url` 可指向任意兼容网关 | `POST {base_url}/chat/completions` |
+| `anthropic_compat` | Anthropic Messages 协议，视需要启用 | `POST {base_url}/v1/messages` |
+
+**用户自定义 Provider 接入**
+
+用户可在设置页新增、修改、删除任意模型后端，不改代码、不重启。
+
+| 字段 | 必填 | 说明 |
+|---|:---:|---|
+| `name` | ✅ | 唯一标识，被档位路由与 Agent 定义引用 |
+| `type` | ✅ | 协议类型，取自上表 |
+| `base_url` | ✅ | 端点根地址；校验禁内网网段、禁跟随重定向（§10.5） |
+| `models` | ✅ | 该后端可用的模型 ID 列表 |
+| `vendor` | ✅ | 厂商标识，用于 `critique` 跨厂商校验（§8.2）；自建端点如实填写 |
+| `api_key_ref` | ⬜ | 凭据管理器中的引用名；本地端点（如 Ollama）可留空 |
+| `capabilities` | ✅ | 声明 `json_object` / `tools` / `stream` / `vision`；未声明的能力按缺失处理（§8.3） |
+| `price` | ⬜ | 每 1K token 输入 / 输出单价，用于成本归因；留空按 0 记账 |
+| `timeout_s` | ⬜ | 覆盖默认超时（§11.4） |
+| `extra_headers` / `extra_body` | ⬜ | 透传字段，兼容需要特殊参数的端点 |
+
+**模型清单获取**：端点若兼容 `GET {base_url}/models`，提供「自动拉取」按钮列出候选模型；不兼容时用户手工填写。
+
+**能力与价格不由上游推断**：端点返回的模型清单只取 `id` 列表；`capabilities` 与单价一律以本地配置为准，不依赖上游返回值。
+
+**写入即生效**：新增或修改 provider 后立即重建注册表，并失效该 provider 的健康探测缓存，无需重启。
 
 ### 8.2 档位：按科研动作划分
 
 | 档位 | 典型任务 | 质量敏感度 | 调用量 | 默认后端 |
 |---|---|---|---|---|
-| `extract` | 字段抽取、分类、打标、实体识别 | 低 | 极高 | 云端轻量模型 |
-| `plan` | 研究问题生成、假设生成、实验方案设计 | 高 | 中 | 云端强模型 |
+| `extract` | 字段抽取、分类、打标、实体识别 | 低 | 极高 | 用户指定的轻量模型 |
+| `plan` | 研究问题生成、假设生成、实验方案设计 | 高 | 中 | 用户指定的强模型 |
 | `critique` | 评审、证据校验、一致性检查 | 高 | 中 | **与产出方不同厂商的模型** |
-| `synthesize` | 分析解读、综述合成、投稿匹配 | 高 | 低 | 云端强模型 |
-| `write` | 结构化草稿生成 | 中 | 中 | 云端中档模型 |
+| `synthesize` | 分析解读、综述合成、投稿匹配 | 高 | 低 | 用户指定的强模型 |
+| `write` | 结构化草稿生成 | 中 | 中 | 用户指定的中档模型 |
 
-**关键约束**：`critique` 档必须配置为与 `plan` / `synthesize` **不同厂商**的模型，否则失去交叉验证意义。
+**关键约束**：`critique` 档必须配置为与 `plan` / `synthesize` **不同厂商**的模型，否则失去交叉验证意义。厂商取自 provider 配置的 `vendor` 字段（§8.1），配置加载期校验。
 
-**模型配置约束**：免费档仅用于 `extract`。`plan` / `critique` / `synthesize` 的产出直接构成结论，必须由用户首次运行时配置可用档次的模型；未配置时这些档位不可用，界面明确提示，**不静默回落到免费档**。
+**档位绑定的是模型能力，不是模型来源或价格**。用户可为每个档位指定任意已配置的 provider / model。`plan` / `critique` / `synthesize` 的产出直接构成结论，必须由用户在首次运行时显式指定；指定时界面显示能力提示，并把该选择写入 `provider_switch_log` 供审计。**任何档位未配置时该档位不可用，界面明确提示，不静默回落到任何默认模型。**
 
 ### 8.3 能力矩阵与降级
 
@@ -672,8 +711,11 @@ Orchestrator 建立 Blackboard，加载领域包，生成初始路线图
 | 流式工具调用 | 工具调用场景退回非流式 |
 | 稀疏向量 | 检索降级为 dense + FTS5 双路，记录降级事件并告警 |
 | 上下文不足 | 切 Map-Reduce 分段处理 |
+| 能力未声明或上游未返回能力字段 | 按最小能力集处理，首次调用探测实际支持情况并回写 `llm_usage.degraded` |
 
 所有降级写入 `degraded` 字段并记录审计。
+
+**协议一致性校验**：路由候选链中的每个 `(provider, model)` 必须指向其 `type` 对应的协议端点。`openai_compat` 类型的 provider 只允许挂载支持 Chat Completions 协议的模型；走 Messages、Responses 等其他协议的模型须单独建一个对应 `type` 的 provider。配置加载期校验并拒绝不匹配的组合。
 
 ### 8.4 运行时热切换
 
@@ -684,9 +726,21 @@ Orchestrator 建立 Blackboard，加载领域包，生成初始路线图
 | 档位级 | 某一档位 | `PATCH /api/settings/routing` | 否 |
 | 全局级 | 所有新建项目 | `POST /api/settings/providers/reload` | 否 |
 
+**Provider 管理 API**
+
+| 操作 | 端点 |
+|---|---|
+| 列出（含健康状态） | `GET /api/settings/providers` |
+| 新增 | `POST /api/settings/providers` |
+| 修改 | `PATCH /api/settings/providers/{name}` |
+| 删除 | `DELETE /api/settings/providers/{name}` |
+| 录入 / 更新密钥 | `PUT /api/settings/providers/{name}/key` |
+| 探测端点可用模型 | `POST /api/settings/providers/{name}/probe-models` |
+| 热重载全部 | `POST /api/settings/providers/reload` |
+
 **切换保障**：项目启动时冻结 `RegistrySnapshot`，切换只影响新项目；配置加载阶段拦截路由引用错误与能力缺失；每次切换写 `provider_switch_log`。
 
-API Key 存 **Windows 凭据管理器**，不落盘为明文。
+API Key 存 **Windows 凭据管理器**（`keyring`）；`config.yaml` 只存 `api_key_ref` 引用名，不落盘明文。未录入 Key 的 provider 健康为 `unconfigured`：注册表保留，调用点拒绝并提示「请先在设置页录入 Key」。录入 Key 后主动失效该 provider 的健康探测缓存，无需重启。
 
 ### 8.5 成本控制（多 Agent 场景必须做）
 
@@ -695,10 +749,11 @@ API Key 存 **Windows 凭据管理器**，不落盘为明文。
 | **项目级预算熔断** | 单项目总额（如 ¥50）+ 每日额度，超限即暂停并请人确认 |
 | **Agent 级预算** | 每 Agent 独立步数与成本上限（如 Scout 20 步 / ¥2，Writer 40 步 / ¥5） |
 | **同阶段重试上限** | 同一阶段 ≤ 3 次；同一子目标 ≤ 3 次（防振荡死循环） |
-| **跨 Agent 缓存** | `(provider, model, messages_hash, schema)` 命中即复用，多 Agent 场景命中率高 |
+| **跨 Agent 缓存** | `(provider, model, messages_hash, schema)` 命中即复用，多 Agent 场景命中率高；缓存落 SQLite 表并设 TTL，跨重启有效 |
 | **档位分级** | 简单步骤走轻量档；只有 `plan` / `critique` / `synthesize` 用强档 |
 | **思考预算** | Critic 反思轮次独立上限 |
 | **成本归因** | 按项目 / 阶段 / Agent 三维展示，一眼看出谁最烧钱 |
+| **价格表** | 每 1K token 输入 / 输出单价来自用户对各 provider 的配置（§8.1），不依赖上游返回值；单价为 0 时仍如实记账并标注 provider / model |
 
 **成本目标**：单项目全链路（含 30 篇文献 + 一轮真实实验）< ¥15。
 
@@ -716,6 +771,11 @@ API Key 存 **Windows 凭据管理器**，不落盘为明文。
 | **Agent** | `agents` | Agent 定义与配置（角色、档位、工具、启用状态） |
 | | `agent_runs` | Agent 运行轨迹（阶段、状态、步数、成本） |
 | | `agent_steps` | 单步明细（思考、工具、参数、结果、决策） |
+| **Agent 内核** | `conversations` | 会话（所属项目、标题、状态） |
+| | `messages` | 消息（角色 user / assistant / tool / system、内容、工具调用关联、token 数） |
+| | `task_plans` | 结构化任务计划（版本、状态、模式 plan_execute / react、步骤 JSON） |
+| | `tool_calls` | 工具调用（工具名、参数、权限等级、结果、错误、关联审批单、耗时） |
+| | `kernel_checkpoints` | 内核检查点（计划、步骤序号、快照），支持中断后恢复 |
 | **黑板** | `blackboard` | 结构化共享状态（类型、版本、载荷、产出 Agent、证据） |
 | **阶段产物** | `research_questions` | 研究问题 + 空白点证据 + 可行性评分 |
 | | `hypotheses` | 假设 + 操作化定义 + 变量 + 否证条件 + 状态 + 演化树 |
@@ -728,8 +788,11 @@ API Key 存 **Windows 凭据管理器**，不落盘为明文。
 | **文献** | `documents` / `chunks` / `chunks_fts` / `chunks_fts_tri` | 文献、切片、FTS5 索引（unicode61 + trigram） |
 | | `doc_relations` | 图谱关系（CITES / AUTHORED / AFFILIATED_WITH / PROPOSES / APPLIES / EVALUATED_ON / IMPROVES_UPON / LIMITATION） |
 | | `search_strategies` | ★ 可复现检索策略记录（检索式、时间、结果数） |
-| **任务与成本** | `jobs` / `job_events` | 后台任务与事件 |
+| **任务与成本** | `jobs` / `job_events` | 后台任务与事件；事件按 `seq` 递增，SSE 据此支持 `Last-Event-ID` 断线续传 |
 | | `llm_usage` | 调用记账（**含 project_id / stage / agent_id**，支持三维归因） |
+| | `llm_cache` | LLM 响应缓存（cache_key、provider、model、tier、响应、过期时间） |
+| | `app_config` | 运行期状态持久化（熔断状态等） |
+| | `budget_grants` | 预算豁免（审批签发的额度、有效期、关联审批单） |
 | | `provider_switch_log` | 后端切换审计 |
 | **产出** | `artifacts` | 复现包与产物（路径、哈希、可复现标记、校验日志） |
 
@@ -828,14 +891,17 @@ API Key 存 **Windows 凭据管理器**，不落盘为明文。
 | 项 | 规则 |
 |---|---|
 | 可重试判定 | 按 HTTP 状态与异常类型；参数错误、配额不足不重试 |
+| 鉴权失败（401 / 403） | **不重试、不计入熔断**；把该 provider 标记为 `unconfigured`，提示「请先在设置页录入 Key」 |
 | 退避 | 指数退避 + 抖动，基准 1 s，最多 3 次 |
-| 熔断 | 单后端连续失败 5 次进入冷却，冷却 5 分钟，期间走降级链 |
+| 熔断 | 单后端连续失败 5 次进入冷却，冷却 5 分钟，期间走降级链；状态持久化到 `app_config`，重启后保留；热重载不清零未变更 provider 的计数 |
 | 超时 | 模型调用 120 s，检索 15 s，解析 300 s，**实验执行按方案配置（默认 3600 s）** |
 | 幂等 | 重试使用同一幂等键，写库 upsert |
 
 ### 11.5 离线与降级
 
 模型后端不可用时，本地功能保持可用：文献库浏览、笔记批注、已解析内容检索、向量检索降级为 FTS5。**真实执行分支不受影响**（沙箱是本地能力）。界面顶部显示离线提示，恢复后由用户手动触发重跑，不自动重跑。
+
+**两类不可用须区分提示**：① `unconfigured`（未录入 Key 或 Key 失效）→ 提示「请先在设置页录入 API Key」，并给出跳转入口；② `down`（网络不可达或上游故障）→ 提示离线。二者都不自动重跑。
 
 ---
 
@@ -938,6 +1004,7 @@ API Key 存 **Windows 凭据管理器**，不落盘为明文。
 researchpilot/
 ├── backend/
 │   ├── app/
+│   │   ├── agent_kernel/   # ★ Agent 内核：循环、任务拆解、工具注册、权限闸门、上下文
 │   │   ├── api/            # 路由、静态托管、SSE
 │   │   ├── orchestration/  # ★ Orchestrator、阶段调度、回退边、检查点
 │   │   ├── agents/         # 8 阶段 Agent + 4 支撑 Agent
@@ -967,9 +1034,9 @@ researchpilot/
 
 ## 16. 开发过程
 
-采用 **Scrum，2 周一个 Sprint，共 8 个 Sprint（16 周）**，3 人团队。
+采用 **Scrum，2 周一个 Sprint，共 9 个 Sprint（18 周）**，分两个阶段推进：阶段一交付 Agent 内核，阶段二在核之上扩展科研技能。
 
-完整的用户故事、故事点、Sprint 编排、完成的定义与调整规则见独立文档：**《科研全链路多 Agent 系统 · 敏捷冲刺排期》**。
+完整的用户故事、故事点、Sprint 编排、决策闸口、完成的定义与裁剪规则见独立文档：**《修订排期与修复计划》**。
 
 ---
 
