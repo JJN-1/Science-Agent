@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from sqlalchemy.orm import Session
 
 from app.ai.client import LlmGateway
+from app.jobs.events import LLM_CALL, STEP, emit
 from app.store.dao import blackboard as blackboard_dao
 from app.store.dao import decisions as decisions_dao
 from app.store.dao import runs as runs_dao
@@ -20,12 +21,42 @@ class StageContext:
     agent_id: str
     stage_id: str = ""
     gateway: LlmGateway | None = None
+    job_id: int | None = None
 
     def think(self, text: str) -> None:
-        runs_dao.add_step(self.session, run_id=self.run_id, kind="thought", content={"text": text})
+        self.record("thought", {"text": text})
 
     def record(self, kind: str, content: dict) -> None:
+        """轨迹的唯一写入口。``think`` / ``decide`` / Agent 都从这里过。
+
+        因此「实时进度」只需要在这里挂钩子：写完 ``agent_steps`` 后镜像一条
+        ``step`` 事件，SSE 就能把 Agent 的每一步送到前端 —— 不必让每个 Agent
+        自己记得上报。
+        """
         runs_dao.add_step(self.session, run_id=self.run_id, kind=kind, content=content)
+        self._emit_step(kind, content)
+
+    def _emit_step(self, kind: str, content: dict) -> None:
+        if self.job_id is None:
+            return
+        emit(self.session, self.job_id, STEP,
+             {"kind": kind, "content": content, "run_id": self.run_id})
+
+    def _emit_llm_step(self, response, cost: float, cached: bool) -> None:  # noqa: ANN001
+        """模型调用的结算事件：让「正在等模型」这件事在流里可见。"""
+        if self.job_id is None:
+            return
+        emit(self.session, self.job_id, LLM_CALL, {
+            "provider": response.provider,
+            "model": response.model,
+            "prompt_tokens": response.prompt_tokens,
+            "completion_tokens": response.completion_tokens,
+            "cost": round(cost, 6),
+            "latency_ms": response.latency_ms,
+            "cached": cached,
+            "degraded": list(response.degraded),
+            "run_id": self.run_id,
+        })
 
     def write_blackboard(self, obj_type: str, payload: dict, evidence: list | None = None) -> None:
         blackboard_dao.write(
@@ -64,5 +95,5 @@ class StageContext:
             self.session, project_id=self.project_id, run_id=self.run_id,
             stage_id=self.stage_id, agent_id=self.agent_id, tier=tier,
             messages=messages, schema=schema, max_tokens=max_tokens,
-            temperature=temperature,
+            temperature=temperature, on_step=self._emit_llm_step,
         )

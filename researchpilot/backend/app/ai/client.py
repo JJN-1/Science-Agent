@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Callable
 
 from sqlalchemy.orm import Session
 
@@ -47,6 +48,9 @@ class LlmGateway:
 
     缓存落在 ``llm_cache`` 表（FIX-05），跨重启有效；键由
     (provider, model, tier, messages, schema) 规范化哈希得到。
+
+    ``on_step`` 是给异步作业层用的结算钩子（FIX-03）：``_record`` 落完轨迹与
+    记账后回调一次，让「模型返回了」这件事能变成一条可订阅的事件。
     """
 
     def __init__(self, registry: ProviderRegistry, router: Router,
@@ -71,6 +75,7 @@ class LlmGateway:
         schema: dict | None = None,
         max_tokens: int = 1024,
         temperature: float = 0.7,
+        on_step: Callable[[ChatResponse, float, bool], None] | None = None,
     ) -> ChatResponse:
         self.budget.check(session, project_id, agent_id, run_id)
 
@@ -79,6 +84,8 @@ class LlmGateway:
             self._record(session, project_id=project_id, run_id=run_id,
                          stage_id=stage_id, agent_id=agent_id, tier=tier,
                          response=cached, cost=0.0, cached=True)
+            if on_step is not None:
+                on_step(cached, 0.0, True)
             return cached
 
         request = ChatRequest(
@@ -106,6 +113,8 @@ class LlmGateway:
         self._record(session, project_id=project_id, run_id=run_id,
                      stage_id=stage_id, agent_id=agent_id, tier=tier,
                      response=response, cost=cost, cached=False)
+        if on_step is not None:
+            on_step(response, cost, False)
         return response
 
     def _lookup_cache(self, session: Session, tier: str, messages: list[ChatMessage],

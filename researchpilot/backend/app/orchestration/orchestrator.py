@@ -4,6 +4,8 @@ from sqlalchemy.orm import Session
 
 from app.ai.budget import BudgetExceeded
 from app.ai.client import LlmGateway
+from app.jobs.events import STAGE_FAILED, STAGE_PAUSED, STAGE_START, STAGE_SUCCEEDED, emit
+from app.observability.logging import get_logger
 from app.orchestration.base import StageAgent
 from app.orchestration.context import StageContext
 from app.store.dao import approvals as approvals_dao
@@ -12,6 +14,8 @@ from app.store.dao import decisions as decisions_dao
 from app.store.dao import runs as runs_dao
 
 STAGE_ORDER = ["S1", "S2", "S3", "S4", "S5", "S6", "S7", "S8"]
+
+logger = get_logger("orchestrator")
 
 
 class StageRegistry:
@@ -45,7 +49,28 @@ class Orchestrator:
         self.registry = registry
         self.gateway = gateway
 
-    def run_stage(self, session: Session, project_id: int, stage_id: str) -> int:
+    @staticmethod
+    def _emit(session: Session, job_id: int | None, event_type: str, payload: dict) -> None:
+        """发一条阶段事件（``job_id`` 为空时是同步路径，静默跳过）。
+
+        发事件失败不该盖掉阶段本身的错误 —— 尤其在 ``except`` 分支里，
+        真正要紧的是原始异常，而不是「事件没写成」。
+        """
+        if job_id is None:
+            return
+        try:
+            emit(session, job_id, event_type, payload)
+        except Exception:
+            session.rollback()
+            logger.exception("stage_event_emit_failed", job_id=job_id, event=event_type)
+
+    def run_stage(self, session: Session, project_id: int, stage_id: str,
+                  job_id: int | None = None) -> int:
+        """跑一个阶段。``job_id`` 非空时把阶段起止写成作业事件（FIX-03）。
+
+        事件写入会立即提交（见 ``app.jobs.events.emit``），因此异步路径下
+        「失败现场先落库再抛」这条语义在这里就成立了，API 层不再需要特判。
+        """
         agent = self.registry.get(stage_id)
         run = runs_dao.create_run(
             session, project_id=project_id, stage_id=stage_id, agent_id=agent.agent_id
@@ -53,7 +78,10 @@ class Orchestrator:
         ctx = StageContext(
             session=session, project_id=project_id, run_id=run.id,
             agent_id=agent.agent_id, stage_id=stage_id, gateway=self.gateway,
+            job_id=job_id,
         )
+        self._emit(session, job_id, STAGE_START,
+                   {"stage_id": stage_id, "agent_id": agent.agent_id, "run_id": run.id})
         try:
             writes = agent.run(ctx)
             for w in writes:
@@ -80,6 +108,8 @@ class Orchestrator:
                 snapshot={"stage_id": stage_id, "run_id": run.id,
                           "reason": exc.kind},
             )
+            self._emit(session, job_id, STAGE_PAUSED,
+                       {"stage_id": stage_id, "run_id": run.id, "reason": exc.kind})
             return run.id
         except Exception as exc:
             runs_dao.finish_run(session, run_id=run.id, status="failed", error=str(exc))
@@ -95,6 +125,8 @@ class Orchestrator:
                 status="failed",
                 snapshot={"stage_id": stage_id, "run_id": run.id, "error": str(exc)},
             )
+            self._emit(session, job_id, STAGE_FAILED,
+                       {"stage_id": stage_id, "run_id": run.id, "error": str(exc)})
             raise
         runs_dao.finish_run(session, run_id=run.id, status="succeeded")
         checkpoint_dao.save_checkpoint(
@@ -111,10 +143,13 @@ class Orchestrator:
                 ],
             },
         )
+        self._emit(session, job_id, STAGE_SUCCEEDED,
+                   {"stage_id": stage_id, "run_id": run.id, "writes": len(writes)})
         return run.id
 
     def run_pipeline(self, session: Session, project_id: int,
-                     stage_ids: list[str] | None = None) -> list[int]:
+                     stage_ids: list[str] | None = None,
+                     job_id: int | None = None) -> list[int]:
         """顺序调度：按 STAGE_ORDER 执行已注册的阶段。
 
         任一阶段抛错即向上传播；遇 ``paused``（预算熔断）则**立即中断**，并把
@@ -126,7 +161,7 @@ class Orchestrator:
         for index, stage_id in enumerate(ids):
             if not self.registry.has(stage_id):
                 continue
-            run_id = self.run_stage(session, project_id, stage_id)
+            run_id = self.run_stage(session, project_id, stage_id, job_id=job_id)
             run_ids.append(run_id)
             run = runs_dao.get_run(session, run_id)
             if run is not None and run.status == "paused":

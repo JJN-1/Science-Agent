@@ -242,3 +242,52 @@ class LlmCache(Base):
     response: Mapped[dict] = mapped_column(JSON)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
     expires_at: Mapped[datetime] = mapped_column(DateTime, index=True)
+
+
+# 作业状态：queued → running → succeeded / failed / paused（FIX-03）
+JOB_STATUSES = ("queued", "running", "succeeded", "failed", "paused")
+JOB_TERMINAL_STATUSES = ("succeeded", "failed", "paused")
+
+
+class Job(Base):
+    """异步作业台账（FIX-03）：受理与执行解耦，受理即返回 job_id。
+
+    此前 `POST /run` 是同步阻塞接口：S2 起的分钟级任务会撞 HTTP 超时，
+    且用户全程看不到进度。作业化之后前端拿 job_id 订阅事件流即可。
+    """
+
+    __tablename__ = "jobs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    project_id: Mapped[int] = mapped_column(
+        ForeignKey("projects.id", ondelete="CASCADE"), index=True
+    )
+    kind: Mapped[str] = mapped_column(String(16))  # stage | pipeline
+    stage_id: Mapped[str | None] = mapped_column(String(8), nullable=True)
+    status: Mapped[str] = mapped_column(String(16), default="queued", index=True)
+    run_id: Mapped[int | None] = mapped_column(
+        ForeignKey("agent_runs.id", ondelete="SET NULL"), nullable=True
+    )
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    params: Mapped[dict] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
+class JobEvent(Base):
+    """作业事件日志（FIX-03）：``seq`` 就是 SSE 的 id，支撑 Last-Event-ID 断线续传。
+
+    事件以数据库为准（ADR-0003 / D1），不做进程内队列扇出 —— 跨进程、跨重启都不丢。
+    """
+
+    __tablename__ = "job_events"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    job_id: Mapped[int] = mapped_column(
+        ForeignKey("jobs.id", ondelete="CASCADE"), index=True
+    )
+    seq: Mapped[int] = mapped_column(Integer)
+    type: Mapped[str] = mapped_column(String(32))
+    payload: Mapped[dict] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)

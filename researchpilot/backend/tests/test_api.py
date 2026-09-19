@@ -125,3 +125,41 @@ def test_unparseable_output_is_kept_in_trajectory(client):
     errors = [s for s in detail["steps"] if s["kind"] == "error"]
     assert len(errors) == 1
     assert errors[0]["content"]["raw"] == "[1, 2, 3]"
+
+
+def test_lifespan_wires_the_async_job_layer(client):
+    """FIX-03：应用启动即挂上作业层，worker 真的会在后台把作业跑到终态。
+
+    这里绕开 HTTP 直接走 ``app.state.job_runner``，因为 run 的受理接口在
+    下一步（SSE 那一版）才切过去；本测试要钉的是「应用启动后作业层可用」。
+    """
+    import time
+
+    from app.store.dao import jobs as jobs_dao
+    from app.store.dao import projects as projects_dao
+
+    state = client.app.state
+    assert state.job_runner is not None
+    factory = state.session_factory
+
+    with factory() as session:
+        project = projects_dao.create(session, title="异步冒烟", goal="图神经网络推荐")
+        session.commit()
+        job = state.job_runner.submit(
+            session, project_id=project.id, kind="stage", stage_id="S1",
+        )
+        job_id = job.id
+
+    deadline = time.monotonic() + 20
+    while time.monotonic() < deadline:
+        with factory() as session:
+            row = jobs_dao.get(session, job_id)
+            if jobs_dao.is_terminal(row):
+                break
+        time.sleep(0.05)
+
+    with factory() as session:
+        row = jobs_dao.get(session, job_id)
+        assert row.status == "succeeded", row.error
+        assert [e.type for e in jobs_dao.events_after(session, job_id)][-1] == "job.succeeded"
+        assert jobs_dao.events_after(session, job_id)[0].type == "job.queued"

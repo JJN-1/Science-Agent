@@ -12,9 +12,11 @@ from app.ai.registry import ProviderRegistry as AIProviderRegistry
 from app.ai.routing import Router
 from app.api import governance, projects, runs, settings, stages
 from app.config import ensure_data_dir, load_config
+from app.jobs.runner import JobRunner
 from app.observability.logging import get_logger, setup_logging
 from app.orchestration.orchestrator import Orchestrator, StageRegistry
 from app.store.dao import agents as agents_dao
+from app.store.dao import jobs as jobs_dao
 from app.store.dao import llm_cache as llm_cache_dao
 from app.store.db import database_path, make_engine, make_session_factory
 from app.store.migrations import upgrade_to_head
@@ -51,6 +53,11 @@ async def lifespan(app: FastAPI):
     register_all(registry)
     app.state.orchestrator = Orchestrator(registry, gateway)
 
+    # 异步作业层（FIX-03）：受理即返回，执行交给进程内单 worker。
+    # orchestrator 用 provider 延迟取，热重载后仍拿到最新的那一个。
+    job_runner = JobRunner(session_factory, lambda: app.state.orchestrator)
+    app.state.job_runner = job_runner
+
     # agents 表播种（US-201 契约：档位/预算随 Agent 定义）+ 运行期状态恢复（FIX-05）
     with session_factory() as session:
         for agent in registry.all():
@@ -60,11 +67,16 @@ async def lifespan(app: FastAPI):
             )
         ai_registry.load_circuits(session)      # 熔断状态跨重启保留
         llm_cache_dao.purge_expired(session)    # 清掉过期缓存
+        recovered = jobs_dao.recover_orphans(session)  # 僵尸作业自愈
         session.commit()
+    if recovered:
+        logger.warning("jobs_recovered_from_crash", count=recovered)
 
+    job_runner.start()
     logger.info("startup_complete", data_dir=str(root),
                 providers=ai_registry.names())
     yield
+    await job_runner.stop()
     engine.dispose()
 
 
