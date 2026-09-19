@@ -49,3 +49,57 @@ export interface BlackboardItem {
   evidence: unknown[]
   created_at: string
 }
+
+export interface Decision {
+  id: number
+  run_id: number | null
+  stage_id: string
+  agent_id: string
+  kind: 'decision' | 'failed_attempt' | string
+  decision: string
+  reason: string
+  alternatives: unknown[]
+  decided_by: string
+  created_at: string
+}
+
+export interface UsageRow {
+  key: string
+  calls: number
+  prompt_tokens: number
+  completion_tokens: number
+  cost: number
+}
+
+export interface UsageSummary {
+  dim: string
+  project_id: number
+  rows: UsageRow[]
+  total_cost: number
+}
+
+export interface Approval {
+  id: number
+  project_id: number
+  run_id: number | null
+  kind: string
+  detail: Record<string, unknown>
+  status: string
+  created_at: string
+  decided_at: string | null
+}
+
+export interface ProviderHealth {
+  name: string
+  type: string
+  model: string
+  vendor: string
+  capabilities: string[]
+  healthy: boolean
+  circuit_failures: number
+}
+
+export interface TierRoute {
+  provider: string
+  model: string
+}

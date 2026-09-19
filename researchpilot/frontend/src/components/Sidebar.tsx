@@ -3,6 +3,7 @@ import { Link, useNavigate, useParams } from 'react-router-dom'
 import { App as AntdApp, Form, Input, Modal, Select } from 'antd'
 import { api, ApiError } from '../api/client'
 import type { Project } from '../api/types'
+import SettingsDialog from './SettingsDialog'
 
 export default function Sidebar() {
   const { message } = AntdApp.useApp()
@@ -10,6 +11,7 @@ export default function Sidebar() {
   const navigate = useNavigate()
   const [projects, setProjects] = useState<Project[]>([])
   const [open, setOpen] = useState(false)
+  const [settingsOpen, setSettingsOpen] = useState(false)
   const [form] = Form.useForm()
 
   const load = useCallback(async () => {
@@ -56,10 +58,19 @@ export default function Sidebar() {
         </div>
       )}
       <div className="side-foot">
+        <button
+          className="btn"
+          style={{ width: '100%', marginBottom: 8 }}
+          onClick={() => setSettingsOpen(true)}
+        >
+          ⚙ 设置 · 模型后端
+        </button>
         <button className="btn primary" style={{ width: '100%' }} onClick={() => setOpen(true)}>
           ＋ 新建项目
         </button>
       </div>
+
+      <SettingsDialog open={settingsOpen} onClose={() => setSettingsOpen(false)} />
 
       <Modal
         title="新建研究项目"

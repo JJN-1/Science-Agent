@@ -24,6 +24,30 @@ function stepText(step: AgentStep): string | null {
     : null
 }
 
+function isLlmCall(step: AgentStep): boolean {
+  return step.kind === 'llm_call' && typeof step.content.cost === 'number'
+}
+
+/** llm_call 步骤元信息行：⎿ llm plan · model · tok · ¥cost · 降级标记 */
+function LlmMeta({ step }: { step: AgentStep }) {
+  const c = step.content as Record<string, unknown>
+  const prompt = Number(c.prompt_tokens ?? 0)
+  const completion = Number(c.completion_tokens ?? 0)
+  const cost = Number(c.cost ?? 0)
+  const degraded = Array.isArray(c.degraded) ? (c.degraded as string[]) : []
+  const flags = [
+    c.cached === true ? 'cached' : null,
+    ...degraded,
+  ].filter(Boolean) as string[]
+  return (
+    <span className="llm-meta">
+      {String(c.tier ?? '')} · {String(c.provider ?? '')}/{String(c.model ?? '')} ·{' '}
+      {prompt + completion} tok · ¥{cost.toFixed(4)}
+      {flags.length > 0 && <em className="llm-flags"> · ⚠ {flags.join(' / ')}</em>}
+    </span>
+  )
+}
+
 interface RunBlockProps {
   run: AgentRun
   steps: AgentStep[]
@@ -63,16 +87,20 @@ export default function RunBlock({ run, steps, writes, running }: RunBlockProps)
   }
 
   const status = running ? 'running' : run.status
+  const runCost = steps.filter(isLlmCall).reduce((sum, s) => sum + Number(s.content.cost), 0)
 
   return (
     <div>
       <div className={`runhead s-${status}`}>
         <span className="glyph" aria-hidden="true">
-          {running ? '✻' : status === 'failed' ? '✗' : '⏺'}
+          {running ? '✻' : status === 'paused' ? '⏸' : status === 'failed' ? '✗' : '⏺'}
         </span>
         <span className="title">{run.stage_id}</span>
         <span className="meta">{run.agent_id}</span>
         {!running && <span className="meta">· {steps.length} steps</span>}
+        {!running && runCost > 0 && (
+          <span className="meta run-cost">· ¥{runCost.toFixed(4)}</span>
+        )}
         <span className="end">
           <span className="meta">{timeOf(running ? null : run.started_at)}</span>
           {!running && steps.length > 0 && (
@@ -104,9 +132,12 @@ export default function RunBlock({ run, steps, writes, running }: RunBlockProps)
         return (
           <div key={step.id} className={cls}>
             <span className="glyph" aria-hidden="true">⎿</span>
-            <span className="kind">{KIND_LABEL[step.kind] ?? step.kind}</span>
+            <span className="kind">{step.kind === 'llm_call' ? 'llm' : KIND_LABEL[step.kind] ?? step.kind}</span>
             <span className="body">
-              {text ? (
+              {isLlmCall(step) && <LlmMeta step={step} />}
+              {text && text.length <= 120 ? (
+                <span className="md-inline">{text}</span>
+              ) : text ? (
                 <Markdown text={text} />
               ) : (
                 <details>

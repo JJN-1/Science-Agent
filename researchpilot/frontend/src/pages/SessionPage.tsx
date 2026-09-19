@@ -2,7 +2,15 @@ import { useCallback, useEffect, useState } from 'react'
 import { useParams } from 'react-router-dom'
 import { App as AntdApp, Spin } from 'antd'
 import { api, ApiError } from '../api/client'
-import type { AgentRun, AgentStep, BlackboardItem, Project, StageInfo } from '../api/types'
+import type {
+  AgentRun,
+  AgentStep,
+  Approval,
+  BlackboardItem,
+  Project,
+  StageInfo,
+} from '../api/types'
+import ApprovalCard from '../components/ApprovalCard'
 import RunBlock from '../components/RunBlock'
 import CommandBar from '../components/CommandBar'
 
@@ -24,6 +32,7 @@ export default function SessionPage() {
   const [stages, setStages] = useState<StageInfo[]>([])
   const [runs, setRuns] = useState<RunWithSteps[]>([])
   const [blackboard, setBlackboard] = useState<BlackboardItem[]>([])
+  const [approvals, setApprovals] = useState<Approval[]>([])
   const [loading, setLoading] = useState(true)
   const [notFound, setNotFound] = useState(false)
   const [runningStage, setRunningStage] = useState<string | null>(null)
@@ -36,13 +45,15 @@ export default function SessionPage() {
     try {
       const p = await api.getProject(projectId)
       setProject(p)
-      const [s, r, b] = await Promise.all([
+      const [s, r, b, ap] = await Promise.all([
         api.listStages(),
         api.listRuns(projectId),
         api.getBlackboard(projectId),
+        api.listApprovals(projectId),
       ])
       setStages(s)
       setBlackboard(b)
+      setApprovals(ap)
       // 每个 run 拉取完整步骤（Sprint 1 规模小，可接受），按时间正序呈现在会话流中
       const withSteps = await Promise.all(
         r.map(async (run) => ({ run, steps: (await api.getRun(run.id)).steps ?? [] })),
@@ -79,6 +90,15 @@ export default function SessionPage() {
       setRunningStage(null)
       await load()
     }
+  }
+
+  const handleApproval = async (approvalId: number, action: 'approve' | 'reject') => {
+    try {
+      await api.decideApproval(approvalId, action)
+    } catch (err) {
+      message.error(err instanceof ApiError ? err.message : '审批操作失败')
+    }
+    await load()
   }
 
   if (notFound) {
@@ -159,6 +179,14 @@ export default function SessionPage() {
               <span className="glyph" aria-hidden="true">!</span>
               <span>{evt.text}</span>
             </div>
+          ))}
+
+          {approvals.map((ap) => (
+            <ApprovalCard
+              key={ap.id}
+              approval={ap}
+              onDecide={(action) => handleApproval(ap.id, action)}
+            />
           ))}
         </div>
       </div>

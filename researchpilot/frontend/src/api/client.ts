@@ -1,4 +1,15 @@
-import type { AgentRun, BlackboardItem, Project, RunDetail, StageInfo } from './types'
+import type {
+  AgentRun,
+  Approval,
+  BlackboardItem,
+  Decision,
+  Project,
+  ProviderHealth,
+  RunDetail,
+  StageInfo,
+  TierRoute,
+  UsageSummary,
+} from './types'
 
 const BASE = '/api'
 
@@ -48,4 +59,33 @@ export const api = {
   getRun: (runId: number) => request<RunDetail>(`/runs/${runId}`),
   getBlackboard: (projectId: number) =>
     request<BlackboardItem[]>(`/projects/${projectId}/blackboard`),
+  // ── Sprint 2：治理与设置 ──
+  listDecisions: (projectId: number) =>
+    request<Decision[]>(`/projects/${projectId}/decisions`),
+  usageSummary: (projectId: number, dim: 'agent' | 'stage' | 'provider') =>
+    request<UsageSummary>(`/usage/summary?project_id=${projectId}&dim=${dim}`),
+  listApprovals: (projectId: number, status = 'pending') =>
+    request<Approval[]>(`/approvals?project_id=${projectId}&status=${status}`),
+  decideApproval: (approvalId: number, action: 'approve' | 'reject') =>
+    request<{ approval_id: number; status: string; new_run_id?: number | null }>(
+      `/approvals/${approvalId}/${action}`,
+      { method: 'POST', body: JSON.stringify({ note: '' }) },
+    ),
+  getProviders: () => request<ProviderHealth[]>('/settings/providers'),
+  reloadProviders: () =>
+    request<{ providers: string[]; removed: string[]; added: string[] }>(
+      '/settings/providers/reload',
+      { method: 'POST' },
+    ),
+  getRouting: () => request<Record<string, TierRoute[]>>('/settings/routing'),
+  patchRouting: (tier: string, candidates: TierRoute[]) =>
+    request<{ tier: string; candidates: TierRoute[] }>('/settings/routing', {
+      method: 'PATCH',
+      body: JSON.stringify({ tier, candidates }),
+    }),
+  setProviderKey: (name: string, key: string) =>
+    request<{ provider: string; stored: boolean }>(`/settings/providers/${name}/key`, {
+      method: 'PUT',
+      body: JSON.stringify({ key }),
+    }),
 }
