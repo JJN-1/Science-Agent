@@ -38,8 +38,14 @@ def project_decisions(project_id: int, session: Session = Depends(get_session)) 
 
 
 @router.get("/api/usage/summary")
-def usage_summary(project_id: int, dim: str = "agent",
+def usage_summary(project_id: int | None = None, dim: str = "agent",
                   session: Session = Depends(get_session)) -> dict:
+    """成本与调用次数归因（US-203）。
+
+    ``project_id`` 可省略 —— 不传即全库汇总。设置页的「模型供应商统计」问的是
+    「我这个后端到底被调过几次」，那是全局问题；按项目切片答不了。
+    合计一并返回，免得每个调用方各自求和（并各自求错）。
+    """
     try:
         rows = usage_dao.summary_by(session, project_id, dim)
     except ValueError:
@@ -49,6 +55,8 @@ def usage_summary(project_id: int, dim: str = "agent",
         "project_id": project_id,
         "rows": rows,
         "total_cost": sum(r["cost"] for r in rows),
+        "total_calls": sum(r["calls"] for r in rows),
+        "total_failed": sum(r["failed"] for r in rows),
     }
 
 

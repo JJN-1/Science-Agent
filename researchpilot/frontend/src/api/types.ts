@@ -76,11 +76,18 @@ export interface UsageRow {
   cost: number
 }
 
+/** 归因维度：后端 / 阶段 / Agent（US-203）。 */
+export type UsageDim = 'provider' | 'stage' | 'agent'
+
 export interface UsageSummary {
   dim: string
-  project_id: number
+  /** null = 全库汇总（未按项目切片）。 */
+  project_id: number | null
   rows: UsageRow[]
   total_cost: number
+  /** 含失败调用，与 rows 口径一致；合计由后端算好，避免各调用方各求各的。 */
+  total_calls: number
+  total_failed: number
 }
 
 export interface Approval {

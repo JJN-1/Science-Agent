@@ -118,6 +118,12 @@ def test_failed_stage_is_persisted_with_actionable_error(client, run_and_wait):
                                "prompt_tokens": 0, "completion_tokens": 0, "cost": 0.0}
     assert usage["total_cost"] == 0.0
 
+    # 全库汇总同样看得见这次失败 —— 设置页的「模型供应商统计」用的就是这条路径，
+    # 只按项目切片是不够的：用户问的是「我这个端点一共被调过几次」。
+    glob = client.get("/api/usage/summary?dim=provider").json()
+    assert glob["project_id"] is None
+    assert glob["total_calls"] == 1 and glob["total_failed"] == 1
+
 
 def test_unparseable_output_is_kept_in_trajectory(client, run_and_wait):
     """FIX-06：解析失败时原始输出必须留在轨迹里，否则无从排查模型到底吐了什么。

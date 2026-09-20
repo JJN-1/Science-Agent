@@ -84,11 +84,14 @@ def run_cost(session: Session, run_id: int) -> float:
     )
 
 
-def summary_by(session: Session, project_id: int, dim: str) -> list[dict]:
+def summary_by(session: Session, project_id: int | None, dim: str) -> list[dict]:
     """三维归因：dim ∈ {stage, agent, provider}。
 
     ``calls`` 含失败调用，``failed`` 单列失败次数 —— 只统计成功的话，
     「这个后端到底被调过几次」这个问题永远答不对。
+
+    ``project_id`` 为 None 时统计**全库**。用户排查「模型供应商统计里没有我这次
+    请求」时问的是全局，而按项目切片的接口答不了这个问题。
     """
     columns = {"stage": LlmUsage.stage_id, "agent": LlmUsage.agent_id,
                "provider": LlmUsage.provider}
@@ -98,7 +101,7 @@ def summary_by(session: Session, project_id: int, dim: str) -> list[dict]:
     failed = func.coalesce(
         func.sum(case((LlmUsage.status != STATUS_OK, 1), else_=0)), 0
     )
-    rows = session.execute(
+    stmt = (
         select(
             key,
             func.count(LlmUsage.id),
@@ -107,10 +110,14 @@ def summary_by(session: Session, project_id: int, dim: str) -> list[dict]:
             func.coalesce(func.sum(LlmUsage.cost), 0.0),
             failed,
         )
-        .where(LlmUsage.project_id == project_id)
         .group_by(key)
-        .order_by(func.sum(LlmUsage.cost).desc())
-    ).all()
+        # 调用次数优先（统计视图先回答「谁被用得最多」），同次数再按花费排 ——
+        # 加次序号是为了让顺序确定，否则同次数的分组在 SQLite 上顺序不稳定。
+        .order_by(func.count(LlmUsage.id).desc(), func.sum(LlmUsage.cost).desc())
+    )
+    if project_id is not None:
+        stmt = stmt.where(LlmUsage.project_id == project_id)
+    rows = session.execute(stmt).all()
     return [
         {
             "key": row[0],

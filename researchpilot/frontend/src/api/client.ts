@@ -14,6 +14,7 @@ import type {
   RunDetail,
   StageInfo,
   TierRoute,
+  UsageDim,
   UsageSummary,
 } from './types'
 
@@ -85,8 +86,12 @@ export const api = {
   // ── Sprint 2：治理与设置 ──
   listDecisions: (projectId: number) =>
     request<Decision[]>(`/projects/${projectId}/decisions`),
-  usageSummary: (projectId: number, dim: 'agent' | 'stage' | 'provider') =>
-    request<UsageSummary>(`/usage/summary?project_id=${projectId}&dim=${dim}`),
+  // 不传 projectId 即全库汇总：设置页的「模型供应商统计」问的是全局，
+  // 而按项目切片的接口答不了「我这个后端一共被调过几次」。
+  usageSummary: (dim: UsageDim, projectId?: number) =>
+    request<UsageSummary>(
+      `/usage/summary?dim=${dim}${projectId === undefined ? '' : `&project_id=${projectId}`}`,
+    ),
   listApprovals: (projectId: number, status = 'pending') =>
     request<Approval[]>(`/approvals?project_id=${projectId}&status=${status}`),
   decideApproval: (approvalId: number, action: 'approve' | 'reject') =>

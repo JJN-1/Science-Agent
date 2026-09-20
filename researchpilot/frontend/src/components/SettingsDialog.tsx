@@ -3,6 +3,7 @@ import { App as AntdApp, AutoComplete, Modal, Popconfirm, Select, Table, Tag } f
 import { api, ApiError } from '../api/client'
 import type { ProviderHealth, ProviderTypes, TierRoute } from '../api/types'
 import ProviderForm, { healthLabel } from './ProviderForm'
+import { UsagePanel } from './UsagePanel'
 
 const TIERS = ['extract', 'plan', 'critique', 'synthesize', 'write'] as const
 
@@ -253,6 +254,8 @@ export default function SettingsDialog({ open, onClose }: { open: boolean; onClo
           模型 ID 必须在该后端的模型清单里 —— 填错会在这一步被挡下，而不是等到真跑起来才发现。
         </div>
       </div>
+
+      <UsagePanel />
 
       <Modal
         title={editing === 'new' ? '接入新模型后端' : `编辑 ${editing?.name ?? ''}`}

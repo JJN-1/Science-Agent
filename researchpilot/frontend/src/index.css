@@ -497,6 +497,50 @@ a:hover {
   word-break: break-word;
 }
 
+/* ── 用量统计（US-203）────────────────────── */
+/* .settings-head 是 space-between 的两栏布局，这里元素更多，改成从左排开 */
+.usage-head,
+.settings-head.usage-head {
+  justify-content: flex-start;
+  gap: 10px;
+}
+.usage-head .spacer {
+  flex: 1;
+}
+.usage-scope {
+  font-family: var(--mono);
+  font-size: 11.5px;
+  color: var(--faint);
+}
+/* 失败次数是这张表的主角：成功是常态，失败才是要看的那一行 */
+.usage-fail {
+  color: var(--error);
+  font-weight: 600;
+}
+.usage-zero {
+  color: var(--faint);
+}
+.usage-line {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  align-items: baseline;
+  margin-top: 14px;
+  padding-top: 10px;
+  border-top: 1px dashed var(--border);
+  font-family: var(--mono);
+  font-size: 11.5px;
+  color: var(--dim);
+}
+.usage-line .usage-key {
+  color: var(--faint);
+  letter-spacing: 0.08em;
+}
+.usage-line .usage-detail {
+  color: var(--faint);
+  margin-left: auto;
+}
+
 /* ── Markdown 输出（Agent 产物）────────────── */
 .md {
   font-family: var(--sans);

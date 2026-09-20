@@ -13,6 +13,7 @@ import type {
 } from '../api/types'
 import ApprovalCard from '../components/ApprovalCard'
 import RunBlock from '../components/RunBlock'
+import { UsageLine } from '../components/UsagePanel'
 import CommandBar, { placeholderHint, type Command } from '../components/CommandBar'
 
 interface SysEvent {
@@ -38,6 +39,8 @@ export default function SessionPage() {
   const [notFound, setNotFound] = useState(false)
   const [live, setLive] = useState<LiveRun | null>(null)
   const [sysEvents, setSysEvents] = useState<SysEvent[]>([])
+  // 用量摘要的刷新信号：作业失败不一定多出一条 run，用它才追得上失败调用。
+  const [usageToken, setUsageToken] = useState(0)
 
   // 流事件回调是普通函数（不是渲染期的闭包），拿 state 会读到旧值 —— 用 ref 兜住。
   const liveRef = useRef<LiveRun | null>(null)
@@ -67,6 +70,7 @@ export default function SessionPage() {
         )
         withSteps.sort((a, b) => a.run.id - b.run.id)
         setRuns(withSteps)
+        setUsageToken((n) => n + 1)
       } catch (err) {
         if (err instanceof ApiError && err.status === 404) setNotFound(true)
         else message.error(err instanceof ApiError ? err.message : '加载失败')
@@ -284,6 +288,8 @@ export default function SessionPage() {
               onDecide={(action) => handleApproval(ap.id, action)}
             />
           ))}
+
+          <UsageLine projectId={projectId} version={usageToken} />
         </div>
       </div>
 

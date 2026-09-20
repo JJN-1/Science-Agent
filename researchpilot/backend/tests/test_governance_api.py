@@ -64,7 +64,26 @@ def test_usage_summary_by_agent(client, run_and_wait):
     assert data["rows"][0]["key"] == "scout"
     assert data["rows"][0]["calls"] == 1
     assert data["total_cost"] >= 0
+    assert data["total_calls"] == data["rows"][0]["calls"]
+    assert data["total_failed"] == 0
     assert client.get(f"/api/usage/summary?project_id={project_id}&dim=bogus").status_code == 400
+
+
+def test_usage_summary_global_scope(client, run_and_wait):
+    """不带 project_id 即全库汇总：设置页的「模型供应商统计」问的是全局。
+
+    用户投诉「跑过一次，统计里没有该请求」时，能在**后端维度**看到它才叫修好；
+    只能按项目切片的接口答不了「我这个端点到底被调过几次」。
+    """
+    project_id = _make_project(client)
+    run_and_wait(client, project_id, "S1")
+
+    data = client.get("/api/usage/summary?dim=provider").json()
+    assert data["project_id"] is None
+    assert data["rows"][0]["key"] == "mock"
+    assert data["total_calls"] >= 1
+    assert data["total_calls"] == sum(r["calls"] for r in data["rows"])
+    assert data["total_failed"] == sum(r["failed"] for r in data["rows"])
 
 
 # ── US-205：审批暂停与恢复 ────────────────────────
