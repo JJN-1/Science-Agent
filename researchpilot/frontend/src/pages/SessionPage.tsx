@@ -1,7 +1,8 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { useParams } from 'react-router-dom'
 import { App as AntdApp, Spin } from 'antd'
-import { api, ApiError } from '../api/client'
+import { api, ApiError, streamJob } from '../api/client'
+import { liveRunToAgentRun, newLiveRun, reduceLiveRun, type LiveRun } from '../api/liveRun'
 import type {
   AgentRun,
   AgentStep,
@@ -35,71 +36,132 @@ export default function SessionPage() {
   const [approvals, setApprovals] = useState<Approval[]>([])
   const [loading, setLoading] = useState(true)
   const [notFound, setNotFound] = useState(false)
-  const [runningStage, setRunningStage] = useState<string | null>(null)
+  const [live, setLive] = useState<LiveRun | null>(null)
   const [sysEvents, setSysEvents] = useState<SysEvent[]>([])
-  const [sysSeq, setSysSeq] = useState(0)
 
-  const load = useCallback(async () => {
-    if (Number.isNaN(projectId)) return
-    setLoading(true)
-    try {
-      const p = await api.getProject(projectId)
-      setProject(p)
-      const [s, r, b, ap] = await Promise.all([
-        api.listStages(),
-        api.listRuns(projectId),
-        api.getBlackboard(projectId),
-        api.listApprovals(projectId),
-      ])
-      setStages(s)
-      setBlackboard(b)
-      setApprovals(ap)
-      // 每个 run 拉取完整步骤（Sprint 1 规模小，可接受），按时间正序呈现在会话流中
-      const withSteps = await Promise.all(
-        r.map(async (run) => ({ run, steps: (await api.getRun(run.id)).steps ?? [] })),
-      )
-      withSteps.sort((a, b) => a.run.id - b.run.id)
-      setRuns(withSteps)
-    } catch (err) {
-      if (err instanceof ApiError && err.status === 404) setNotFound(true)
-      else message.error(err instanceof ApiError ? err.message : '加载失败')
-    } finally {
-      setLoading(false)
-    }
-  }, [projectId, message])
+  // 流事件回调是普通函数（不是渲染期的闭包），拿 state 会读到旧值 —— 用 ref 兜住。
+  const liveRef = useRef<LiveRun | null>(null)
+  const closeStreamRef = useRef<(() => void) | null>(null)
+  const sysSeqRef = useRef(0)
+
+  /** ``silent`` 用于作业跑完后的对账刷新：不翻整页 loading，只悄悄换掉快照。 */
+  const load = useCallback(
+    async (opts?: { silent?: boolean }) => {
+      if (Number.isNaN(projectId)) return
+      if (!opts?.silent) setLoading(true)
+      try {
+        const p = await api.getProject(projectId)
+        setProject(p)
+        const [s, r, b, ap] = await Promise.all([
+          api.listStages(),
+          api.listRuns(projectId),
+          api.getBlackboard(projectId),
+          api.listApprovals(projectId),
+        ])
+        setStages(s)
+        setBlackboard(b)
+        setApprovals(ap)
+        // 每个 run 拉取完整步骤（Sprint 1 规模小，可接受），按时间正序呈现在会话流中
+        const withSteps = await Promise.all(
+          r.map(async (run) => ({ run, steps: (await api.getRun(run.id)).steps ?? [] })),
+        )
+        withSteps.sort((a, b) => a.run.id - b.run.id)
+        setRuns(withSteps)
+      } catch (err) {
+        if (err instanceof ApiError && err.status === 404) setNotFound(true)
+        else message.error(err instanceof ApiError ? err.message : '加载失败')
+      } finally {
+        if (!opts?.silent) setLoading(false)
+      }
+    },
+    [projectId, message],
+  )
 
   useEffect(() => {
     void load()
   }, [load])
 
-  const pushSysEvent = (text: string) => {
-    setSysEvents((evts) => [...evts, { id: sysSeq, text }])
-    setSysSeq((n) => n + 1)
-  }
+  // 卸载或切项目必须关流，否则连接会跟着页面一直挂着
+  useEffect(() => () => closeStreamRef.current?.(), [])
 
-  const handleRun = async (stageId: string) => {
-    if (runningStage) return
-    const target = stages.find((s) => s.stage_id === stageId)
-    if (!target) {
-      pushSysEvent(`未知阶段：${stageId}。可用：${stages.map((s) => s.stage_id).join(' / ')}`)
-      return
-    }
-    // US-307：占位阶段不可直接运行，避免占位实现被当成已有能力
-    if (!target.implemented) {
-      pushSysEvent(`${target.stage_id} ${target.name}：${placeholderHint(target)}`)
-      return
-    }
-    setRunningStage(stageId)
-    try {
-      await api.runStage(projectId, stageId)
-    } catch {
-      // 阶段失败时后端记录 failed run，流内会显示 ✗ 与错误信息
-      pushSysEvent(`${stageId} 运行失败，详见流内记录`)
-    } finally {
-      setRunningStage(null)
-      await load()
-    }
-  }
+  const pushSysEvent = useCallback((text: string) => {
+    sysSeqRef.current += 1
+    const id = sysSeqRef.current
+    setSysEvents((evts) => [...evts, { id, text }])
+  }, [])
+
+  const applyLive = useCallback((next: LiveRun | null) => {
+    liveRef.current = next
+    setLive(next)
+  }, [])
+
+  /** 作业收尾：关流 → 提示终态 → 丢弃缓冲 → 按数据库现状对账一次。 */
+  const settle = useCallback(
+    async (final: LiveRun | null) => {
+      closeStreamRef.current?.()
+      closeStreamRef.current = null
+      if (final?.status === 'failed') {
+        pushSysEvent(`作业失败：${final.error ?? '未知错误'}`)
+      } else if (final?.status === 'paused') {
+        pushSysEvent('预算熔断，作业已暂停，等待审批')
+      }
+      applyLive(null)
+      await load({ silent: true })
+    },
+    [applyLive, load, pushSysEvent],
+  )
+
+  /** 受理成功 → 挂上事件流。进度从流里来，最终状态从数据库来。 */
+  const watchJob = useCallback(
+    (jobId: number, stageId: string, agentId: string) => {
+      closeStreamRef.current?.()
+      applyLive(newLiveRun(jobId, stageId, agentId))
+      closeStreamRef.current = streamJob(jobId, {
+        onEvent: (event) => {
+          const cur = liveRef.current
+          if (!cur) return
+          const { live: next, done } = reduceLiveRun(cur, event)
+          applyLive(next)
+          if (done) void settle(next)
+        },
+        onFallback: () => {
+          const cur = liveRef.current
+          if (!cur) return
+          applyLive({ ...cur, degraded: true })
+          pushSysEvent('实时通道不稳定，已降级为每秒轮询')
+        },
+        onError: (msg) => {
+          pushSysEvent(`作业流中断：${msg}`)
+          void settle(null)
+        },
+      })
+    },
+    [applyLive, pushSysEvent, settle],
+  )
+
+  const startStage = useCallback(
+    async (stageId: string) => {
+      const target = stages.find((s) => s.stage_id === stageId)
+      if (!target) {
+        pushSysEvent(`未知阶段：${stageId}。可用：${stages.map((s) => s.stage_id).join(' / ')}`)
+        return
+      }
+      // US-307：占位阶段不可直接运行，避免占位实现被当成已有能力
+      if (!target.implemented) {
+        pushSysEvent(`${target.stage_id} ${target.name}：${placeholderHint(target)}`)
+        return
+      }
+      try {
+        // FIX-03：受理接口只承诺「已排队」，所以紧接着要自己去订流，
+        // 否则界面会停在「已受理」而看不到任何进展。
+        const accepted = await api.runStage(projectId, stageId)
+        watchJob(accepted.job_id, stageId, target.agent_id)
+      } catch (err) {
+        pushSysEvent(err instanceof ApiError ? `受理失败：${err.message}` : '受理失败')
+      }
+    },
+    [projectId, stages, pushSysEvent, watchJob],
+  )
 
   /** 命令行入口（US-311）：自由文本按「研究目标」处理，落到 goal 后直接触发 S1。 */
   const handleCommand = async (command: Command) => {
@@ -107,28 +169,26 @@ export default function SessionPage() {
       pushSysEvent(command.text)
       return
     }
+    if (liveRef.current) return
     if (command.kind === 'goal') {
-      if (runningStage) return
       const scout = stages.find((s) => s.stage_id === 'S1')
       if (!scout?.implemented) {
         pushSysEvent('S1 选题发现尚不可用，暂时无法从研究目标入手')
         return
       }
-      setRunningStage('S1')
       try {
         // 先落 goal 再跑：S1 的提示词读的就是 project.goal，
         // 顺序反了这一轮就跑在旧目标上。
         await api.updateProject(projectId, { goal: command.text })
-        await api.runStage(projectId, 'S1')
+        setProject((p) => (p ? { ...p, goal: command.text } : p))
       } catch (err) {
-        pushSysEvent(err instanceof ApiError ? err.message : '启动 S1 失败')
-      } finally {
-        setRunningStage(null)
-        await load()
+        pushSysEvent(err instanceof ApiError ? err.message : '更新研究目标失败')
+        return
       }
+      await startStage('S1')
       return
     }
-    await handleRun(command.stageId)
+    await startStage(command.stageId)
   }
 
   const handleApproval = async (approvalId: number, action: 'approve' | 'reject') => {
@@ -137,7 +197,7 @@ export default function SessionPage() {
     } catch (err) {
       message.error(err instanceof ApiError ? err.message : '审批操作失败')
     }
-    await load()
+    await load({ silent: true })
   }
 
   if (notFound) {
@@ -168,6 +228,8 @@ export default function SessionPage() {
         (!run.finished_at || w.created_at <= run.finished_at),
     )
 
+  const liveRun = live ? liveRunToAgentRun(live, projectId) : null
+
   return (
     <div className="session">
       <div className="stream">
@@ -188,26 +250,21 @@ export default function SessionPage() {
             />
           ))}
 
-          {runningStage && (
+          {liveRun && live && (
             <RunBlock
-              run={{
-                id: -1,
-                project_id: projectId,
-                stage_id: runningStage,
-                agent_id: stages.find((s) => s.stage_id === runningStage)?.agent_id ?? '',
-                status: 'running',
-                steps: 0,
-                error: null,
-                started_at: new Date().toISOString(),
-                finished_at: null,
-              }}
-              steps={[]}
+              run={liveRun}
+              steps={live.steps}
               writes={[]}
-              running
+              running={live.status === 'running'}
+              jobId={live.jobId}
             />
           )}
 
-          {runs.length === 0 && !runningStage && (
+          {live?.degraded && (
+            <div className="hintline">{'// 实时通道已降级为轮询，进度仍会自动刷新'}</div>
+          )}
+
+          {runs.length === 0 && !liveRun && (
             <div className="hintline">
               {'// 还没有运行记录。用下方命令行触发一个阶段，Agent 的每一步都会追加在这里。'}
             </div>
@@ -230,7 +287,7 @@ export default function SessionPage() {
         </div>
       </div>
 
-      <CommandBar stages={stages} disabled={runningStage !== null} onCommand={handleCommand} />
+      <CommandBar stages={stages} disabled={live !== null} onCommand={handleCommand} />
     </div>
   )
 }

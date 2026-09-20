@@ -145,3 +145,35 @@ export interface TierRoute {
   provider: string
   model: string
 }
+
+// ── US-304：异步作业与事件流 ──────────────────────
+
+/** 作业状态机：queued → running → succeeded / failed / paused */
+export type JobStatus = 'queued' | 'running' | 'succeeded' | 'failed' | 'paused'
+
+export interface Job {
+  id: number
+  project_id: number
+  kind: 'stage' | 'pipeline' | string
+  stage_id: string | null
+  status: JobStatus | string
+  run_id: number | null
+  error: string | null
+  params: Record<string, unknown>
+  created_at: string
+  started_at: string | null
+  finished_at: string | null
+}
+
+/** SSE 帧里的形状（id 走 SSE 的 id 行，不重复进 data）。 */
+export interface JobStreamEvent {
+  seq: number
+  type: string
+  payload: Record<string, unknown>
+}
+
+/** 轮询接口多带出来的两个字段。 */
+export interface JobEvent extends JobStreamEvent {
+  id: number
+  created_at: string
+}

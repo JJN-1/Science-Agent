@@ -42,13 +42,19 @@ class StageContext:
         emit(self.session, self.job_id, STEP,
              {"kind": kind, "content": content, "run_id": self.run_id})
 
-    def _emit_llm_step(self, response, cost: float, cached: bool) -> None:  # noqa: ANN001
-        """模型调用的结算事件：让「正在等模型」这件事在流里可见。"""
+    def _emit_llm_step(self, response, cost: float, cached: bool,  # noqa: ANN001
+                       tier: str = "") -> None:
+        """模型调用的结算事件：让「正在等模型」这件事在流里可见。
+
+        不带模型原文：完整输出已经在 ``agent_steps`` 里，事件里再抄一份只会让
+        job_events 表跟着长胖。流只负责「有进度」，史实以轨迹为准。
+        """
         if self.job_id is None:
             return
         emit(self.session, self.job_id, LLM_CALL, {
             "provider": response.provider,
             "model": response.model,
+            "tier": tier,
             "prompt_tokens": response.prompt_tokens,
             "completion_tokens": response.completion_tokens,
             "cost": round(cost, 6),
@@ -91,9 +97,13 @@ class StageContext:
             max_tokens: int = 1024, temperature: float = 0.7):
         if self.gateway is None:
             raise RuntimeError("gateway 未注入，无法调用模型")
+
+        def on_step(response, cost: float, cached: bool) -> None:  # noqa: ANN001
+            self._emit_llm_step(response, cost, cached, tier)
+
         return self.gateway.call(
             self.session, project_id=self.project_id, run_id=self.run_id,
             stage_id=self.stage_id, agent_id=self.agent_id, tier=tier,
             messages=messages, schema=schema, max_tokens=max_tokens,
-            temperature=temperature, on_step=self._emit_llm_step,
+            temperature=temperature, on_step=on_step,
         )

@@ -65,6 +65,8 @@ HTTP 连接可能被中间层超时切断、用户全程看不到进度、前端
 | worker 并发度 | 单 worker 串行（`asyncio.Queue` + 1 个消费协程） | SQLite 只有一个写者，并行只会把 wait 时间换成 timeout 风险；要并行得先换库 |
 | 执行线程 | `anyio.to_thread.run_sync` + 线程内自建 session | 编排层是同步 SQLAlchemy，与事件循环同线程会把整个服务卡死；请求 session 在受理那一刻就已结束 |
 | 队列入队 | 跨线程一律 `call_soon_threadsafe` | `asyncio.Queue.put_nowait` 的唤醒绑定事件循环，跨线程直调只会留下一个无人通知的 future，作业永远停在 `queued` |
+| 前端订阅 | 原生 `EventSource` + 实时缓冲（`LiveRun`），**终态事件到达即丢弃缓冲并整表重拉** | `Last-Event-ID` 续传与断线重连是 `EventSource` 的内建行为，自己实现等于把它们重写一遍还更不稳；而流是「增量、可能丢帧」的，轨迹必须「完整且一致」——两者职责分开，界面上的最终状态一律以数据库为准 |
+| 流收尾事件 | 除三个终态事件外，`job.settled`（订阅晚于终态，后端补播现状）与 `job.not_found` 同样意味着「别再等了」，前端一并关流 | 只认 `job.succeeded/failed/paused` 会让收尾帧落进「未知类型」，连接凭 `onerror` 重连两轮才发现没事——白等两秒 |
 
 **命名陷阱**：作业状态是 `succeeded/failed/paused`，事件类型是 `job.succeeded/job.failed/job.paused`。
 两者字符串相近但不能互比 —— 曾因此在 SSE 终止条件里写出「永不退出」的流，靠
