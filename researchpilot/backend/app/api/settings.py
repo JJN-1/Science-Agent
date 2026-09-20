@@ -170,9 +170,18 @@ def _invalidate(request: Request, name: str) -> None:
 
 
 def _references(request: Request, session: Session) -> dict[str, list[str]]:
-    """统计每个 provider 的引用位置：档位路由 + Agent 配置（不级联删除）。
+    """统计每个 provider 的引用位置：档位路由 + Agent 归属（不级联删除）。
 
     路由取**运行期**的那份：`PATCH /routing` 是内存热切换，只读配置文件会漏判。
+
+    Agent 的归属分两种，都记成 ``agent:<id>``：
+
+    - 显式写在 ``agent.config.provider`` 上的；
+    - **跟随档位**的 —— 没显式绑定就受该 Agent 档位的首候选后端支配。
+
+    后者从前完全没统计，于是「被引用」列对 Agent 恒为「无」：用户根本看不出
+    这个后端到底被哪些 Agent 用着。补上它不会让删除更难 —— 能成为某档位首候选的
+    provider，必然已经在 ``routing:<tier>`` 里被记过一次了，两种记法指向同一件事。
     """
     refs: dict[str, list[str]] = defaultdict(list)
     router_obj = getattr(request.app.state, "router", None)
@@ -183,10 +192,18 @@ def _references(request: Request, session: Session) -> dict[str, list[str]]:
         for cand in chain or []:
             refs[str(cand.get("provider"))].append(f"routing:{tier}")
     for agent in agents_dao.list_all(session):
-        provider = (agent.config or {}).get("provider")
+        provider = (agent.config or {}).get("provider") or _tier_primary(routes, agent.tier)
         if provider:
             refs[str(provider)].append(f"agent:{agent.agent_id}")
     return {name: sorted(set(where)) for name, where in refs.items()}
+
+
+def _tier_primary(routes: dict, tier: str | None) -> str | None:
+    """该档位的首候选后端 —— Agent 未显式绑定时实际会调用的那一个。"""
+    chain = routes.get(tier or "") or []
+    if not chain:
+        return None
+    return str(chain[0].get("provider") or "") or None
 
 
 def _build_probe_provider(provider_id: str, body: ProbeIn) -> OpenAICompatProvider:

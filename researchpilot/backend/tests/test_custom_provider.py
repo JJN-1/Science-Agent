@@ -209,7 +209,7 @@ def test_rename_provider_keeps_identity_and_references(client):
     assert row["name"] == "我的智谱端点"
     assert row["api_key_ref"] == "acme"                  # 凭据引用跟着 id，不跟展示名
     assert row["auth_required"] is True and row["has_key"] is True   # 编辑页据此回填
-    assert row["referenced_by"] == ["routing:write"]     # 路由引用不断
+    assert row["referenced_by"] == ["agent:writer", "routing:write"]   # 路由与 Agent 归属都不断
     assert client.get("/api/settings/routing").json()["write"] == [
         {"provider": "acme", "model": "acme-small"}
     ]
@@ -314,7 +314,7 @@ def test_delete_referenced_provider_is_refused_with_locations(client):
     resp = client.delete("/api/settings/providers/acme")
     assert resp.status_code == 409
     detail = resp.json()["detail"]
-    assert detail["referenced_by"] == ["routing:write"]
+    assert detail["referenced_by"] == ["agent:writer", "routing:write"]
 
     # 解除引用后即可删除
     client.patch("/api/settings/routing", json={
@@ -322,6 +322,31 @@ def test_delete_referenced_provider_is_refused_with_locations(client):
     })
     assert client.delete("/api/settings/providers/acme").status_code == 200
     assert "acme" not in [r["id"] for r in client.get("/api/settings/providers").json()]
+
+
+def test_references_show_agents_following_their_tier(client):
+    """「被引用」列对 Agent 不再恒空。
+
+    只认 ``agent.config.provider`` 时，这一列对 Agent 永远是「无」—— 播种从不写那个字段，
+    Agent 实际是**跟随自己档位的首候选后端**。补上这层归属不会让删除更难：能当上首候选的
+    provider 必然已在 ``routing:<tier>`` 里被记过一次，两种记法说的是同一件事。
+    """
+    client.post("/api/settings/providers", json=VALID_PROVIDER)
+    client.patch("/api/settings/routing", json={
+        "tier": "write", "candidates": [{"provider": "acme", "model": "acme-small"}],
+    })
+
+    def provider(pid: str) -> dict:
+        return next(r for r in client.get("/api/settings/providers").json() if r["id"] == pid)
+
+    assert provider("acme")["referenced_by"] == ["agent:writer", "routing:write"]
+
+    # 首候选换回 mock：Agent 的归属跟着档位走，而不是留在历史里
+    client.patch("/api/settings/routing", json={
+        "tier": "write", "candidates": [{"provider": "mock", "model": "mock-small"}],
+    })
+    assert provider("acme")["referenced_by"] == []
+    assert "agent:writer" in provider("mock")["referenced_by"]
 
 
 def test_delete_unknown_provider_is_404(client):
