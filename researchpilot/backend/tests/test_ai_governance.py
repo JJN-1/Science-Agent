@@ -210,6 +210,42 @@ def test_router_rejects_same_vendor_critique():
                                          "capabilities": ["json_object"]}))
 
 
+def test_router_allows_same_vendor_different_model_critique():
+    """同厂商换模型即可交叉验证（用户明确要求）。
+
+    旧实现比的是 **vendor**，于是「同一个供应商的大模型产出、小模型评审」这种
+    既省钱又不失独立性的组合被硬拦下来。
+    """
+    providers = _providers(a={"type": "mock", "vendor": "acme",
+                              "capabilities": ["json_object"]})
+    providers["b"] = MockProvider("b", {"type": "mock", "model": "m2", "vendor": "acme",
+                                        "capabilities": ["json_object"]})
+    routes = _routes()
+    routes["critique"] = [{"provider": "b", "model": "m2"}]
+    router = Router.from_config({"ai": {"routing": routes}}, providers)
+    assert router.candidates("critique")[0].provider == "b"
+
+
+def test_router_checks_the_whole_candidate_chain():
+    """只看首候选会漏判：首候选换了，降级之后照样可能撞成自我评审。"""
+    providers = _providers(a={"type": "mock", "vendor": "acme",
+                              "capabilities": ["json_object"]})
+    providers["b"] = MockProvider("b", {"type": "mock", "model": "m2", "vendor": "acme",
+                                        "capabilities": ["json_object"]})
+    routes = _routes()
+    # critique 首候选 b/m2 与 plan 不同，但整条链都被 plan 覆盖 → 仍应拒绝
+    routes["critique"] = [
+        {"provider": "b", "model": "m2"},
+        {"provider": "a", "model": "m"},
+    ]
+    routes["plan"] = [
+        {"provider": "a", "model": "m"},
+        {"provider": "b", "model": "m2"},
+    ]
+    with pytest.raises(RoutingError, match="交叉验证"):
+        Router.from_config({"ai": {"routing": routes}}, providers)
+
+
 def test_router_update_tier_hot_swap():
     router = Router.from_config({"ai": {"routing": _routes()}}, _providers())
     router.update_tier("plan", [RouteCandidate(provider="a", model="m2")],
