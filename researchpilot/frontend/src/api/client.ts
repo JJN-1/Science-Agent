@@ -100,17 +100,23 @@ export const api = {
       method: 'POST',
       body: JSON.stringify(data),
     }),
-  updateProvider: (name: string, data: ProviderInput) =>
+  // 下面几个接口的路径参数都是 provider **id**（身份），不是展示名 ——
+  // 名称可改，id 不变，改名后这些调用照旧有效。
+  updateProvider: (id: string, data: ProviderInput) =>
     request<{ provider: string; config: ProviderInput }>(
-      `/settings/providers/${name}`,
+      `/settings/providers/${encodeURIComponent(id)}`,
       { method: 'PATCH', body: JSON.stringify(data) },
     ),
-  deleteProvider: (name: string) =>
-    request<{ provider: string; removed: boolean }>(`/settings/providers/${name}`, {
-      method: 'DELETE',
-    }),
-  probeModels: (name: string, data: { base_url?: string; api_key?: string } = {}) =>
-    request<ProbeResult>(`/settings/providers/${name}/probe-models`, {
+  deleteProvider: (id: string) =>
+    request<{ provider: string; removed: boolean }>(
+      `/settings/providers/${encodeURIComponent(id)}`,
+      { method: 'DELETE' },
+    ),
+  probeModels: (
+    id: string,
+    data: { base_url?: string; api_key?: string; api_key_ref?: string; keyless?: boolean } = {},
+  ) =>
+    request<ProbeResult>(`/settings/providers/${encodeURIComponent(id)}/probe-models`, {
       method: 'POST',
       body: JSON.stringify(data),
     }),
@@ -126,11 +132,11 @@ export const api = {
       method: 'PATCH',
       body: JSON.stringify({ tier, candidates }),
     }),
-  setProviderKey: (name: string, key: string) =>
-    request<{ provider: string; stored: boolean }>(`/settings/providers/${name}/key`, {
-      method: 'PUT',
-      body: JSON.stringify({ key }),
-    }),
+  setProviderKey: (id: string, key: string) =>
+    request<{ provider: string; api_key_ref: string; stored: boolean }>(
+      `/settings/providers/${encodeURIComponent(id)}/key`,
+      { method: 'PUT', body: JSON.stringify({ key }) },
+    ),
 }
 
 // ── 作业事件流订阅（US-304 §5）────────────────────

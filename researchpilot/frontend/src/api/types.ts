@@ -100,6 +100,9 @@ export type HealthState = 'ok' | 'unconfigured' | 'down' | string
 export type ProviderSource = 'builtin' | 'user' | 'runtime'
 
 export interface ProviderHealth {
+  /** 身份：配置键，路由 / 凭据引用 / 统计都认它，创建后不变。 */
+  id: string
+  /** 展示名：用户可改、可中文、可重复。 */
   name: string
   type: string
   model: string
@@ -107,10 +110,19 @@ export interface ProviderHealth {
   vendor: string
   capabilities: string[]
   price: { input: number; output: number }
+  /** 编辑表单回填用；mock 类型为 null。 */
+  base_url: string | null
+  timeout_s: number | null
+  extra_headers: Record<string, unknown>
+  extra_body: Record<string, unknown>
   health: HealthState
   healthy: boolean
   circuit_failures: number
   detail: string | null
+  /** 凭据回填三件套：引用名 / 是否必须鉴权 / 是否已录入。 */
+  api_key_ref: string | null
+  auth_required: boolean
+  has_key: boolean
   /** 引用位置，如 routing:plan / agent:scout */
   referenced_by: string[]
   source: ProviderSource
@@ -119,6 +131,9 @@ export interface ProviderHealth {
 
 /** 接入表单提交体（US-312）；未提交的字段在 PATCH 时沿用现值 */
 export interface ProviderInput {
+  /** 身份，仅新建时可给；留空则按 name 自动派生。 */
+  id?: string
+  /** 展示名，可改。 */
   name?: string
   type?: string
   base_url?: string | null

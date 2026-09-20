@@ -108,6 +108,12 @@ class ProviderRegistry:
                     "vendor": p.vendor,
                     "capabilities": sorted(p.capabilities),
                     "price": dict(p.price),
+                    # 以下字段只为「编辑表单能原样回填」而存在：缺了它们，用户每次
+                    # 打开编辑页都看到空输入框，保存时还会把没回填的字段清成默认值。
+                    "base_url": getattr(p, "base_url", None),
+                    "timeout_s": getattr(p, "timeout_s", None),
+                    "extra_headers": dict(getattr(p, "extra_headers", {}) or {}),
+                    "extra_body": dict(getattr(p, "extra_body", {}) or {}),
                     "health": state,
                     "healthy": state == HEALTH_OK and not self._is_open(name),
                     "circuit_failures": st.failures,

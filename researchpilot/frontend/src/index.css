@@ -443,6 +443,13 @@ a:hover {
   font-size: 11.5px;
 }
 
+/* provider 标识：身份，等宽显示以便与路由 / 凭据引用对上号 */
+.provider-id {
+  font-family: var(--mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+  font-size: 11.5px;
+  color: var(--dim);
+}
+
 /* ── 接入表单（US-312）────────────────────── */
 .settings-hint {
   margin-top: 6px;
