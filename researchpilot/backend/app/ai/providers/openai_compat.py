@@ -38,7 +38,8 @@ class OpenAICompatProvider(ChatProvider):
     """
 
     def __init__(self, name: str, cfg: dict, transport: httpx.BaseTransport | None = None) -> None:
-        self.name = name
+        self.name = name                      # 身份：配置键、路由与凭据引用都认它
+        self.label = str(cfg.get("name") or name).strip() or name  # 展示名，用户可改
         self.models = resolve_models(name, cfg)
         self.model = self.models[0]
         self.vendor = cfg.get("vendor", "openai")
@@ -185,6 +186,13 @@ class OpenAICompatProvider(ChatProvider):
             return HEALTH_OK if resp.status_code < 500 else HEALTH_DOWN
         except httpx.HTTPError:
             return HEALTH_DOWN
+
+    def credential_view(self) -> dict:
+        return {
+            "api_key_ref": self.api_key_ref,
+            "auth_required": self.auth_required,
+            "has_key": self._peek_key() is not None,
+        }
 
     def invalidate_health(self) -> None:
         """录入 / 更换 Key 后调用，使下一次 health() 立即重新探测。"""

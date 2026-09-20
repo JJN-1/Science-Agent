@@ -99,7 +99,9 @@ class ProviderRegistry:
             state = p.health()  # provider 侧有 TTL 缓存，不会每次真打网络
             rows.append(
                 {
-                    "name": name,
+                    # id 是身份（可被路由 / 凭据引用），name 只是展示名
+                    "id": name,
+                    "name": getattr(p, "label", None) or name,
                     "type": type(p).__name__,
                     "model": p.model,
                     "models": list(getattr(p, "models", [p.model])),
@@ -110,6 +112,8 @@ class ProviderRegistry:
                     "healthy": state == HEALTH_OK and not self._is_open(name),
                     "circuit_failures": st.failures,
                     "detail": None if state == HEALTH_OK else p.unavailable_reason(),
+                    # 凭据回填：设置页据此显示「引用名 / 无需鉴权 / 已录入」
+                    **p.credential_view(),
                 }
             )
         return rows

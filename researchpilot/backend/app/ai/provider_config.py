@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import ipaddress
 import re
+from collections.abc import Iterable
 from urllib.parse import urlparse
 
 from app.ai.registry import PROVIDER_TYPES
@@ -24,12 +25,13 @@ from app.ai.registry import PROVIDER_TYPES
 KNOWN_CAPABILITIES = frozenset({"json_object", "tools", "stream", "vision"})
 DEFAULT_CAPABILITIES = ("json_object",)
 DEFAULT_TIMEOUT_S = 120.0
+MAX_LABEL_LEN = 64
 
 NAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 
 # 与 provider 实例约定的配置键（写回 config.yaml 时只写这些）
 CONFIG_KEYS = (
-    "type", "base_url", "models", "vendor", "api_key_ref",
+    "name", "type", "base_url", "models", "vendor", "api_key_ref",
     "capabilities", "price", "timeout_s", "extra_headers", "extra_body",
 )
 
@@ -38,11 +40,34 @@ class ProviderConfigError(ValueError):
     code = "CFG-PROVIDER-001"
 
 
-def normalize(name: str, raw: dict | None) -> dict:
-    """校验并规范化一条 provider 配置；不合法一律抛 ProviderConfigError（带可读原因）。"""
-    if not NAME_PATTERN.match(name or ""):
+def generate_id(label: str, taken: Iterable[str]) -> str:
+    """从展示名派生一个稳定的 provider id（= 配置文件里的键）。
+
+    **身份与展示名解耦**：id 创建后不再变，档位路由 / 凭据引用 / 迁移统计都认它，
+    用户改名称不会打断任何一条引用。旧实现把名字本身当身份，于是「改名」等于
+    「删掉重建」—— 路由断、Key 找不到、历史统计断成两截。
+    """
+    slug = re.sub(r"[^A-Za-z0-9]+", "-", str(label or "")).strip("-").lower()[:48]
+    if not NAME_PATTERN.match(slug):  # 纯中文名会退化成空串
+        slug = "provider"
+    existing = set(taken)
+    if slug not in existing:
+        return slug
+    n = 2
+    while f"{slug}-{n}" in existing:
+        n += 1
+    return f"{slug}-{n}"
+
+
+def normalize(provider_id: str, raw: dict | None) -> dict:
+    """校验并规范化一条 provider 配置；不合法一律抛 ProviderConfigError（带可读原因）。
+
+    ``provider_id`` 是身份（配置键），``raw["name"]`` 是可改的展示名。
+    """
+    if not NAME_PATTERN.match(provider_id or ""):
         raise ProviderConfigError(
-            f"provider 名称非法: {name!r}（仅允许字母/数字/下划线/连字符/点，1–64 位，且不以符号开头）"
+            f"provider id 非法: {provider_id!r}（仅允许字母/数字/下划线/连字符/点，"
+            f"1–64 位，且不以符号开头）"
         )
     cfg = dict(raw or {})
 
@@ -52,6 +77,7 @@ def normalize(name: str, raw: dict | None) -> dict:
         raise ProviderConfigError(f"未知 provider 类型: {ptype!r}；已支持: {supported}")
 
     out: dict = {
+        "name": _normalize_label(cfg.get("name"), provider_id),
         "type": ptype,
         "models": _normalize_models(cfg),
         "vendor": _normalize_vendor(cfg),
@@ -62,9 +88,9 @@ def normalize(name: str, raw: dict | None) -> dict:
 
     if ptype != "mock":
         out["base_url"] = normalize_base_url(cfg.get("base_url"))
-        # 留空表示该端点无需鉴权（本地自建），缺省则引用名即 provider 名
+        # 留空表示该端点无需鉴权（本地自建），缺省则引用名即 provider id
         ref = cfg.get("api_key_ref")
-        out["api_key_ref"] = name if ref is None else str(ref).strip()
+        out["api_key_ref"] = provider_id if ref is None else str(ref).strip()
 
     for key in ("extra_headers", "extra_body"):
         value = cfg.get(key)
@@ -75,6 +101,18 @@ def normalize(name: str, raw: dict | None) -> dict:
         out[key] = {str(k): v for k, v in value.items()}
 
     return out
+
+
+def _normalize_label(raw: object, fallback: str) -> str:
+    """展示名：可改、可中文、可重复，与身份无关。"""
+    text = str(raw).strip() if raw is not None else ""
+    if not text:
+        return fallback
+    if len(text) > MAX_LABEL_LEN:
+        raise ProviderConfigError(f"名称过长（最多 {MAX_LABEL_LEN} 字符）")
+    if any(ch in text for ch in "\r\n\t"):
+        raise ProviderConfigError("名称不得包含换行或制表符")
+    return text
 
 
 def normalize_base_url(raw: object) -> str:
@@ -188,6 +226,10 @@ def _normalize_timeout(raw: object) -> float:
     return value
 
 
-def public_view(name: str, cfg: dict) -> dict:
-    """给 API 响应用的视图（与配置文件字段一致，便于用户对照 config.yaml）。"""
-    return {"name": name, **cfg}
+def public_view(provider_id: str, cfg: dict) -> dict:
+    """给 API 响应用的视图（与配置文件字段一致，便于用户对照 config.yaml）。
+
+    同时给出 ``id``（身份，不可改）与 ``name``（展示名，可改）——
+    设置页据此渲染「标识 + 名称」两个字段，重命名不再需要删掉重建。
+    """
+    return {"id": provider_id, **cfg, "name": cfg.get("name") or provider_id}

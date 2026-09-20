@@ -95,9 +95,14 @@ class ChatProvider(ABC):
     """Provider 协议：声明能力与价格，health() 返回三态健康状态（§8.1）。
 
     注册表**不再因健康状态剔除** provider：健康只是元数据，能否调用在调用点判定。
+
+    ``name`` 是**身份**（= 配置文件的键，路由与凭据引用都认它，创建后不变），
+    ``label`` 是**展示名**（用户可改，可中文，可重复）。分开之后「改个名字」不再
+    等于「删掉重建」。
     """
 
     name: str
+    label: str
     model: str
     vendor: str
     capabilities: frozenset[str]  # json_object / tools / stream
@@ -110,6 +115,14 @@ class ChatProvider(ABC):
     @abstractmethod
     def health(self) -> str:
         """健康检查（轻量、快速返回），返回 HEALTH_OK / HEALTH_UNCONFIGURED / HEALTH_DOWN。"""
+
+    def credential_view(self) -> dict:
+        """凭据状态，供设置页回填：引用名 + 是否必须鉴权 + 是否已录入。
+
+        旧实现里设置页拿不到这三项，于是编辑表单只能把 Key 一栏留空、
+        并且无法知道这个端点其实是「无需鉴权」—— 一次编辑就把配置改坏了。
+        """
+        return {"api_key_ref": None, "auth_required": False, "has_key": False}
 
     def unavailable_reason(self) -> str:
         """不可调用时的可操作提示，交由上层直接展示给用户。"""

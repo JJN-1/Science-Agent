@@ -123,8 +123,8 @@ def test_base_url_validation_allows(ok_url):
 
 
 @pytest.mark.parametrize("override,reason", [
-    ({"name": "bad name"}, "名称非法"),
-    ({"name": "-leading"}, "名称非法"),
+    ({"name": "bad name"}, "id 非法"),
+    ({"name": "-leading"}, "id 非法"),
     ({"type": "nope"}, "未知 provider 类型"),
     ({"vendor": ""}, "vendor 必填"),
     ({"models": []}, "models 不能为空"),
@@ -135,9 +135,20 @@ def test_base_url_validation_allows(ok_url):
 ])
 def test_normalize_rejects_bad_fields(override, reason):
     payload = {**VALID_PROVIDER, **override}
-    name = payload.pop("name")
+    provider_id = payload.pop("name")   # 这里的 name 是被当作身份（id）去校验
     with pytest.raises(ProviderConfigError, match=reason):
-        normalize(name, payload)
+        normalize(provider_id, payload)
+
+
+def test_normalize_label_is_decoupled_from_id():
+    """展示名可中文、可重复，缺省回落到 id；身份始终是 id。"""
+    payload = {k: v for k, v in VALID_PROVIDER.items() if k != "name"}
+    assert normalize("acme", payload)["name"] == "acme"                    # 缺省回落
+    assert normalize("acme", {**payload, "name": "我的智谱端点"})["name"] == "我的智谱端点"
+    with pytest.raises(ProviderConfigError, match="名称过长"):
+        normalize("acme", {**payload, "name": "x" * 65})
+    with pytest.raises(ProviderConfigError, match="换行"):
+        normalize("acme", {**payload, "name": "a\nb"})
 
 
 # ── API：增删改 ──────────────────────────────────
@@ -145,9 +156,10 @@ def test_normalize_rejects_bad_fields(override, reason):
 def test_create_provider_takes_effect_without_restart(client):
     assert client.post("/api/settings/providers", json=VALID_PROVIDER).status_code == 200
 
-    rows = {r["name"]: r for r in client.get("/api/settings/providers").json()}
+    rows = {r["id"]: r for r in client.get("/api/settings/providers").json()}
     assert "acme" in rows
     row = rows["acme"]
+    assert row["name"] == "acme"                             # 未给展示名则回落到 id
     assert row["models"] == ["acme-large", "acme-small"]
     assert row["capabilities"] == ["json_object", "tools"]
     assert row["price"] == {"input": 0.001, "output": 0.002}
@@ -155,10 +167,73 @@ def test_create_provider_takes_effect_without_restart(client):
     assert row["health"] in ("ok", "down", "unconfigured")   # 已进入注册表并被探测
 
 
-def test_create_provider_rejects_duplicate(client):
+def test_create_provider_conflicts_only_on_explicit_id(client):
+    """id 是身份：显式给的 id 撞了必须拒；没给 id 时按展示名派生并自动避让。
+
+    展示名只是标签、可以重复 —— 那正是「名称可改」的前提；旧实现把它当身份，
+    于是「改名」只能靠删掉重建，引用全断。
+    """
+    assert client.post("/api/settings/providers", json=VALID_PROVIDER).status_code == 200
+
+    dup = client.post("/api/settings/providers", json={**VALID_PROVIDER, "id": "acme"})
+    assert dup.status_code == 409
+    assert "id 已存在" in dup.json()["detail"]
+
+    same_label = client.post("/api/settings/providers",
+                             json={**VALID_PROVIDER, "base_url": "http://127.0.0.1:9/v2"})
+    assert same_label.status_code == 200
+    assert same_label.json()["provider"] == "acme-2"   # 自动避让，不覆盖已有配置
+
+
+def test_generate_id_handles_non_ascii_labels():
+    """纯中文名派不出合法 id，得退化成可用的标识而不是报错。"""
+    from app.ai.provider_config import generate_id
+
+    assert generate_id("我的本地端点", set()) == "provider"
+    assert generate_id("我的本地端点", {"provider"}) == "provider-2"
+    assert generate_id("My Endpoint!!", set()) == "my-endpoint"
+
+
+def test_rename_provider_keeps_identity_and_references(client):
+    """改名只换展示名：id、路由引用、凭据引用全部不动。"""
     client.post("/api/settings/providers", json=VALID_PROVIDER)
-    again = client.post("/api/settings/providers", json=VALID_PROVIDER)
-    assert again.status_code == 409
+    client.patch("/api/settings/routing", json={
+        "tier": "write", "candidates": [{"provider": "acme", "model": "acme-small"}],
+    })
+
+    resp = client.patch("/api/settings/providers/acme", json={"name": "我的智谱端点"})
+    assert resp.status_code == 200
+    assert resp.json()["config"]["name"] == "我的智谱端点"
+
+    row = next(r for r in client.get("/api/settings/providers").json() if r["id"] == "acme")
+    assert row["name"] == "我的智谱端点"
+    assert row["api_key_ref"] == "acme"                  # 凭据引用跟着 id，不跟展示名
+    assert row["auth_required"] is True and row["has_key"] is True   # 编辑页据此回填
+    assert row["referenced_by"] == ["routing:write"]     # 路由引用不断
+    assert client.get("/api/settings/routing").json()["write"] == [
+        {"provider": "acme", "model": "acme-small"}
+    ]
+
+
+def test_key_write_uses_credential_ref_not_provider_id(client, monkeypatch):
+    """Key 写到 ``api_key_ref`` 名下 —— 多个端点可以共用一份凭据。"""
+    calls: list[tuple] = []
+    monkeypatch.setattr("app.api.settings.keyring.set_password",
+                        lambda svc, ref, key: calls.append((ref, key)))
+
+    client.post("/api/settings/providers",
+                json={**VALID_PROVIDER, "api_key_ref": "shared-creds"})
+    resp = client.put("/api/settings/providers/acme/key", json={"key": "sk-1"})
+    assert resp.json() == {"provider": "acme", "api_key_ref": "shared-creds", "stored": True}
+    assert calls == [("shared-creds", "sk-1")]
+
+
+def test_key_write_refused_for_keyless_provider(client):
+    """无需鉴权的端点不该被要求录 Key —— 直接说清原因，而不是写进一个没人读的账号。"""
+    client.post("/api/settings/providers", json={**VALID_PROVIDER, "api_key_ref": ""})
+    resp = client.put("/api/settings/providers/acme/key", json={"key": "sk-1"})
+    assert resp.status_code == 400
+    assert "无需鉴权" in resp.json()["detail"]
 
 
 def test_create_provider_rejects_bad_base_url(client):
@@ -193,7 +268,7 @@ def test_update_provider_rejects_when_new_capabilities_break_routing(client):
     assert resp.status_code == 400
     assert "已保持原样" in resp.json()["detail"]
 
-    row = next(r for r in client.get("/api/settings/providers").json() if r["name"] == "acme")
+    row = next(r for r in client.get("/api/settings/providers").json() if r["id"] == "acme")
     assert row["capabilities"] == ["json_object", "tools"]   # 原值未被改动
 
     # 运行期也必须仍是可用的旧配置：plan 档还能正常取到候选
@@ -224,7 +299,7 @@ def test_delete_referenced_provider_is_refused_with_locations(client):
         "tier": "write", "candidates": [{"provider": "mock", "model": "mock-small"}],
     })
     assert client.delete("/api/settings/providers/acme").status_code == 200
-    assert "acme" not in [r["name"] for r in client.get("/api/settings/providers").json()]
+    assert "acme" not in [r["id"] for r in client.get("/api/settings/providers").json()]
 
 
 def test_delete_unknown_provider_is_404(client):

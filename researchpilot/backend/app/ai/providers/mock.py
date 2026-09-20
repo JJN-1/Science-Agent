@@ -20,6 +20,7 @@ class MockProvider(ChatProvider):
 
     def __init__(self, name: str, cfg: dict) -> None:
         self.name = name
+        self.label = str(cfg.get("name") or name).strip() or name
         self.models = resolve_models(name, cfg)
         self.model = self.models[0]
         self.vendor = cfg.get("vendor", "mock")

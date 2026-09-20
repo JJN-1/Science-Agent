@@ -11,6 +11,7 @@ from app.ai.base import ProviderUnavailable
 from app.ai.provider_config import (
     KNOWN_CAPABILITIES,
     ProviderConfigError,
+    generate_id,
     normalize,
     normalize_base_url,
 )
@@ -47,9 +48,14 @@ class ProviderKey(BaseModel):
 
 
 class ProviderIn(BaseModel):
-    """接入表单（US-312）：字段与设计 §8.1 的 provider 配置一致。"""
+    """接入表单（US-312）：字段与设计 §8.1 的 provider 配置一致。
+
+    ``id`` 是**身份**（配置键，路由与凭据引用都认它，创建后不可改），
+    ``name`` 是**展示名**（可改、可中文）。不给 ``id`` 时按展示名派生一个。
+    """
 
     name: str
+    id: str | None = None               # 留空则按展示名自动派生
     type: str
     base_url: str | None = None
     models: list[str] | None = None
@@ -65,6 +71,9 @@ class ProviderIn(BaseModel):
 
 
 class ProviderPatch(BaseModel):
+    """局部修改；``name`` 只改展示名，身份（id = 路径参数）不变。"""
+
+    name: str | None = None
     type: str | None = None
     base_url: str | None = None
     models: list[str] | None = None
@@ -94,6 +103,18 @@ class ProbeIn(BaseModel):
 
 def _effective_providers() -> dict:
     return (load_config().get("ai", {}) or {}).get("providers", {}) or {}
+
+
+def _keyring_ref(provider_id: str) -> str:
+    """该 provider 的凭据引用名（keyring 账号）。
+
+    以配置文件为**单一来源**：写 Key 用它、读 Key 用它、凭据状态回填也用它。
+    旧实现写 Key 时用 provider 名、读 Key 时用 api_key_ref —— 用户改了引用名
+    （或展示名）之后，Key 就再也对不上了。
+    """
+    cfg = _effective_providers().get(provider_id) or {}
+    ref = cfg.get("api_key_ref")
+    return provider_id if ref is None else str(ref).strip()
 
 
 def _registry(request: Request):
@@ -168,9 +189,9 @@ def _references(request: Request, session: Session) -> dict[str, list[str]]:
     return {name: sorted(set(where)) for name, where in refs.items()}
 
 
-def _build_probe_provider(name: str, body: ProbeIn) -> OpenAICompatProvider:
+def _build_probe_provider(provider_id: str, body: ProbeIn) -> OpenAICompatProvider:
     """给探测模型用的一次性 provider（不落配置、不进注册表）。"""
-    raw = dict(_effective_providers().get(name) or {})
+    raw = dict(_effective_providers().get(provider_id) or {})
     if body.base_url is not None:
         raw["base_url"] = body.base_url
     # 草稿里的凭据语义要和保存路径**完全一致**，否则会出现「保存后能用、探测时说缺 Key」
@@ -186,14 +207,14 @@ def _build_probe_provider(name: str, body: ProbeIn) -> OpenAICompatProvider:
         base_url = normalize_base_url(raw["base_url"])
     except ProviderConfigError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from None
-    # None = 用户没提过这件事 → 缺省引用名即 provider 名；"" = 显式无需鉴权。
+    # None = 用户没提过这件事 → 缺省引用名即 provider id；"" = 显式无需鉴权。
     # 旧实现写 `or name`，把「显式留空」当成了「没填」—— 勾了无需鉴权照样要 Key。
     ref = raw.get("api_key_ref")
-    provider = OpenAICompatProvider(name, {
+    provider = OpenAICompatProvider(provider_id, {
         "base_url": base_url,
         "models": [raw.get("model") or "probe"],
         "vendor": raw.get("vendor") or "probe",
-        "api_key_ref": name if ref is None else str(ref).strip(),
+        "api_key_ref": provider_id if ref is None else str(ref).strip(),
         "extra_headers": raw.get("extra_headers") or {},
     })
     if body.api_key and provider.auth_required:
@@ -206,18 +227,19 @@ def _build_probe_provider(name: str, body: ProbeIn) -> OpenAICompatProvider:
 
 @router.get("/providers")
 def providers(request: Request, session: Session = Depends(get_session)) -> list[dict]:
+    """后端清单。``id`` 是身份、``name`` 是可改的展示名，界面按 id 做行键与引用。"""
     registry = _registry(request)
     refs = _references(request, session)
-    user_names = set((read_user_config().get("ai", {}) or {}).get("providers", {}) or {})
+    user_ids = set((read_user_config().get("ai", {}) or {}).get("providers", {}) or {})
     builtin = default_provider_names()
     return [
         {
             **row,
-            "referenced_by": refs.get(row["name"], []),
-            "source": "user" if row["name"] in user_names else (
-                "builtin" if row["name"] in builtin else "runtime"
+            "referenced_by": refs.get(row["id"], []),
+            "source": "user" if row["id"] in user_ids else (
+                "builtin" if row["id"] in builtin else "runtime"
             ),
-            "deletable": row["name"] in user_names and row["name"] not in builtin,
+            "deletable": row["id"] in user_ids and row["id"] not in builtin,
         }
         for row in registry.health_report()
     ]
@@ -226,100 +248,113 @@ def providers(request: Request, session: Session = Depends(get_session)) -> list
 @router.post("/providers")
 def create_provider(body: ProviderIn, request: Request,
                     session: Session = Depends(get_session)) -> dict:
-    """新增自定义 provider（US-312）。"""
-    if body.name in _effective_providers():
-        raise HTTPException(status_code=409, detail=f"provider 已存在: {body.name}")
+    """新增自定义 provider（US-312）。
+
+    身份（``id`` = 配置键）与展示名（``name``）分开：未给 ``id`` 时按展示名派生，
+    此后改名不会打断路由 / 凭据 / 统计的任何一条引用。
+    """
     raw = body.model_dump(exclude_none=True)
-    name = raw.pop("name")
+    raw.pop("id", None)
+    provider_id = (body.id or "").strip() or generate_id(
+        body.name, _effective_providers()
+    )
+    if provider_id in _effective_providers():
+        raise HTTPException(status_code=409, detail=f"provider id 已存在: {provider_id}")
     try:
-        normalized = normalize(name, raw)
+        normalized = normalize(provider_id, raw)
     except ProviderConfigError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from None
 
     try:
-        _dry_run(_with_provider(name, normalized))
+        _dry_run(_with_provider(provider_id, normalized))
     except (ValueError, RoutingError) as exc:
         raise HTTPException(status_code=400, detail=f"配置无法生效: {exc}") from None
 
-    upsert_user_provider(name, normalized)
+    upsert_user_provider(provider_id, normalized)
     old = ",".join(_registry(request).names())
-    _apply_config(request, session, scope=f"provider:{name}", old=old,
+    _apply_config(request, session, scope=f"provider:{provider_id}", old=old,
                   new=",".join(_registry(request).names()),
                   source="api_provider_create")
-    _invalidate(request, name)
+    _invalidate(request, provider_id)
     session.commit()
-    return {"provider": name, "config": normalized}
+    return {"provider": provider_id, "config": normalized}
 
 
-@router.patch("/providers/{name}")
-def update_provider(name: str, body: ProviderPatch, request: Request,
+@router.patch("/providers/{provider_id}")
+def update_provider(provider_id: str, body: ProviderPatch, request: Request,
                     session: Session = Depends(get_session)) -> dict:
-    """修改 provider（US-312）；只提交需要改的字段，其余沿用现值。"""
-    current = _effective_providers().get(name)
+    """修改 provider（US-312）；只提交需要改的字段，其余沿用现值。
+
+    路径参数是**身份**，改 ``name`` 只换展示名 —— 路由候选、凭据引用、
+    历史统计都指向同一个 id，改名因此是安全的。
+    """
+    current = _effective_providers().get(provider_id)
     if current is None:
-        raise HTTPException(status_code=404, detail=f"provider 不存在: {name}")
-    if name in default_provider_names():
+        raise HTTPException(status_code=404, detail=f"provider 不存在: {provider_id}")
+    if provider_id in default_provider_names():
         raise HTTPException(
             status_code=400,
-            detail=f"{name} 是内置 provider（config/default.yaml），请勿在此修改；"
+            detail=f"{provider_id} 是内置 provider（config/default.yaml），请勿在此修改；"
                    f"可在用户 config.yaml 中覆盖",
         )
+    # exclude_none 让未提交的字段沿用现值（含 name）；id 不在可改字段里
     merged = {**current, **body.model_dump(exclude_none=True)}
-    merged.pop("name", None)
+    merged.pop("id", None)
     try:
-        normalized = normalize(name, merged)
+        normalized = normalize(provider_id, merged)
     except ProviderConfigError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from None
 
     try:
-        _dry_run(_with_provider(name, normalized))
+        _dry_run(_with_provider(provider_id, normalized))
     except (ValueError, RoutingError) as exc:
         raise HTTPException(
             status_code=400,
             detail=f"配置无法生效，已保持原样: {exc}",
         ) from None
 
-    upsert_user_provider(name, normalized)
-    _apply_config(request, session, scope=f"provider:{name}",
+    upsert_user_provider(provider_id, normalized)
+    _apply_config(request, session, scope=f"provider:{provider_id}",
                   old=str(current), new=str(normalized),
                   source="api_provider_update")
-    _invalidate(request, name)               # 改了 base_url / capabilities 必须重探
+    _invalidate(request, provider_id)        # 改了 base_url / capabilities 必须重探
     session.commit()
-    return {"provider": name, "config": normalized}
+    return {"provider": provider_id, "config": normalized}
 
 
-@router.delete("/providers/{name}")
-def delete_provider(name: str, request: Request,
+@router.delete("/providers/{provider_id}")
+def delete_provider(provider_id: str, request: Request,
                     session: Session = Depends(get_session)) -> dict:
     """删除 provider；被档位路由或 Agent 引用时拒绝并列出引用位置，不做级联删除。"""
-    if name not in _effective_providers():
-        raise HTTPException(status_code=404, detail=f"provider 不存在: {name}")
-    if name in default_provider_names():
+    if provider_id not in _effective_providers():
+        raise HTTPException(status_code=404, detail=f"provider 不存在: {provider_id}")
+    if provider_id in default_provider_names():
         raise HTTPException(
             status_code=400,
-            detail=f"{name} 是内置 provider（config/default.yaml），不能删除",
+            detail=f"{provider_id} 是内置 provider（config/default.yaml），不能删除",
         )
-    referenced = _references(request, session).get(name) or []
+    referenced = _references(request, session).get(provider_id) or []
     if referenced:
         raise HTTPException(
             status_code=409,
             detail={
-                "message": f"provider {name} 仍被引用，请先解除引用再删除",
+                "message": f"provider {provider_id} 仍被引用，请先解除引用再删除",
                 "referenced_by": referenced,
             },
         )
 
-    removed = remove_user_provider(name)
+    removed = remove_user_provider(provider_id)
     if not removed:
-        raise HTTPException(status_code=404, detail=f"provider 不存在于用户配置: {name}")
-    _apply_config(request, session, scope=f"provider:{name}", old=name, new="",
+        raise HTTPException(status_code=404,
+                            detail=f"provider 不存在于用户配置: {provider_id}")
+    _apply_config(request, session, scope=f"provider:{provider_id}", old=provider_id, new="",
                   source="api_provider_delete")
     session.commit()
-    return {"provider": name, "removed": True}
+    return {"provider": provider_id, "removed": True}
 
 
-@router.post("/providers/{name}/probe-models")
-def probe_models(name: str, request: Request, body: ProbeIn | None = None) -> dict:
+@router.post("/providers/{provider_id}/probe-models")
+def probe_models(provider_id: str, request: Request, body: ProbeIn | None = None) -> dict:
     """探测端点可用模型清单（US-312）。
 
     只取 `id`：上游清单不含能力与价格，这两项一律以本地配置为准（设计 §8.1）。
@@ -328,28 +363,28 @@ def probe_models(name: str, request: Request, body: ProbeIn | None = None) -> di
     """
     draft = body or ProbeIn()
     registry = getattr(request.app.state, "ai_registry", None)
-    known = (registry is not None and name in registry.names()) \
-        or name in _effective_providers()
+    known = (registry is not None and provider_id in registry.names()) \
+        or provider_id in _effective_providers()
     if not known and not draft.base_url:
         raise HTTPException(
             status_code=404,
-            detail=f"provider 不存在: {name}（新端点请先填写 base_url）",
+            detail=f"provider 不存在: {provider_id}（新端点请先填写 base_url）",
         )
 
-    target = _build_probe_provider(name, draft)
+    target = _build_probe_provider(provider_id, draft)
     try:
         models = target.list_remote_models()
     except ProviderUnavailable as exc:
         # 缺 Key / 端点不可达这类「补一下就能好」的原因，直接给动作指引
-        return {"provider": name, "ok": False, "models": [],
+        return {"provider": provider_id, "ok": False, "models": [],
                 "detail": f"{exc}。录入 Key 或勾选「该端点无需鉴权」后重试。"}
     except Exception as exc:  # 协议不兼容等，只能请用户手工填
-        return {"provider": name, "ok": False, "models": [],
+        return {"provider": provider_id, "ok": False, "models": [],
                 "detail": f"无法从该端点获取模型清单（{exc}）。请手工填写模型 ID。"}
     if not models:
-        return {"provider": name, "ok": False, "models": [],
+        return {"provider": provider_id, "ok": False, "models": [],
                 "detail": "端点返回的模型清单为空，请手工填写模型 ID。"}
-    return {"provider": name, "ok": True, "models": models, "detail": None}
+    return {"provider": provider_id, "ok": True, "models": models, "detail": None}
 
 
 # ── 档位路由 / 热重载 / Key ──────────────────────
@@ -400,15 +435,26 @@ def get_routing(request: Request) -> dict:
     return request.app.state.router.as_config()
 
 
-@router.put("/providers/{name}/key")
-def set_provider_key(name: str, body: ProviderKey, request: Request) -> dict:
-    """API Key 写入 Windows 凭据管理器（§8.4），config 不落明文。"""
+@router.put("/providers/{provider_id}/key")
+def set_provider_key(provider_id: str, body: ProviderKey, request: Request) -> dict:
+    """API Key 写入 Windows 凭据管理器（§8.4），config 不落明文。
+
+    写入位置 = 该 provider 的 ``api_key_ref``，与读取位置一致。旧实现按 provider
+    名写入，一旦用户把引用名改成别的（比如多个端点共用一份凭据），Key 就再也读不到。
+    """
+    ref = _keyring_ref(provider_id)
+    if not ref:
+        raise HTTPException(
+            status_code=400,
+            detail=f"provider {provider_id} 标记为「无需鉴权」，不需要录入 Key；"
+                   f"若要改成需要鉴权，请先在表单里取消该选项并填写凭据引用名",
+        )
     try:
-        keyring.set_password(KEYRING_SERVICE, name, body.key)
+        keyring.set_password(KEYRING_SERVICE, ref, body.key)
     except Exception as exc:  # keyring 后端不可用（如无桌面环境）
         raise HTTPException(status_code=500, detail=f"凭据写入失败: {exc}") from None
-    _invalidate(request, name)  # 让下一次 health() 立即重新探测（FIX-04）
-    return {"provider": name, "stored": True}
+    _invalidate(request, provider_id)  # 让下一次 health() 立即重新探测（FIX-04）
+    return {"provider": provider_id, "api_key_ref": ref, "stored": True}
 
 
 @router.get("/provider-types")
