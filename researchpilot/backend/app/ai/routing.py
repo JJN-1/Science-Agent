@@ -3,6 +3,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from app.ai.base import ChatProvider
+from app.observability.logging import get_logger
+
+logger = get_logger("ai.routing")
 
 TIERS = ("extract", "plan", "critique", "synthesize", "write")
 
@@ -24,6 +27,16 @@ class RoutingError(ValueError):
 class RouteCandidate:
     provider: str
     model: str
+
+    def __post_init__(self) -> None:
+        """构造即规范化：两侧一律去空白。
+
+        候选来自三处 —— 配置文件、`PATCH /routing` 的表单、测试。任何一处漏了
+        trim，脏值就会顺着 ``provider_switch_log`` 与 ``.as_config()`` 一路扩散，
+        最后在调用点变成一个「模型不存在」的 404，而日志里查不出是谁写进去的。
+        """
+        self.provider = str(self.provider or "").strip()
+        self.model = str(self.model or "").strip()
 
 
 MOCK_VENDOR = "mock"
@@ -48,7 +61,7 @@ class Router:
                 RouteCandidate(provider=item["provider"], model=item["model"])
                 for item in chain
             ]
-            cls._validate_tier(tier, candidates, providers)
+            cls._validate_tier(tier, candidates, providers, strict_models=False)
             routes[tier] = candidates
         missing = [t for t in TIERS if t not in routes]
         if missing:
@@ -59,22 +72,64 @@ class Router:
     @classmethod
     def _validate_tier(
         cls, tier: str, candidates: list[RouteCandidate],
-        providers: dict[str, ChatProvider],
+        providers: dict[str, ChatProvider], *, strict_models: bool = False,
     ) -> None:
         if not candidates:
             raise RoutingError(f"档位 {tier} 路由为空")
         for cand in candidates:
+            if not cand.model:
+                raise RoutingError(f"档位 {tier} 的候选缺少模型 ID")
             provider = providers.get(cand.provider)
             if provider is None:
                 raise RoutingError(
                     f"档位 {tier} 引用了不存在的 provider: {cand.provider}"
                 )
+            cls._check_model_declared(tier, cand, provider, strict=strict_models)
             required = TIER_REQUIRED_CAPS.get(tier, frozenset())
             lack = required - provider.capabilities
             if lack:
                 raise RoutingError(
                     f"档位 {tier} 的 provider {cand.provider} 缺少能力: {', '.join(sorted(lack))}"
                 )
+
+    @classmethod
+    def _check_model_declared(
+        cls, tier: str, cand: RouteCandidate, provider: ChatProvider, *, strict: bool
+    ) -> None:
+        """模型 ID 必须在该后端声明的 ``models`` 里。
+
+        判据以**本地声明**为准（设计 §8.1：清单与能力只认本地配置，不认上游）。
+        声明为空时放弃这道检查 —— 探测常常拿不到清单，不该因此把用户锁死；
+        mock 后端同样跳过（见下）。
+
+        两条路径刻意不同：
+
+        - **改路由（strict，`PATCH /routing`）**：这是我们唯一能当场纠正用户的时刻，
+          直接拒掉并告诉它声明了哪些模型。从前写错的模型要等到真发起调用才发现，
+          而且表现成「后端不可用」，用户根本看不出是自己填错了。路由的模型输入框
+          已改成可自由输入，这道检查正是让自由输入安全的那张网。
+        - **加载配置（非 strict）**：配置漂移（例如重新探测后 models 收窄）不该让
+          应用起不来。打告警，真到调用时再按失败处理 —— 硬失败会让用户连界面都进不去，
+          也就没地方改回来。
+        """
+        declared = [str(m) for m in (getattr(provider, "models", None) or [])]
+        if not declared or cand.model in declared:
+            return
+        if getattr(provider, "vendor", "") == MOCK_VENDOR:
+            # mock 是开发替身：任何模型名都返回同一段内置响应，它的清单不具约束力。
+            # 与 `_validate_vendor_separation` 用同一个豁免判据，保持一套口径。
+            logger.debug("routing_model_check_skipped_for_mock",
+                         tier=tier, provider=cand.provider, model=cand.model)
+            return
+        detail = (
+            f"档位 {tier} 的 provider {cand.provider} 未声明模型 {cand.model!r}；"
+            f"它声明了: {', '.join(declared)}"
+        )
+        if strict:
+            raise RoutingError(detail)
+        logger.warning("routing_model_not_declared", tier=tier,
+                       provider=cand.provider, model=cand.model,
+                       declared=declared)
 
     @classmethod
     def _validate_vendor_separation(
@@ -137,7 +192,7 @@ class Router:
         """档位级热切换（§8.4），带完整校验。"""
         if tier not in TIERS:
             raise RoutingError(f"未知档位: {tier}")
-        self._validate_tier(tier, candidates, providers)
+        self._validate_tier(tier, candidates, providers, strict_models=True)
         new_routes = dict(self._routes)
         new_routes[tier] = candidates
         self._validate_vendor_separation(new_routes, providers)

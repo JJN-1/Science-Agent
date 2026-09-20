@@ -409,15 +409,15 @@ def patch_routing(patch: RoutingPatch, request: Request,
     router_obj = request.app.state.router
     ai_registry = _registry(request)
     old = router_obj.as_config().get(patch.tier)
-    candidates = [{"provider": c.provider, "model": c.model} for c in patch.candidates]
+    # 先过 RouteCandidate 再落盘：它负责 trim，写进用户配置的就是最终生效的那份，
+    # 不会出现「配置里带着空格、调用时才看出模型不存在」。
+    new_candidates = [RouteCandidate(provider=c.provider, model=c.model)
+                      for c in patch.candidates]
     try:
-        router_obj.update_tier(
-            patch.tier,
-            [RouteCandidate(provider=c["provider"], model=c["model"]) for c in candidates],
-            ai_registry.providers_map(),
-        )
+        router_obj.update_tier(patch.tier, new_candidates, ai_registry.providers_map())
     except RoutingError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from None
+    candidates = [{"provider": c.provider, "model": c.model} for c in new_candidates]
     upsert_user_routing(patch.tier, candidates)
     new = [
         {"provider": c.provider, "model": c.model}

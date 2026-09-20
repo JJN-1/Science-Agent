@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from 'react'
-import { App as AntdApp, Modal, Popconfirm, Select, Table, Tag } from 'antd'
+import { App as AntdApp, AutoComplete, Modal, Popconfirm, Select, Table, Tag } from 'antd'
 import { api, ApiError } from '../api/client'
 import type { ProviderHealth, ProviderTypes, TierRoute } from '../api/types'
 import ProviderForm, { healthLabel } from './ProviderForm'
@@ -70,12 +70,17 @@ export default function SettingsDialog({ open, onClose }: { open: boolean; onClo
 
   const saveTier = async (tier: string) => {
     const d = draft[tier]
-    if (!d?.provider || !d.model) return
+    const provider = d?.provider?.trim()
+    const model = d?.model?.trim()
+    if (!provider || !model) {
+      message.warning('请先选择后端并填写模型 ID')
+      return
+    }
     // 只改首候选，**保留**配置好的降级链尾 —— 旧实现把整条链替换成单个候选，
     // 用户点一下「应用」就把 fallback 全清空了
     const tail = (routing[tier] ?? []).slice(1)
     try {
-      await api.patchRouting(tier, [d, ...tail])
+      await api.patchRouting(tier, [{ provider, model }, ...tail])
       message.success(`档位 ${tier} 已热切换`)
       await load()
     } catch (err) {
@@ -220,16 +225,12 @@ export default function SettingsDialog({ open, onClose }: { open: boolean; onClo
                   setDraft((d) => ({ ...d, [tier]: { provider, model: first } }))
                 }}
               />
-              <Select
+              <AutoComplete
                 size="small"
-                style={{ width: 180 }}
-                showSearch
-                value={draft[tier]?.model || undefined}
-                placeholder="模型"
-                options={modelsOf(draft[tier]?.provider ?? '').map((m) => ({
-                  value: m,
-                  label: m,
-                }))}
+                style={{ width: 220 }}
+                value={draft[tier]?.model ?? ''}
+                placeholder="模型 ID"
+                options={modelsOf(draft[tier]?.provider ?? '').map((m) => ({ value: m }))}
                 onChange={(model: string) =>
                   setDraft((d) => ({ ...d, [tier]: { ...d[tier], model } }))
                 }
@@ -249,6 +250,7 @@ export default function SettingsDialog({ open, onClose }: { open: boolean; onClo
         <div className="settings-hint">
           首个候选不可用时自动走降级链；修改只作用于首候选，已有备选会保留。
           critique 档需要与 plan / synthesize 不同后端或不同模型，否则交叉验证失效。
+          模型 ID 必须在该后端的模型清单里 —— 填错会在这一步被挡下，而不是等到真跑起来才发现。
         </div>
       </div>
 

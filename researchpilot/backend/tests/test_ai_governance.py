@@ -43,6 +43,35 @@ def _config(**provider_overrides) -> dict:
     }
 
 
+def _real_config() -> dict:
+    """一个真实类型的 provider（openai_compat）—— 模型清单对它是有约束力的。
+
+    地址指向 discard 端口（明文连上去立刻 ECONNREFUSED），构造时用
+    ``probe_health=False`` 跳过网络：这批用例考的是路由校验，不是网络行为。
+    """
+    return {
+        "ai": {
+            "providers": {
+                "acme": {
+                    "type": "openai_compat",
+                    "models": ["acme-large", "acme-small"],
+                    "vendor": "acme",
+                    "capabilities": ["json_object"],
+                    "base_url": "http://127.0.0.1:9/v1",
+                    "api_key_ref": "acme",
+                }
+            },
+            "routing": {
+                "extract": [{"provider": "acme", "model": "acme-large"}],
+                "plan": [{"provider": "acme", "model": "acme-large"}],
+                "critique": [{"provider": "acme", "model": "acme-small"}],
+                "synthesize": [{"provider": "acme", "model": "acme-large"}],
+                "write": [{"provider": "acme", "model": "acme-large"}],
+            },
+        }
+    }
+
+
 # ── ProviderRegistry ─────────────────────────────
 
 def test_unhealthy_provider_kept_but_flagged():
@@ -395,5 +424,72 @@ def test_mock_delay_ms_actually_sleeps():
 
     assert elapsed >= 0.06, f"delay_ms 未生效（耗时 {elapsed * 1000:.0f}ms）"
     assert MockProvider("mock", {"models": ["m"]}).complete(request).latency_ms == 0
+
+
+# ── 档位路由：候选规范化与模型校验 ────────────────
+
+def test_route_candidate_trims_and_blank_model_is_rejected():
+    """候选两侧去空白；空模型 ID 被校验层当场拦下。
+
+    从前 model 一路原样落进 ``provider_switch_log`` 和用户 config.yaml，脏值要等到
+    真发起调用才暴露，而且表现成「后端不可用」——用户根本看不出是自己填错了。
+    """
+    cand = RouteCandidate(provider="  a  ", model="  m1  ")
+    assert (cand.provider, cand.model) == ("a", "m1")
+
+    cfg = _config()
+    registry = ProviderRegistry.from_config(cfg)
+    router = Router.from_config(cfg, registry.providers_map())
+    with pytest.raises(RoutingError, match="缺少模型 ID"):
+        router.update_tier("plan", [RouteCandidate("a", "   ")], registry.providers_map())
+
+
+def test_hot_swap_rejects_model_not_declared_by_provider():
+    """改路由是最能当场纠正用户的时刻：模型 ID 必须在该后端声明的清单里。
+
+    用真实类型（openai_compat）而不是 mock —— mock 的清单不具约束力，见下个用例。
+    """
+    cfg = _real_config()
+    registry = ProviderRegistry.from_config(cfg, probe_health=False)
+    router = Router.from_config(cfg, registry.providers_map())
+
+    with pytest.raises(RoutingError, match="未声明模型"):
+        router.update_tier("plan", [RouteCandidate("acme", "typo-model")],
+                           registry.providers_map())
+    assert router.candidates("plan")[0].model == "acme-large"   # 拒绝后原路由原封不动
+
+    # 声明过的模型照常放行（改 write 档：它与 critique 不参与交叉校验，不会撞出别的规则）
+    router.update_tier("write", [RouteCandidate("acme", "acme-small")],
+                       registry.providers_map())
+    assert router.candidates("write")[0].model == "acme-small"
+
+
+def test_model_declaration_check_skips_mock():
+    """mock 是开发替身：任何模型名都返回同一段内置响应，清单不具约束力。
+
+    拿它当硬约束会让「零配置首启就能演示」这条链路莫名其妙地卡住 ——
+    而 mock 本来就不存在「模型 ID 写错」这回事。
+    """
+    cfg = _config()
+    registry = ProviderRegistry.from_config(cfg)
+    router = Router.from_config(cfg, registry.providers_map())
+
+    router.update_tier("plan", [RouteCandidate("a", "whatever-model")],
+                       registry.providers_map())   # 不得抛
+    assert router.candidates("plan")[0].model == "whatever-model"
+
+
+def test_config_load_tolerates_model_drift():
+    """配置里的清单漂移不该让应用起不来。
+
+    加载路径只告警：重新探测后 models 收窄是正常的，硬失败会让用户连设置页都进不去，
+    也就没地方把配置改回来。交互路径（update_tier）保持严格 —— 见前面的用例。
+    """
+    cfg = _real_config()
+    cfg["ai"]["routing"]["plan"] = [{"provider": "acme", "model": "legacy-model"}]
+    registry = ProviderRegistry.from_config(cfg, probe_health=False)
+
+    router = Router.from_config(cfg, registry.providers_map())  # 不得抛
+    assert router.candidates("plan")[0].model == "legacy-model"
 
 

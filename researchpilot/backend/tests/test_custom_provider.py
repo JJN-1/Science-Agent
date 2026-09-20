@@ -243,6 +243,28 @@ def test_create_provider_rejects_bad_base_url(client):
     assert "链路本地" in resp.json()["detail"]
 
 
+def test_routing_patch_trims_and_rejects_undeclared_model(client):
+    """路由候选写入前先 trim，且模型 ID 必须在该后端的模型清单里。"""
+    client.post("/api/settings/providers", json=VALID_PROVIDER)
+
+    bad = client.patch("/api/settings/routing", json={
+        "tier": "write", "candidates": [{"provider": "acme", "model": "no-such-model"}],
+    })
+    assert bad.status_code == 400
+    assert "未声明模型" in bad.json()["detail"]
+    assert "acme-small" in bad.json()["detail"]      # 告诉用户它声明了哪些
+
+    ok = client.patch("/api/settings/routing", json={
+        "tier": "write",
+        "candidates": [{"provider": " acme ", "model": " acme-small "}],
+    })
+    assert ok.status_code == 200
+    assert ok.json()["candidates"] == [{"provider": "acme", "model": "acme-small"}]
+    assert client.get("/api/settings/routing").json()["write"] == [
+        {"provider": "acme", "model": "acme-small"}
+    ]
+
+
 def test_update_provider_patches_only_given_fields(client):
     client.post("/api/settings/providers", json=VALID_PROVIDER)
 
