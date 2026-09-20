@@ -1,4 +1,4 @@
-# Sprint 4 实施计划：Agent 内核（US-401 ~ US-408，48 SP）
+# Sprint 4 实施计划：Agent 内核（US-401 ~ US-409，51 SP）
 
 > 对应《修订排期与修复计划》§3.3 / §5.2 / §8.2，Sprint 4（W3–W4，2026-10-05 ~ 10-18）。
 > 前三个冲刺做的是**地基**：数据模型、治理与记账、异步作业与 SSE、真实模型接入。
@@ -6,6 +6,10 @@
 > 摆到人面前等着批准。
 >
 > 这也是阶段一的收尾冲刺：做完它，阶段二的 S1–S8 才能作为技能挂上来。
+>
+> **2026-09-20 修订**：初稿（48 SP / 8 步）把「模型能调工具」当成既有能力，代码核查显示
+> **协议层一行都没有**。新增 **US-409 工具调用协议层**（3 SP）并前置，总计 **51 SP / 10 步**。
+> 超出的 3 SP 由裁剪序列吸收。详见「开工前补丁」。
 
 ## 目标（对齐 G2 闸口）
 
@@ -17,10 +21,73 @@ Sprint 4 末必须通过 **G2 闸口**（内核验收）：
 4. 预算超限能暂停并恢复
 5. 中断后能从检查点继续
 6. `GET /api/tools` 返回全部工具及权限等级
-7. `deterministic` 模式可用
+7. `deterministic` 模式可用（同一输入两次跑出**相同步骤序列**，可断言）
 
-未通过则**不进入 S5**：内核压缩为「工具注册表 + 调用循环 + 权限闸门」，
-暂缓并行调用、上下文摘要化与确定性模式（§7 裁剪表）。
+未通过则**不进入 S5**：内核压缩为「工具调用协议层 + 工具注册表 + 调用循环 + 权限闸门」，
+暂缓并行调用与上下文摘要化。**`deterministic` 不在裁剪序列内**——它是第 7 条的
+唯一证据来源，而实现成本只是一个固定模板加三个固定量。
+
+---
+
+## 开工前补丁（2026-09-20 评估发现的三个缺口）
+
+这份计划初稿把「模型能调工具」当成了既有能力。**代码级核查显示它不是**，
+且三个缺口都是「不补就开不了工」或「不补就会长歪」的级别。
+
+### 补丁 ①（P0，阻塞）：`tools` 协议层一行都没有 → 新增 US-409
+
+| 实测 | 证据 |
+|---|---|
+| `ChatRequest` 字段只有 `messages / tier / schema / max_tokens / temperature / model`，**没有 `tools`** | `app/ai/base.py:15-23` |
+| `ChatResult` 只有 `text / provider / model / tokens / latency / degraded / attempts`，**没有 `tool_calls`** | `app/ai/base.py:28-36` |
+| `capabilities` 在三个文件里都声明了 `"tools"`，但全仓 `grep tool_choice\|function_call\|tool_calls` **只有声明、零消费点** | `base.py:108`、`providers/openai_compat.py:50`、`provider_config.py:25` |
+| `agents.tools` 是死列，无任何读取点；设计 §5.3 `AgentSpec.tools` 从未落地 | `store/models.py:98`、`dao/agents.py:35` |
+
+结论：**协议层无法表达一次工具调用**，注册表注册了也无处调用。US-409 因此**前置到第 3 步**，
+排在工具注册表之前。
+
+改动面（四文件 + 测试）：
+
+- `app/ai/base.py`：`ChatRequest` 增 `tools: list[dict] | None` 与 `tool_choice: str | dict | None`；
+  `ChatResult` 增 `tool_calls: list[ToolCall] | None`（`ToolCall = {id, name, arguments}`）
+- `app/ai/providers/openai_compat.py`：请求体透传 `tools` / `tool_choice`；响应解析
+  `choices[0].message.tool_calls`（含 `arguments` 是 **JSON 字符串**这一细节，需按
+  `json_utils` 的容错路径解析）
+- ⚠️ **`app/ai/degrade.py::_request_with` 手工重建 `ChatRequest`** —— 必须同步新字段，
+  否则**降级重试时工具定义会被静默丢掉**（`model` 字段已经踩过这个坑，见项目记忆）
+- `app/ai/providers/mock.py`：产出**确定性**工具调用，让内核测试可离线跑
+- `app/ai/client.py`：缓存键要覆盖 `tools` 摘要 —— 否则「同一段对话带不同工具集」会串缓存
+
+**SP 影响**：Sprint 4 由 48 → **51 SP**。超出的 3 SP 由裁剪序列吸收（并行调用为首选裁剪项），
+不额外挤占排期。
+
+### 补丁 ②（P0，会污染审计语义）：`tool.*` 事件与既有 `tool` 步骤种类撞名
+
+前端的 `RunBlock.KIND_LABEL`（`components/RunBlock.tsx:5-10`）里，`tool` / `result` 已经是
+**步骤种类**，含义是「Agent 自己写出来的文本步骤」——它们是模型叙述，不是系统执行。
+
+本计划要新增的事件 `tool.call` / `tool.result` 指的是**系统真的执行了一次工具**。
+两者若共用「tool」这个词，界面上就分不清「模型声称做了」和「系统真的做了」——
+**而这恰恰是审计价值的全部来源**（D10 的「不静默撒谎」是同一个原则）。
+
+**定名（D12）**：
+
+| 概念 | 命名 | 来源 |
+|---|---|---|
+| 模型叙述的一个步骤 | 步骤种类 `note`（原 `tool` / `result` 保留读取兼容，写入侧一律用 `note`） | `agent_steps.kind` |
+| 系统真实执行一次工具 | 事件 `tool.call` / `tool.result`；落 `tool_calls` 表 | `job_events` + `tool_calls` |
+
+前端卡片标题也随之区分：`note` → 「步骤」，`tool.call` → 「工具调用（含权限徽标）」。
+
+### 补丁 ③（P1，文档引用错位）：工具契约不在 §3.3
+
+初稿写「工具契约（对齐设计 §3.3）」——**§3.3 实际是领域包的 `pack.yaml` 接口**。
+工具契约在 **§5.3 `AgentSpec`**（`tools` / `reads` / `writes` / `max_steps` / `max_cost_usd` /
+`requires_critic` / `human_checkpoint`）与 **§10.1 工具权限分级**。已在下文改正。
+
+顺带记一笔：§5.3 那六个字段**至今一个都没实现**，它们是内核算法的真正输入——
+`max_steps` / `max_cost_usd` 决定循环的停止条件，`reads` / `writes` 决定黑板权限，
+`requires_critic` / `human_checkpoint` 决定评审与中断点。
 
 ---
 
@@ -72,6 +139,9 @@ Key 约 70 字符）。而 provider 健康仍显示 `ok` —— 因为健康探�
 | D9 | 错误自愈计数按 **`(tool, args_hash)`** 计，连续 3 次失败终止该步并转人工 | 按工具名计数会误杀「换参数重试」——那本来就是正常操作 |
 | D10 | 单工具结果超 32 KB 时**头尾保留 + 截断提示** | 与 FIX-06 同一条原则：静默截断等于对模型撒谎，它会在错误的前提下继续推理 |
 | D11 | 无新增运行时依赖。并行用现有 `anyio`，token 估算用自写启发式 | 沿用 Sprint 3 约定；引 `tiktoken` 会让安装包与离线可用性都变差 |
+| D12 | **「模型叙述的步骤」与「系统执行的工具」分开命名**：步骤种类用 `note`，事件用 `tool.call` / `tool.result` | 见补丁 ②。同名会让「声称做了」与「真的做了」在界面上不可分辨，审计价值归零 |
+| D13 | **US-409（`tools` 协议层）前置到工具注册表之前**，且缓存键必须覆盖 `tools` 摘要 | 见补丁 ①。协议不通则注册表无处调用；缓存键不覆盖工具集会让不同工具组合串缓存 |
+| D14 | **`POST /api/conversations/{id}/messages` 从第 1 步就定型为 `{message, job_id: int \| null}`**，第 1 步 `job_id` 恒为 `null`，内核算法就位后由第 5 步填上 | 避免第 5 步为了返回 `202 {job_id}` 而破坏已经联调过的响应契约。前端从一开始就按可空处理 |
 
 ---
 
@@ -110,7 +180,11 @@ agent_kernel/
 └── errors.py          # 内核错误码（沿用 §11.3 格式）
 ```
 
-### 3. 工具契约（对齐设计 §3.3）
+### 3. 工具契约（对齐设计 **§5.3 `AgentSpec`** 与 **§10.1 工具权限分级**）
+
+> 初稿此处写「对齐设计 §3.3」有误——§3.3 是领域包的 `pack.yaml` 接口。工具契约的权威定义
+> 在 §5.3（`tools` / `reads` / `writes` / `max_steps` / `max_cost_usd` / `requires_critic` /
+> `human_checkpoint`）与 §10.1（权限分级、危险操作不可配置关闭）。
 
 ```python
 @dataclass(frozen=True)
@@ -123,6 +197,17 @@ class ToolSpec:
     timeout_s: float
     result_max_bytes: int
 ```
+
+**§5.3 的六个字段与本计划的对应关系**（它们是内核算法的真正输入，不能再悬空）：
+
+| §5.3 字段 | 内核里的落点 | 本计划哪一步 |
+|---|---|---|
+| `tools` | 工具白名单收口（`AgentSpec.tools` ∩ 注册表） | 第 4 步（当前 `agents.tools` 是死列） |
+| `reads` / `writes` | 黑板对象类型权限 | 第 6 步 |
+| `max_steps` | 循环步数上限（`kernel.max_steps` 的 per-agent 覆盖） | 第 5 / 7 步 |
+| `max_cost_usd` | 与 `BudgetManager` 双闸 | 第 7 步 |
+| `requires_critic` | Critic 强制评审（阶段二 S8 接线） | 阶段二 |
+| `human_checkpoint` | `none` / `before` / `after` / `risk_based` → 中断点 | 第 6 步 |
 
 ### 4. 调用循环
 
@@ -144,12 +229,20 @@ class ToolSpec:
 ### 6. API 与 SSE（对齐设计 §3.4）
 
 新增：`POST/GET /api/conversations`、`GET /api/conversations/{id}`、
-`POST /api/conversations/{id}/messages`（返回 `202 {job_id}`）、`GET /api/tools`、
-`PATCH /api/task-plans/{id}`。
+`POST /api/conversations/{id}/messages`、`GET /api/tools`、`PATCH /api/task-plans/{id}`。
 复用：`GET /api/jobs/{id}`、`/stream`、`/cancel`。
+
+`POST /api/conversations/{id}/messages` 的响应从第 1 步就定型为
+`{ "message": MessageOut, "job_id": int | null }`（D14）：
+
+- **第 1 步**：写用户消息、返回 `201`，`job_id` 恒为 `null` —— 内核还没就位，不假装派活
+- **第 5 步**：内核循环接上后改为 `202`，`job_id` 为 `kind=chat` 作业的 id
+
+这样前端从第一天就按可空处理，第 5 步不需要回头改已经联调过的契约。
 
 新增事件类型：`plan.updated`、`assistant.delta`、`tool.call`、`tool.result`、
 `approval.required`。**沿用 Sprint 3 的帧约定：只有 `id:` + `data:`，类型在 `data.type`。**
+命名与既有步骤种类的分工见 D12。
 
 ### 7. 前端
 
@@ -159,19 +252,47 @@ class ToolSpec:
 
 ---
 
-## 实施顺序（每步一个 commit，每步跑一次回归）
+## 实施顺序（10 步，每步一个 commit，每步跑一次回归）
+
+> 原 8 步把「工具调用协议层」当作隐含前提，实测发现它一行都没有（补丁 ①）。
+> 现拆为 US-409 并前置到注册表之前。**第 3 步与第 4 步不可合并**——
+> 前者是协议改造（改的是 AI 接入层），后者是领域建模（改的是内核层），混在一个 commit 里
+> 出问题时无法判断是协议映射错了还是注册表契约错了。
 
 | # | 提交范围 | 内容 |
 |:--:|---|---|
 | 0 | `test(US-303)` | **前置**：G1-1 复跑留证（需用户录入真实 Key） |
-| 1 | `feat(US-401/402)` | migration 5（`conversations`/`messages`）；会话 API；上下文装配与裁剪 |
+| 1 | `feat(US-401/402)` | migration 5（`conversations`/`messages`）；会话 API（含 D14 契约）；上下文装配与裁剪 |
 | 2 | `feat(US-403)` | `task_plans` 表与计划器；计划 API；确定性模式开关 |
-| 3 | `feat(US-404)` | 工具契约与注册表；`GET /api/tools`；`run_pipeline` 注册为 capability |
-| 4 | `feat(US-405)` | 内核循环（双模式、并行调用、结果截断、错误自愈） |
-| 5 | `feat(US-406)` | 权限分级；最小沙箱；危险操作批准接线 |
-| 6 | `feat(US-407)` | 执行控制：步数上限、预算熔断、中断、检查点恢复 |
-| 7 | `feat(US-405)` | 前端：计划卡片、工具调用卡片、批准卡片、工具清单 |
-| 8 | `test(US-408)` | 内核端到端冒烟与回归；G2 留证 |
+| 3 | `feat(US-409)` | **工具调用协议层**：`ChatRequest.tools` / `ChatResult.tool_calls`；`openai_compat` 双向透传；`degrade` 同步；mock 确定性工具调用；缓存键覆盖 `tools` |
+| 4 | `feat(US-404)` | 工具契约（**对齐设计 §5.3 `AgentSpec` / §10.1**）与注册表；**事件定名 `tool.call`/`tool.result`（D12）**；`GET /api/tools`；`run_pipeline` 注册为 capability |
+| 5 | `feat(US-405)` | 内核循环（双模式、并行调用、结果截断、错误自愈）；`POST /messages` 改 `202`（D14） |
+| 6 | `feat(US-406)` | 权限分级；最小沙箱；危险操作批准接线 |
+| 7 | `feat(US-407)` | 执行控制：步数上限、预算熔断、中断、检查点恢复 |
+| 8 | `feat(US-405)` | 前端：计划卡片、工具调用卡片、批准卡片、工具清单；`note` 与 `tool.call` 分卡渲染（D12） |
+| 9 | `test(US-408)` | 内核端到端冒烟与回归；G2 留证 |
+
+## 实施进度
+
+| # | 提交范围 | 状态 | 留证 |
+|:--:|---|:--:|---|
+| 0 | `test(US-303)` G1-1 复跑 | ☐ 待用户录入真实 Key | — |
+| 1 | `feat(US-401/402)` 会话持久化 + 上下文裁剪 | ✅ 已完成 | 回归 228 passed（基线 202，+26）；`tmp/migration5_safety.py`（真实库副本 16 张表 193 行一字不差、新表幂等）；`tmp/smoke_us401.py`（真实 config.yaml 冒烟） |
+| 2 | `feat(US-403)` 计划器 | ☐ | — |
+| 3 | `feat(US-409)` 工具调用协议层 | ☐ | — |
+| 4 | `feat(US-404)` 工具注册表 | ☐ | — |
+| 5 | `feat(US-405)` 内核循环 | ☐ | — |
+| 6 | `feat(US-406)` 权限与沙箱 | ☐ | — |
+| 7 | `feat(US-407)` 执行控制 | ☐ | — |
+| 8 | `feat` 前端会话界面 | ☐ | — |
+| 9 | `test(US-408)` 内核冒烟 | ☐ | — |
+
+**第 1 步的两处契约选择**（后续步骤不要改）：
+
+- `POST /api/conversations/{id}/messages` 现在返回 `201 {message, job_id: null}`，
+  `job_id` 是**可空字段**而不是「暂缺字段」—— 第 5 步只换值，不动形状（D14）
+- `messages.tokens` 存**本地估算**，`llm_usage` 存上游**真实用量**。两者刻意不合并：
+  合并之后就分不清哪个数字能信
 
 ## 依赖与约束
 
@@ -191,7 +312,13 @@ class ToolSpec:
 | 4 | 预算超限可暂停并恢复 | 复用 S3 的预算熔断路径 + 内核循环下的等价用例 | ☐ |
 | 5 | 中断可恢复 | 取消 → 从 `kernel_checkpoints` 续跑，步骤序号连续 | ☐ |
 | 6 | `GET /api/tools` 返回全部工具及权限等级 | 接口快照 | ☐ |
-| 7 | `deterministic` 模式可用 | 同一输入连跑两次，计划与步骤序列一致 | ☐ |
+| 7 | `deterministic` 模式可用 | **同一输入连跑两次，计划与步骤序列逐项相等**（第 9 步落成 golden case，见下方说明） | ☐ |
+| 8 | 上下游不得在界面上混淆「模型声称」与「系统执行」 | 前端 `note` 与 `tool.call` 分卡渲染的截图（D12） | ☐ |
+
+**第 7 条的留证标准不能只是「开关存在」**（2026-09-20 加严）：设计 §12.5 要求
+「Golden Test：固定输入 + 固定断言；`temperature=0`；关键字段完全匹配」。内核层面的第一个
+golden case 就落在第 7 条上——**同一输入跑两次，`task_plans.steps` 与 `tool_calls` 序列
+逐项相等**。它同时也是 §12.5 在本项目的第一个可运行样本。
 
 ## 风险与裁剪预案
 
@@ -200,4 +327,6 @@ class ToolSpec:
 | Windows 沙箱做不彻底 | 第一版只做 D6 列出的可验证面；UI 明确标注执行真实性与边界，绝不声称「已隔离」 |
 | 模型不按 JSON Schema 出工具调用 | 复用 `schema_utils` + 违规路径重试（FIX-06 已验证的机制） |
 | 内核循环吃光预算 | `max_steps` + 熔断双闸；上下文裁剪优先保系统提示与当前计划 |
-| 进度落后（48 SP 偏大） | 按 §7 裁剪顺序：先砍确定性模式 → 再砍上下文摘要化 → 再砍并行调用；**工具注册表 + 调用循环 + 权限闸门必须保住** |
+| **`tools` 协议层改动波及既有调用路径**（US-409） | 新字段一律**可选**（`None` 表示不带工具），既有 `ctx.llm()` 调用点零改动；`degrade._request_with` 的字段同步补一条**独立单测**，防止再次静默丢字段 |
+| 进度落后（51 SP 偏大） | 裁剪顺序：**先砍并行调用 → 再砍上下文摘要化**；`deterministic` **不在裁剪序列内**（G2 第 7 条依赖它）。**工具调用协议层 + 工具注册表 + 调用循环 + 权限闸门必须保住** |
+| 内核做完但不知质量如何 | 第 7 条升级为 golden case；阶段二 S5 起补「压缩存活」与「真实工具链」两类探针（本次评估列出的两项长期缺口） |
