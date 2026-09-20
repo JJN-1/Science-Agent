@@ -219,6 +219,50 @@ def test_router_update_tier_hot_swap():
 
 # ── DAO：usage / decisions / approvals / agents ──
 
+def test_routed_model_reaches_the_provider(session):
+    """档位里选的模型必须真正下发（旧实现写死 ``provider.models[0]``）。
+
+    用户在设置页把某档位切到同一 provider 的另一个模型后毫无效果：请求体里始终是
+    ``models[0]``，路由表里的 ``model`` 是一行死配置。
+    """
+    from app.ai.budget import BudgetManager
+    from app.ai.client import LlmGateway
+    from app.store.dao import projects as projects_dao
+    from app.store.dao import runs as runs_dao
+
+    tiers = ("extract", "plan", "critique", "synthesize", "write")
+    cfg = {
+        "ai": {
+            "providers": {"a": {"type": "mock", "models": ["m1", "m2"], "vendor": "mock",
+                                "capabilities": ["json_object"]}},
+            "routing": {t: [{"provider": "a", "model": "m2"}] for t in tiers},
+            "budget": {"project_total": 10.0},
+        }
+    }
+    registry = ProviderRegistry.from_config(cfg)
+    router = Router.from_config(cfg, registry.providers_map())
+    gateway = LlmGateway(registry, router, BudgetManager(cfg["ai"]["budget"]))
+
+    project = projects_dao.create(session, title="路由模型", domain="cs-ai")
+    run = runs_dao.create_run(session, project_id=project.id, stage_id="S1", agent_id="scout")
+    response = gateway.call(
+        session, project_id=project.id, run_id=run.id, stage_id="S1", agent_id="scout",
+        tier="plan", messages=[ChatMessage(role="user", content="hi")],
+    )
+
+    assert response.model == "m2"  # 而不是 provider.models[0] == "m1"
+
+    # 热切换档位模型后必须真的换模型，且不能命中旧模型的缓存
+    # （缓存键按 (provider, model, tier, messages, schema) 生成）
+    router.update_tier("plan", [RouteCandidate("a", "m1")], registry.providers_map())
+    again = gateway.call(
+        session, project_id=project.id, run_id=run.id, stage_id="S1", agent_id="scout",
+        tier="plan", messages=[ChatMessage(role="user", content="hi")],
+    )
+    assert again.model == "m1"
+    assert usage_dao.summary_by(session, project_id=project.id, dim="provider")[0]["calls"] == 2
+
+
 def test_usage_record_and_summary(session):
     from app.store.dao import projects as projects_dao
 

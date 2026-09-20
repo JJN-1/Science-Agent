@@ -74,6 +74,25 @@ def test_complete_success_and_usage():
     assert resp.attempts == 1
 
 
+def test_request_model_overrides_provider_default():
+    """路由选定的模型要进请求体 —— 否则用户在档位里换模型等于没换。"""
+    seen = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        import json as _json
+
+        seen["body"] = _json.loads(request.read())
+        return httpx.Response(200, json={"choices": [{"message": {"content": "ok"}}],
+                                         "usage": {}, "model": "chosen-model"})
+
+    p = _provider(handler, models=["default-model", "chosen-model"])
+    assert p.model == "default-model"  # provider 的缺省仍是 models[0]
+    resp = p.complete(ChatRequest(messages=[ChatMessage(role="user", content="hi")],
+                                  model="chosen-model"))
+    assert seen["body"]["model"] == "chosen-model"
+    assert resp.model == "chosen-model"
+
+
 def test_latency_is_measured_and_attempts_counted():
     """记账里全是 latency_ms=0 时，「等了几分钟」和「只要 200ms」在数据上无法区分。"""
     calls = {"n": 0}

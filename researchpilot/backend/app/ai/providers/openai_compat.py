@@ -83,8 +83,11 @@ class OpenAICompatProvider(ChatProvider):
         return headers
 
     def complete(self, request: ChatRequest) -> ChatResponse:
+        # 档位路由选定的模型优先；provider 的 models[0] 只是缺省值。
+        # 旧实现写死 self.model，于是用户在设置页把某档位切到另一个模型后毫无效果。
+        model = request.model or self.model
         payload: dict = {
-            "model": self.model,
+            "model": model,
             "messages": [{"role": m.role, "content": m.content} for m in request.messages],
             "max_tokens": request.max_tokens,
             "temperature": request.temperature,
@@ -101,7 +104,7 @@ class OpenAICompatProvider(ChatProvider):
         return ChatResponse(
             text=choice.get("content", ""),
             provider=self.name,
-            model=data.get("model", self.model),
+            model=data.get("model") or model,
             prompt_tokens=int(usage.get("prompt_tokens", 0)),
             completion_tokens=int(usage.get("completion_tokens", 0)),
             latency_ms=latency_ms,

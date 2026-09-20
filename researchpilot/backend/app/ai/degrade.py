@@ -99,4 +99,5 @@ def _request_with(request: ChatRequest, messages: list[ChatMessage]) -> ChatRequ
     return ChatRequest(
         messages=messages, tier=request.tier, schema=request.schema,
         max_tokens=request.max_tokens, temperature=request.temperature,
+        model=request.model,
     )

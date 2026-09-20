@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 from collections.abc import Callable
+from dataclasses import replace
 
 from sqlalchemy.orm import Session
 
@@ -162,13 +163,19 @@ class LlmGateway:
 
     def _call_with_fallback(self, request: ChatRequest, tier: str,
                             session: Session | None = None) -> ChatResponse:
-        """按档位候选链依次尝试：熔断/失败自动切换降级链（§8.3 / §11.4）。"""
+        """按档位候选链依次尝试：熔断/失败自动切换降级链（§8.3 / §11.4）。
+
+        每个候选都按自己的 ``(provider, model)`` 发请求 —— 档位里选的模型必须真正
+        生效（旧实现只用了 ``provider.models[0]``，路由表里的 ``model`` 是死配置）。
+        """
         last_error: ProviderError | None = None
         for cand in self.router.candidates(tier):
             try:
                 self.registry.check_available(cand.provider, session)
                 provider = self.registry.get(cand.provider)
-                response = complete_with_degradation(provider, request)
+                response = complete_with_degradation(
+                    provider, replace(request, model=cand.model or None)
+                )
             except ProviderError as exc:
                 last_error = exc
                 # 补上归属：provider 自己不知道被谁调度，但失败记账必须落到具体后端

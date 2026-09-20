@@ -18,6 +18,9 @@ class ChatRequest:
     schema: dict | None = None  # JSON Schema（结构化输出要求）
     max_tokens: int = 1024
     temperature: float = 0.7
+    # 本次调用用哪个模型。由档位路由的 (provider, model) 决定；留空则用 provider 的
+    # 首个声明模型。provider 承载「声明了哪些模型」，具体用哪个是路由的事（§8.4）。
+    model: str | None = None
 
 
 @dataclass

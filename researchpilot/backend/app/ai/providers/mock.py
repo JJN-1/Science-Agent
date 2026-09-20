@@ -49,7 +49,7 @@ class MockProvider(ChatProvider):
         return ChatResponse(
             text=self._response,
             provider=self.name,
-            model=self.model,
+            model=request.model or self.model,
             prompt_tokens=len(" ".join(m.content for m in request.messages)) // 4,
             completion_tokens=len(self._response) // 4,
             latency_ms=self._latency_ms,
