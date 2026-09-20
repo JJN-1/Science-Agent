@@ -111,6 +111,13 @@ def test_failed_stage_is_persisted_with_actionable_error(client, run_and_wait):
     assert [d["kind"] for d in
             client.get(f"/api/projects/{project_id}/decisions").json()] == ["failed_attempt"]
 
+    # 失败的调用同样要留痕（用户投诉的「供应商统计里没有这条请求」）
+    usage = client.get(f"/api/usage/summary?project_id={project_id}&dim=provider").json()
+    assert len(usage["rows"]) == 1
+    assert usage["rows"][0] == {"key": "mock", "calls": 1, "failed": 1,
+                               "prompt_tokens": 0, "completion_tokens": 0, "cost": 0.0}
+    assert usage["total_cost"] == 0.0
+
 
 def test_unparseable_output_is_kept_in_trajectory(client, run_and_wait):
     """FIX-06：解析失败时原始输出必须留在轨迹里，否则无从排查模型到底吐了什么。

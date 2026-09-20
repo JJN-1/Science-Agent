@@ -126,7 +126,12 @@ class Decision(Base):
 
 
 class LlmUsage(Base):
-    """调用记账：project / stage / agent 三维归因（US-203）。"""
+    """调用记账：project / stage / agent 三维归因（US-203）。
+
+    **失败也要记**：只记成功的话，「供应商统计」永远是残缺的 —— 那次跑挂了的请求
+    根本不存在，用户于是问不出「到底有没有发出去、发给了谁」（真实投诉）。失败行
+    ``cost=0``，不进花费合计，只进调用次数与 ``failed`` 计数。
+    """
 
     __tablename__ = "llm_usage"
 
@@ -148,6 +153,11 @@ class LlmUsage(Base):
     latency_ms: Mapped[int] = mapped_column(Integer, default=0)
     cached: Mapped[bool] = mapped_column(default=False)
     degraded: Mapped[list] = mapped_column(JSON, default=list)
+    # ok | failed；失败行的 error 存异常消息（含 code 与违规点）
+    status: Mapped[str] = mapped_column(String(16), default="ok")
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # 实际发出的 HTTP 尝试次数（含重试）：超时 120s × 4 次 ≈ 8 分钟，得能看出来
+    attempts: Mapped[int] = mapped_column(Integer, default=1)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
 
 

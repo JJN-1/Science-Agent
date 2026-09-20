@@ -43,14 +43,20 @@ class ProviderError(Exception):
 
     ``attempts`` 是失败前实际发出的尝试次数：默认超时 120s × 4 次尝试意味着一次调用
     最长可拖近 8 分钟，「等了很久」到底是不是重试拖出来的，只有这个数字说得清。
+
+    ``provider`` / ``model`` 由降级链在捕获时补上（provider 自己不知道被谁调度）：
+    失败记账要落到具体后端名下，否则统计里出现的是一行「unknown」。
     """
 
     code = "LLM-PROVIDER-001"
 
-    def __init__(self, *args: object, raw_output: str = "", attempts: int = 1) -> None:
+    def __init__(self, *args: object, raw_output: str = "", attempts: int = 1,
+                 provider: str = "", model: str = "") -> None:
         super().__init__(*args)
         self.raw_output = raw_output
         self.attempts = attempts
+        self.provider = provider
+        self.model = model
 
 
 class ProviderUnavailable(ProviderError):

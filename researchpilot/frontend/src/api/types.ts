@@ -67,7 +67,10 @@ export interface Decision {
 
 export interface UsageRow {
   key: string
+  /** 含失败调用：只统计成功的话，「这个后端被调过几次」永远答不对。 */
   calls: number
+  /** 其中的失败次数（失败行 cost=0，不进花费合计）。 */
+  failed: number
   prompt_tokens: number
   completion_tokens: number
   cost: number

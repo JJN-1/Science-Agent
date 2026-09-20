@@ -6,7 +6,7 @@ from collections.abc import Callable
 
 from sqlalchemy.orm import Session
 
-from app.ai.base import ChatMessage, ChatRequest, ChatResponse, ProviderError
+from app.ai.base import ChatMessage, ChatRequest, ChatResponse, ProviderError, monotonic
 from app.ai.budget import BudgetManager
 from app.ai.degrade import complete_with_degradation
 from app.ai.registry import ProviderRegistry
@@ -104,7 +104,16 @@ class LlmGateway:
             # 而不是「卡住了」。降级链是设计的一部分（§8.3），等待时也该可见。
             on_start(tier, [{"provider": c.provider, "model": c.model}
                             for c in self.router.candidates(tier)])
-        response = self._call_with_fallback(request, tier, session)
+        started = monotonic()
+        try:
+            response = self._call_with_fallback(request, tier, session)
+        except ProviderError as exc:
+            self._record_failure(
+                session, project_id=project_id, run_id=run_id, stage_id=stage_id,
+                agent_id=agent_id, tier=tier, exc=exc,
+                latency_ms=int((monotonic() - started) * 1000),
+            )
+            raise
 
         provider = self.registry.get(response.provider)
         cost = provider.cost_of(response.prompt_tokens, response.completion_tokens)
@@ -162,6 +171,9 @@ class LlmGateway:
                 response = complete_with_degradation(provider, request)
             except ProviderError as exc:
                 last_error = exc
+                # 补上归属：provider 自己不知道被谁调度，但失败记账必须落到具体后端
+                exc.provider = exc.provider or cand.provider
+                exc.model = exc.model or cand.model
                 self.registry.record_failure(cand.provider, session)
                 continue
             self.registry.record_success(response.provider, session)
@@ -187,6 +199,7 @@ class LlmGateway:
             completion_tokens=response.completion_tokens,
             cost=cost, latency_ms=response.latency_ms, cached=cached,
             degraded=response.degraded, project_id=project_id, run_id=run_id,
+            attempts=response.attempts,
         )
         runs_dao.add_step(session, run_id=run_id, kind="llm_call", content={
             "text": response.text,
@@ -201,3 +214,21 @@ class LlmGateway:
             "cached": cached,
             "degraded": response.degraded,
         })
+
+    def _record_failure(self, session: Session, *, project_id: int, run_id: int,
+                        stage_id: str, agent_id: str, tier: str,
+                        exc: ProviderError, latency_ms: int) -> None:
+        """失败的调用同样落一行记账。
+
+        只记成功的话，用户看到的「供应商统计」永远是残缺的：那次跑挂了的请求根本
+        不存在，于是「有没有发出去」「发给了谁」「等了多久」全都答不上来（真实投诉）。
+        失败行 ``cost=0``，不参与花费合计，只参与调用次数与失败计数 —— 钱没花出去，
+        但事情确实发生过，这两件事都得如实记录。
+        """
+        usage_dao.record(
+            session, stage_id=stage_id, agent_id=agent_id,
+            provider=exc.provider or "unknown", model=exc.model or "unknown", tier=tier,
+            cost=0.0, latency_ms=latency_ms, cached=False,
+            project_id=project_id, run_id=run_id,
+            status=usage_dao.STATUS_FAILED, error=str(exc), attempts=exc.attempts,
+        )

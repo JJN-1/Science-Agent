@@ -240,6 +240,30 @@ def test_usage_record_and_summary(session):
     assert by_agent == {"scout": 1.0}
 
 
+def test_failed_call_counts_but_costs_nothing(session):
+    """失败记账：``calls`` 含失败、``cost`` 不含。
+
+    用户投诉「供应商统计里没有那条请求」—— 只记成功时，跑挂的那次在数据上不存在，
+    「到底发出去没有、发给了谁」就成了无解的问题。钱没花出去和事情没发生是两回事。
+    """
+    from app.store.dao import projects as projects_dao
+
+    p = projects_dao.create(session, title="t", domain="cs-ai")
+    usage_dao.record(session, stage_id="S1", agent_id="scout", provider="mock",
+                     model="m", tier="plan", cost=0.5, project_id=p.id)
+    usage_dao.record(session, stage_id="S1", agent_id="scout", provider="mock",
+                     model="m", tier="plan", project_id=p.id,
+                     status=usage_dao.STATUS_FAILED,
+                     error="LLM-UNAVAIL-001: mock unavailable", attempts=2)
+    session.flush()
+
+    assert usage_dao.project_spend(session, project_id=p.id) == 0.5  # 失败不花钱
+    assert usage_dao.summary_by(session, project_id=p.id, dim="provider") == [
+        {"key": "mock", "calls": 2, "failed": 1,
+         "prompt_tokens": 0, "completion_tokens": 0, "cost": 0.5}
+    ]
+
+
 def test_decisions_add_and_list(session):
     from app.store.dao import projects as projects_dao
 
