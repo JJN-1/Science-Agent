@@ -84,6 +84,10 @@ class ProbeIn(BaseModel):
 
     base_url: str | None = None
     api_key: str | None = None
+    api_key_ref: str | None = None
+    # 显式「该端点无需鉴权」（本地自建端点）。与 api_key_ref="" 等价，
+    # 但给表单一个明确的勾选框 —— 用户勾了无需鉴权却仍被要求填 Key，是实打实的投诉。
+    keyless: bool | None = None
 
 
 # ── 内部工具 ────────────────────────────────────
@@ -169,6 +173,11 @@ def _build_probe_provider(name: str, body: ProbeIn) -> OpenAICompatProvider:
     raw = dict(_effective_providers().get(name) or {})
     if body.base_url is not None:
         raw["base_url"] = body.base_url
+    # 草稿里的凭据语义要和保存路径**完全一致**，否则会出现「保存后能用、探测时说缺 Key」
+    if body.keyless:
+        raw["api_key_ref"] = ""
+    elif body.api_key_ref is not None:
+        raw["api_key_ref"] = body.api_key_ref
     if raw.get("type") == "mock":
         raise HTTPException(status_code=400, detail="mock 类型没有远端模型清单可探测")
     if not raw.get("base_url"):
@@ -177,14 +186,17 @@ def _build_probe_provider(name: str, body: ProbeIn) -> OpenAICompatProvider:
         base_url = normalize_base_url(raw["base_url"])
     except ProviderConfigError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from None
+    # None = 用户没提过这件事 → 缺省引用名即 provider 名；"" = 显式无需鉴权。
+    # 旧实现写 `or name`，把「显式留空」当成了「没填」—— 勾了无需鉴权照样要 Key。
+    ref = raw.get("api_key_ref")
     provider = OpenAICompatProvider(name, {
         "base_url": base_url,
         "models": [raw.get("model") or "probe"],
         "vendor": raw.get("vendor") or "probe",
-        "api_key_ref": raw.get("api_key_ref") or name,
+        "api_key_ref": name if ref is None else str(ref).strip(),
         "extra_headers": raw.get("extra_headers") or {},
     })
-    if body.api_key:
+    if body.api_key and provider.auth_required:
         # 草稿里的 Key 只用于本次探测，不落凭据管理器
         provider._peek_key = lambda: body.api_key  # type: ignore[method-assign]
     return provider

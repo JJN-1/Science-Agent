@@ -3,7 +3,8 @@
 覆盖三件事：
 1. 接入表单写进去的配置真能被装配成 provider 并生效（无需重启）；
 2. 校验与引用保护到位——非法地址/未知能力被拒，被路由引用的 provider 不许删；
-3. 免鉴权端点（api_key_ref 留空）与自定义头可用，模型探测失败时给手工填写提示。
+3. 免鉴权端点（api_key_ref 留空）在**保存与探测两条路径**上语义一致，
+   自定义头可用，模型探测失败时给手工填写提示。
 """
 from __future__ import annotations
 
@@ -269,6 +270,46 @@ def test_probe_models_unknown_name_without_base_url_is_404(client):
     resp = client.post("/api/settings/providers/brandnew/probe-models", json={})
     assert resp.status_code == 404
     assert "base_url" in resp.json()["detail"]
+
+
+def test_probe_models_honours_keyless_draft(client, monkeypatch):
+    """勾了「无需鉴权」的草稿探测时不该要 Key（用户投诉的场景）。
+
+    旧实现写 `raw.get("api_key_ref") or name`，把**显式留空**当成「没填」，
+    于是「无需鉴权」在探测路径上完全失效：本地自建端点永远探测不了。
+    """
+    seen: dict = {}
+
+    def fake_list(self, base_url=None, api_key=None):
+        seen["auth_required"] = self.auth_required
+        seen["api_key_ref"] = self.api_key_ref
+        return ["local-model"]
+
+    monkeypatch.setattr(OpenAICompatProvider, "list_remote_models", fake_list)
+
+    body = client.post("/api/settings/providers/brandnew/probe-models",
+                       json={"base_url": DEAD_URL, "keyless": True}).json()
+    assert body["ok"] is True and body["models"] == ["local-model"]
+    assert seen == {"auth_required": False, "api_key_ref": ""}
+
+    # 不勾选则仍按缺省语义要求凭据（引用名即 provider 名）
+    client.post("/api/settings/providers/brandnew/probe-models",
+                json={"base_url": DEAD_URL})
+    assert seen == {"auth_required": True, "api_key_ref": "brandnew"}
+
+
+def test_probe_models_accepts_shared_credential_ref(client, monkeypatch):
+    """多个端点共用一份凭据：草稿能指定 api_key_ref，不必等于 provider 名。"""
+    seen: dict = {}
+
+    def fake_list(self, base_url=None, api_key=None):
+        seen["api_key_ref"] = self.api_key_ref
+        return ["m"]
+
+    monkeypatch.setattr(OpenAICompatProvider, "list_remote_models", fake_list)
+    client.post("/api/settings/providers/brandnew/probe-models",
+                json={"base_url": DEAD_URL, "api_key_ref": "shared-creds"})
+    assert seen["api_key_ref"] == "shared-creds"
 
 
 def test_provider_types_endpoint(client):
