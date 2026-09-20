@@ -13,6 +13,8 @@ from __future__ import annotations
 from alembic import command
 from sqlalchemy import inspect, text
 
+from app.store.dao import conversations as conversations_dao
+from app.store.dao import messages as messages_dao
 from app.store.dao import projects as projects_dao
 from app.store.db import make_engine, make_session_factory
 from app.store.migrations import alembic_config, upgrade_to_head
@@ -87,5 +89,54 @@ def test_upgrade_to_head_is_idempotent(tmp_path):
 
         assert _table_names(engine) == names
         assert _row_counts(engine, names) == before
+    finally:
+        engine.dispose()
+
+
+# Sprint 4 · migration 5：conversations / messages
+BEFORE_CONVERSATIONS = "b1c4e7a92d38"
+SPRINT4_TABLES = ("conversations", "messages")
+
+
+def test_sprint4_migration_adds_conversation_tables_without_touching_rows(tmp_path):
+    """Sprint 4 的加表迁移同样只加表；旧数据（含已写入的会话）必须原样存活。
+
+    这里比已经升级到 head 的库再多验一层：**在新表有数据之后重跑迁移**，
+    确认 conversations / messages 的内容不会被重建丢掉 ——
+    加表迁移最阴的翻车方式就是「顺手重建一遍」。
+    """
+    engine = make_engine(tmp_path / "app.db")
+    try:
+        command.upgrade(alembic_config(engine), BEFORE_CONVERSATIONS)
+        assert not (set(SPRINT4_TABLES) & _table_names(engine)), "旧版本上就已经有新表了"
+
+        project_id = _seed_project(engine, "迁移前")
+
+        upgrade_to_head(engine)
+        assert set(SPRINT4_TABLES) <= _table_names(engine)
+
+        session = make_session_factory(engine)()
+        try:
+            conversation = conversations_dao.create(
+                session, project_id=project_id, title="迁移后写入",
+            )
+            messages_dao.create(
+                session, conversation_id=conversation.id, role="user",
+                content="不该被重建冲掉", tokens=7,
+            )
+            session.commit()
+            conversation_id = conversation.id
+        finally:
+            session.close()
+
+        upgrade_to_head(engine)
+
+        session = make_session_factory(engine)()
+        try:
+            rows = messages_dao.list_for_conversation(session, conversation_id)
+            assert [m.content for m in rows] == ["不该被重建冲掉"]
+            assert conversations_dao.get(session, conversation_id).title == "迁移后写入"
+        finally:
+            session.close()
     finally:
         engine.dispose()

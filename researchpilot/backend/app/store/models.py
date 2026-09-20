@@ -301,3 +301,52 @@ class JobEvent(Base):
     type: Mapped[str] = mapped_column(String(32))
     payload: Mapped[dict] = mapped_column(JSON, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+
+# 会话状态：active → archived（US-401）
+CONVERSATION_STATUSES = ("active", "archived")
+# 消息角色：与 ChatMessage 的 role 域一致，另加 tool（工具结果回填）
+MESSAGE_ROLES = ("user", "assistant", "tool", "system")
+
+
+class Conversation(Base):
+    """对话式入口的会话（US-401）。
+
+    **对话层不持有研究状态**（设计 §352 / D2）：``messages`` 只是入口与呈现，
+    研究状态始终在结构化黑板。因此这张表除了 ``project_id`` 之外没有任何研究字段，
+    也不存在「从消息记录反推事实」的路径 —— 消息丢了，研究进度不受影响。
+    """
+
+    __tablename__ = "conversations"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    project_id: Mapped[int] = mapped_column(
+        ForeignKey("projects.id", ondelete="CASCADE"), index=True
+    )
+    title: Mapped[str] = mapped_column(String(255), default="")
+    status: Mapped[str] = mapped_column(String(16), default="active", index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)
+
+
+class Message(Base):
+    """会话消息（US-401）。
+
+    ``tokens`` 存的是**本地估算**值（自写启发式，见 ``agent_kernel.context``），
+    不是上游返回的真实用量 —— 真实用量在 ``llm_usage`` 里，两者用途不同：
+    前者供下一次裁剪算预算，后者供记账与统计。刻意不复用同一列，
+    否则「估算」与「账实」会混成一个数字，事后分不清哪个能信。
+    """
+
+    __tablename__ = "messages"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    conversation_id: Mapped[int] = mapped_column(
+        ForeignKey("conversations.id", ondelete="CASCADE"), index=True
+    )
+    role: Mapped[str] = mapped_column(String(16))
+    content: Mapped[str] = mapped_column(Text, default="")
+    # assistant 发起的工具调用与随后的工具结果靠它配对；普通消息为 None
+    tool_call_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    tokens: Mapped[int] = mapped_column(Integer, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
