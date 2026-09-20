@@ -91,7 +91,11 @@ class OpenAICompatProvider(ChatProvider):
         }
         if request.schema and "json_object" in self.capabilities:
             payload["response_format"] = {"type": "json_object"}
-        data = self._post(payload)
+        started = monotonic()
+        data, attempts = self._post(payload)
+        # 延迟必须真测：记账里全是 0 时，「用户等了几分钟」和「调用只要 200ms」
+        # 在数据上长得一模一样，问题也就永远查不出来。
+        latency_ms = int((monotonic() - started) * 1000)
         choice = (data.get("choices") or [{}])[0].get("message", {})
         usage = data.get("usage", {})
         return ChatResponse(
@@ -100,13 +104,22 @@ class OpenAICompatProvider(ChatProvider):
             model=data.get("model", self.model),
             prompt_tokens=int(usage.get("prompt_tokens", 0)),
             completion_tokens=int(usage.get("completion_tokens", 0)),
+            latency_ms=latency_ms,
+            attempts=attempts,
         )
 
-    def _post(self, payload: dict) -> dict:
+    def _post(self, payload: dict) -> tuple[dict, int]:
+        """POST /chat/completions，返回 ``(响应体, 尝试次数)``。
+
+        失败时抛 ``ProviderError`` 子类，并把**上游原文**与尝试次数挂在异常上：
+        「等了很久，然后 403」这种现场，只有状态码没有响应体是判不出来的
+        （真实事故就是免费额度端点回了 FreeTierError，而日志里只剩一个 403）。
+        """
         headers = self._headers()
         body = {**payload, **self.extra_body}
-        last_error: Exception | None = None
-        for attempt in range(self.max_retries + 1):
+        last_error: ProviderError | None = None
+        plan = self.max_retries + 1
+        for attempt in range(plan):
             try:
                 with httpx.Client(
                     base_url=self.base_url, timeout=self.timeout_s,
@@ -114,19 +127,31 @@ class OpenAICompatProvider(ChatProvider):
                 ) as client:
                     resp = client.post("/chat/completions", json=body, headers=headers)
                 if resp.status_code < 400:
-                    return resp.json()
+                    return resp.json(), attempt + 1
                 if resp.status_code in RETRYABLE_STATUS:
                     if resp.status_code == 429 and attempt == self.max_retries:
-                        raise RateLimited(f"{self.name} 持续限流 (429)")
-                    last_error = ProviderUnavailable(f"{self.name} HTTP {resp.status_code}")
+                        raise RateLimited(
+                            f"{self.name} 持续限流 (429，已试 {attempt + 1} 次)",
+                            raw_output=resp.text[:500], attempts=attempt + 1,
+                        )
+                    last_error = ProviderUnavailable(
+                        f"{self.name} HTTP {resp.status_code}",
+                        raw_output=resp.text[:500], attempts=attempt + 1,
+                    )
                 else:
                     raise ProviderError(
-                        f"{self.name} HTTP {resp.status_code}: {resp.text[:200]}"
+                        f"{self.name} HTTP {resp.status_code}: {resp.text[:200]}",
+                        raw_output=resp.text[:500], attempts=attempt + 1,
                     )
             except httpx.TimeoutException:
-                last_error = ProviderUnavailable(f"{self.name} 请求超时")
+                last_error = ProviderUnavailable(
+                    f"{self.name} 请求超时（{self.timeout_s:.0f}s，已试 {attempt + 1}/{plan} 次）",
+                    attempts=attempt + 1,
+                )
             except httpx.HTTPError as exc:
-                last_error = ProviderUnavailable(f"{self.name} 网络错误: {exc}")
+                last_error = ProviderUnavailable(
+                    f"{self.name} 网络错误: {exc}", attempts=attempt + 1
+                )
             if attempt < self.max_retries:
                 time.sleep(self.backoff_base * (2**attempt) + random.uniform(0, 0.5))
         raise last_error or ProviderUnavailable(f"{self.name} 调用失败")

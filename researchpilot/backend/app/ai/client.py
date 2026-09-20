@@ -26,6 +26,7 @@ def _serialize(response: ChatResponse) -> dict:
         "prompt_tokens": response.prompt_tokens,
         "completion_tokens": response.completion_tokens,
         "latency_ms": response.latency_ms,
+        "attempts": response.attempts,
         "degraded": list(response.degraded),
     }
 
@@ -40,6 +41,7 @@ def _deserialize(payload: dict) -> ChatResponse:
         completion_tokens=int(payload.get("completion_tokens", 0)),
         latency_ms=0,
         degraded=list(payload.get("degraded") or []),
+        attempts=int(payload.get("attempts", 1)),
     )
 
 
@@ -51,6 +53,10 @@ class LlmGateway:
 
     ``on_step`` 是给异步作业层用的结算钩子（FIX-03）：``_record`` 落完轨迹与
     记账后回调一次，让「模型返回了」这件事能变成一条可订阅的事件。
+
+    ``on_start`` 是**发起前**的钩子：模型调用是全链路最慢的一步，等待期间必须有
+    进度信号，否则界面与作业流是一片死寂（真实事故：「等了好几分钟，什么都看不到」）。
+    只在真的要发网络请求时才回调 —— 缓存命中没有等待可言。
     """
 
     def __init__(self, registry: ProviderRegistry, router: Router,
@@ -76,6 +82,7 @@ class LlmGateway:
         max_tokens: int = 1024,
         temperature: float = 0.7,
         on_step: Callable[[ChatResponse, float, bool], None] | None = None,
+        on_start: Callable[[str, list[dict]], None] | None = None,
     ) -> ChatResponse:
         self.budget.check(session, project_id, agent_id, run_id)
 
@@ -92,6 +99,11 @@ class LlmGateway:
             messages=messages, tier=tier, schema=schema,
             max_tokens=max_tokens, temperature=temperature,
         )
+        if on_start is not None:
+            # 把整条候选项链报出去：用户看到的是「在等谁、还有几个备选」，
+            # 而不是「卡住了」。降级链是设计的一部分（§8.3），等待时也该可见。
+            on_start(tier, [{"provider": c.provider, "model": c.model}
+                            for c in self.router.candidates(tier)])
         response = self._call_with_fallback(request, tier, session)
 
         provider = self.registry.get(response.provider)
@@ -184,6 +196,8 @@ class LlmGateway:
             "prompt_tokens": response.prompt_tokens,
             "completion_tokens": response.completion_tokens,
             "cost": round(cost, 6),
+            "latency_ms": response.latency_ms,
+            "attempts": response.attempts,
             "cached": cached,
             "degraded": response.degraded,
         })

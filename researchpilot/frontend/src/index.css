@@ -351,6 +351,23 @@ a:hover {
   font-style: normal;
   color: var(--tool);
 }
+/* 等待行（流内专有）：让「在等模型」和「卡死了」在界面上长得不一样 */
+.llm-pending {
+  color: var(--accent);
+}
+.llm-pending .llm-flags {
+  color: var(--accent);
+  animation: llm-pulse 1.4s ease-in-out infinite;
+}
+@keyframes llm-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.35;
+  }
+}
 .run-cost {
   color: var(--tool);
   font-weight: 600;

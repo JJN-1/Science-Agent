@@ -194,6 +194,9 @@ def test_sse_stream_delivers_the_whole_event_sequence(client):
     types = [f["type"] for f in frames]
     assert types[0] == "job.queued" and types[1] == "job.running"
     assert "stage.start" in types and "step" in types and "llm.call" in types
+    # 等待期可见：llm.start 必须出现在结算事件之前
+    assert "llm.start" in types
+    assert types.index("llm.start") < types.index("llm.call")
     assert types[-1] == "job.succeeded"
     # 终态之后流就关了，不会再挂着
     assert frames[-1]["payload"]["status"] == "succeeded"

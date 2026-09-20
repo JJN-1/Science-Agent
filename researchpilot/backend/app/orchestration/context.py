@@ -6,7 +6,7 @@ from sqlalchemy.orm import Session
 
 from app.ai.base import ProviderError
 from app.ai.client import LlmGateway
-from app.jobs.events import LLM_CALL, STEP, emit
+from app.jobs.events import LLM_CALL, LLM_START, STEP, emit
 from app.store.dao import blackboard as blackboard_dao
 from app.store.dao import decisions as decisions_dao
 from app.store.dao import runs as runs_dao
@@ -43,6 +43,19 @@ class StageContext:
         emit(self.session, self.job_id, STEP,
              {"kind": kind, "content": content, "run_id": self.run_id})
 
+    def _emit_llm_start(self, tier: str, chain: list[dict]) -> None:
+        """调用**发起前**先报一条：等待期间界面不能一片死寂。
+
+        模型调用是整条链路里最慢的一步。旧实现只在结算时发 ``llm.call``，于是
+        「等了好几分钟」这段时间里作业流上什么都没有 —— 用户看到的就是「卡住了」。
+        现在起手就告诉它「正在等谁、还有几个备选」，长等待也有了可见的起点。
+        """
+        if self.job_id is None:
+            return
+        emit(self.session, self.job_id, LLM_START, {
+            "tier": tier, "chain": chain, "run_id": self.run_id,
+        })
+
     def _emit_llm_step(self, response, cost: float, cached: bool,  # noqa: ANN001
                        tier: str = "") -> None:
         """模型调用的结算事件：让「正在等模型」这件事在流里可见。
@@ -60,6 +73,7 @@ class StageContext:
             "completion_tokens": response.completion_tokens,
             "cost": round(cost, 6),
             "latency_ms": response.latency_ms,
+            "attempts": response.attempts,
             "cached": cached,
             "degraded": list(response.degraded),
             "run_id": self.run_id,
@@ -102,12 +116,15 @@ class StageContext:
         def on_step(response, cost: float, cached: bool) -> None:  # noqa: ANN001
             self._emit_llm_step(response, cost, cached, tier)
 
+        def on_start(tier_name: str, chain: list[dict]) -> None:
+            self._emit_llm_start(tier_name, chain)
+
         try:
             return self.gateway.call(
                 self.session, project_id=self.project_id, run_id=self.run_id,
                 stage_id=self.stage_id, agent_id=self.agent_id, tier=tier,
                 messages=messages, schema=schema, max_tokens=max_tokens,
-                temperature=temperature, on_step=on_step,
+                temperature=temperature, on_step=on_step, on_start=on_start,
             )
         except ProviderError as exc:
             self._record_llm_failure(exc, tier)

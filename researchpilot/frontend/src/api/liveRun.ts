@@ -88,11 +88,38 @@ function llmStep(event: JobStreamEvent, payload: Record<string, unknown>, runId:
       completion_tokens: payload.completion_tokens,
       cost: payload.cost,
       latency_ms: payload.latency_ms,
+      attempts: payload.attempts,
       cached: payload.cached,
       degraded: payload.degraded,
     },
     created_at: new Date().toISOString(),
   }
+}
+
+/**
+ * ``llm.start`` 事件 → 等待占位步骤。
+ *
+ * 模型调用是全链路最慢的一步，而 ``llm.call`` 要等它**结束**才发得出来 ——
+ * 只靠结算事件，等待期在界面上就是一片死寂（真实事故：「点了运行，好几分钟没反应」）。
+ * 占位步骤只活在流里、不落库：它表达的是「正在等」，不是「等过」。
+ */
+function llmStartStep(event: JobStreamEvent, payload: Record<string, unknown>, runId: number): AgentStep {
+  return {
+    id: -event.seq,
+    run_id: runId,
+    seq: event.seq,
+    kind: 'llm_pending',
+    content: {
+      tier: payload.tier,
+      chain: Array.isArray(payload.chain) ? payload.chain : [],
+    },
+    created_at: new Date().toISOString(),
+  }
+}
+
+/** 摘掉等待占位：它只在「等待中」这一瞬间有意义。 */
+function withoutPending(steps: AgentStep[]): AgentStep[] {
+  return steps.filter((s) => s.kind !== 'llm_pending')
 }
 
 /** 把一帧事件叠进实时缓冲。纯函数，便于单测与在 StrictMode 下重放。 */
@@ -121,10 +148,25 @@ export function reduceLiveRun(live: LiveRun, event: JobStreamEvent): LiveRunResu
         done: false,
       }
     }
+    case 'llm.start': {
+      const runId = runIdOf(payload, live.runId) ?? -1
+      return {
+        live: {
+          ...live,
+          runId,
+          steps: [...withoutPending(live.steps), llmStartStep(event, payload, runId)],
+        },
+        done: false,
+      }
+    }
     case 'llm.call': {
       const runId = runIdOf(payload, live.runId) ?? -1
       return {
-        live: { ...live, runId, steps: [...live.steps, llmStep(event, payload, runId)] },
+        live: {
+          ...live,
+          runId,
+          steps: [...withoutPending(live.steps), llmStep(event, payload, runId)],
+        },
         done: false,
       }
     }
@@ -132,14 +174,22 @@ export function reduceLiveRun(live: LiveRun, event: JobStreamEvent): LiveRunResu
       return { live, done: false } // 紧随其后的 job.paused 才是终态
     case 'stage.failed':
       return {
-        live: { ...live, error: String(payload.error ?? '阶段失败') },
+        live: { ...live, steps: withoutPending(live.steps), error: String(payload.error ?? '阶段失败') },
         done: false,
       }
     case 'job.succeeded':
-      return { live: { ...live, runId: runIdOf(payload, live.runId) }, done: true }
+      return {
+        live: { ...live, steps: withoutPending(live.steps), runId: runIdOf(payload, live.runId) },
+        done: true,
+      }
     case 'job.paused':
       return {
-        live: { ...live, status: 'paused', runId: runIdOf(payload, live.runId) },
+        live: {
+          ...live,
+          status: 'paused',
+          steps: withoutPending(live.steps),
+          runId: runIdOf(payload, live.runId),
+        },
         done: true,
       }
     case 'job.failed':
@@ -148,13 +198,19 @@ export function reduceLiveRun(live: LiveRun, event: JobStreamEvent): LiveRunResu
           ...live,
           status: 'failed',
           error: String(payload.error ?? '作业失败'),
+          steps: withoutPending(live.steps),
           runId: runIdOf(payload, live.runId),
         },
         done: true,
       }
     case 'job.not_found':
       return {
-        live: { ...live, status: 'failed', error: String(payload.error ?? '作业不存在') },
+        live: {
+          ...live,
+          status: 'failed',
+          error: String(payload.error ?? '作业不存在'),
+          steps: withoutPending(live.steps),
+        },
         done: true,
       }
     default:
@@ -170,7 +226,7 @@ export function liveRunToAgentRun(live: LiveRun, projectId: number): AgentRun {
     stage_id: live.stageId,
     agent_id: live.agentId,
     status: live.status,
-    steps: live.steps.length,
+    steps: withoutPending(live.steps).length,
     error: live.error,
     started_at: live.startedAt,
     finished_at: null,

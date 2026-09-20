@@ -20,6 +20,7 @@ from app.jobs.events import (
     JOB_RUNNING,
     JOB_SUCCEEDED,
     LLM_CALL,
+    LLM_START,
     STAGE_FAILED,
     STAGE_PAUSED,
     STAGE_START,
@@ -172,6 +173,29 @@ def test_steps_and_llm_calls_are_mirrored_into_event_stream(
     assert len(llm_events) == 1
     assert llm_events[0].payload["provider"] == "mock"
     assert llm_events[0].payload["cached"] is False
+
+
+def test_llm_start_precedes_llm_call_and_carries_candidate_chain(
+    session, session_factory, orchestrator
+):
+    """等待期必须有信号：``llm.start`` 在 ``llm.call`` 之前，且带着候选链。
+
+    真实事故是「点完运行，好几分钟什么都没有」。结算事件只能证明调用**结束了**，
+    证明不了它**开始了** —— 界面于是分不清「在等模型」和「卡死了」。
+    """
+    runner = _runner(session_factory, orchestrator)
+    project = _project(session)
+    job = runner.submit(session, project_id=project.id, kind="stage", stage_id="S1")
+    runner.process_pending_once()
+
+    events = jobs_dao.events_after(session, job.id)
+    started = [e for e in events if e.type == LLM_START]
+    settled = [e for e in events if e.type == LLM_CALL]
+    assert len(started) == 1 and len(settled) == 1
+    assert started[0].seq < settled[0].seq
+
+    assert started[0].payload["tier"] == "plan"
+    assert started[0].payload["chain"] == [{"provider": "mock", "model": "mock-small"}]
 
 
 def test_sync_path_without_job_id_stays_free_of_job_events(session, orchestrator):

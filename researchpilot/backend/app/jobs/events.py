@@ -19,6 +19,7 @@ STAGE_PAUSED = "stage.paused"
 STAGE_FAILED = "stage.failed"
 
 STEP = "step"          # 轨迹步骤的镜像（think / decide / record）
+LLM_START = "llm.start"  # 模型调用**发起**（等待期间的唯一进度信号）
 LLM_CALL = "llm.call"  # 模型调用结算
 
 # 收到其中之一即表示作业已结束，SSE 可以正常关闭

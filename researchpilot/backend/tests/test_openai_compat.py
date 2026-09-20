@@ -71,6 +71,35 @@ def test_complete_success_and_usage():
     assert resp.text == "hello"
     assert (resp.prompt_tokens, resp.completion_tokens) == (10, 5)
     assert resp.provider == "acme"
+    assert resp.attempts == 1
+
+
+def test_latency_is_measured_and_attempts_counted():
+    """记账里全是 latency_ms=0 时，「等了几分钟」和「只要 200ms」在数据上无法区分。"""
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return httpx.Response(503, text="upstream busy")
+        return httpx.Response(200, json=_ok("ok"))
+
+    p = _provider(handler)
+    resp = p.complete(ChatRequest(messages=[ChatMessage(role="user", content="hi")]))
+    assert resp.attempts == 2  # 重试一次才成功
+    assert resp.latency_ms > 0
+
+
+def test_http_error_carries_body_and_attempts():
+    """只有状态码没有响应体的日志判不出原因（真实事故：403 后面其实是 FreeTierError）。"""
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(403, text="FreeTierError: no balance")
+
+    p = _provider(handler)
+    with pytest.raises(ProviderError) as excinfo:
+        p.complete(ChatRequest(messages=[ChatMessage(role="user", content="hi")]))
+    assert excinfo.value.raw_output == "FreeTierError: no balance"
+    assert excinfo.value.attempts == 1
 
 
 def test_missing_key_raises(monkeypatch):

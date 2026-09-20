@@ -34,9 +34,11 @@ function LlmMeta({ step }: { step: AgentStep }) {
   const prompt = Number(c.prompt_tokens ?? 0)
   const completion = Number(c.completion_tokens ?? 0)
   const cost = Number(c.cost ?? 0)
+  const attempts = Number(c.attempts ?? 1)
   const degraded = Array.isArray(c.degraded) ? (c.degraded as string[]) : []
   const flags = [
     c.cached === true ? 'cached' : null,
+    attempts > 1 ? `重试 ${attempts - 1} 次` : null,
     ...degraded,
   ].filter(Boolean) as string[]
   return (
@@ -44,6 +46,26 @@ function LlmMeta({ step }: { step: AgentStep }) {
       {String(c.tier ?? '')} · {String(c.provider ?? '')}/{String(c.model ?? '')} ·{' '}
       {prompt + completion} tok · ¥{cost.toFixed(4)}
       {flags.length > 0 && <em className="llm-flags"> · ⚠ {flags.join(' / ')}</em>}
+    </span>
+  )
+}
+
+/**
+ * 等待行（流内专有）：⎿ llm plan · 正在等待 acme/model · 备选 1 个。
+ *
+ * 只由 ``llm.start`` 事件产生，调用结算时会被换掉。它的存在就为一个目的：
+ * 让「在等模型」和「卡住了」在界面上长得不一样。
+ */
+function LlmPending({ step }: { step: AgentStep }) {
+  const c = step.content as Record<string, unknown>
+  const chain = Array.isArray(c.chain) ? (c.chain as Record<string, unknown>[]) : []
+  const head = chain[0]
+  const target = head ? `${String(head.provider ?? '')}/${String(head.model ?? '')}` : '模型后端'
+  return (
+    <span className="llm-meta llm-pending">
+      {String(c.tier ?? '')} · 正在等待 {target}
+      {chain.length > 1 && `（备选 ${chain.length - 1} 个）`}
+      <em className="llm-flags"> · 等待中…</em>
     </span>
   )
 }
@@ -87,15 +109,20 @@ export default function RunBlock({ run, steps, writes, running, jobId }: RunBloc
     return () => clearInterval(tick)
   }, [running])
 
+  // 等待占位只在「等待中」这一瞬间有意义，不该混进步数 / 回放 / 费用统计，
+  // 因此单独摘出来渲染在轨迹末尾（同一时刻至多一条：阶段是串行执行的）。
+  const visibleSteps = steps.filter((s) => s.kind !== 'llm_pending')
+  const pendingStep = steps.find((s) => s.kind === 'llm_pending')
+
   const startReplay = () => {
-    if (replaying || steps.length === 0) return
+    if (replaying || visibleSteps.length === 0) return
     if (timerRef.current) clearInterval(timerRef.current)
     setReplaying(true)
     setReveal(1)
     let idx = 1
     timerRef.current = setInterval(() => {
       idx += 1
-      if (idx > steps.length) {
+      if (idx > visibleSteps.length) {
         if (timerRef.current) clearInterval(timerRef.current)
         timerRef.current = null
         setReplaying(false)
@@ -107,7 +134,7 @@ export default function RunBlock({ run, steps, writes, running, jobId }: RunBloc
   }
 
   const status = running ? 'running' : run.status
-  const runCost = steps.filter(isLlmCall).reduce((sum, s) => sum + Number(s.content.cost), 0)
+  const runCost = visibleSteps.filter(isLlmCall).reduce((sum, s) => sum + Number(s.content.cost), 0)
 
   return (
     <div>
@@ -121,16 +148,16 @@ export default function RunBlock({ run, steps, writes, running, jobId }: RunBloc
         {running ? (
           <span className="meta run-elapsed">· 已用时 {elapsedOf(run.started_at, now)}</span>
         ) : (
-          <span className="meta">· {steps.length} steps</span>
+          <span className="meta">· {visibleSteps.length} steps</span>
         )}
         {!running && runCost > 0 && (
           <span className="meta run-cost">· ¥{runCost.toFixed(4)}</span>
         )}
         <span className="end">
           <span className="meta">{timeOf(running ? null : run.started_at)}</span>
-          {!running && steps.length > 0 && (
+          {!running && visibleSteps.length > 0 && (
             <button className="btn tiny" onClick={startReplay} disabled={replaying}>
-              {replaying ? `replay ${reveal}/${steps.length}` : '▶ replay'}
+              {replaying ? `replay ${reveal}/${visibleSteps.length}` : '▶ replay'}
             </button>
           )}
         </span>
@@ -143,7 +170,7 @@ export default function RunBlock({ run, steps, writes, running, jobId }: RunBloc
         </div>
       )}
 
-      {steps.map((step, idx) => {
+      {visibleSteps.map((step, idx) => {
         const text = stepText(step)
         const isPending = reveal !== null && idx >= reveal
         const cls = [
@@ -157,7 +184,9 @@ export default function RunBlock({ run, steps, writes, running, jobId }: RunBloc
         return (
           <div key={step.id} className={cls}>
             <span className="glyph" aria-hidden="true">⎿</span>
-            <span className="kind">{step.kind === 'llm_call' ? 'llm' : KIND_LABEL[step.kind] ?? step.kind}</span>
+            <span className="kind">
+              {step.kind === 'llm_call' ? 'llm' : KIND_LABEL[step.kind] ?? step.kind}
+            </span>
             <span className="body">
               {isLlmCall(step) ? (
                 <>
@@ -181,6 +210,16 @@ export default function RunBlock({ run, steps, writes, running, jobId }: RunBloc
           </div>
         )
       })}
+
+      {pendingStep && (
+        <div className="subline k-llm_pending is-current">
+          <span className="glyph" aria-hidden="true">⎿</span>
+          <span className="kind">llm</span>
+          <span className="body">
+            <LlmPending step={pendingStep} />
+          </span>
+        </div>
+      )}
 
       {writes.map((w) => (
         <div key={w.id} className="subline k-tool">

@@ -29,22 +29,28 @@ class ChatResponse:
     completion_tokens: int = 0
     latency_ms: int = 0
     degraded: list[str] = field(default_factory=list)
+    # 实际发出的 HTTP 尝试次数（含重试）。1 = 一次就成功。
+    attempts: int = 1
 
 
 class ProviderError(Exception):
     """AI 接入层错误基类，code 遵循 <域>-<类别>-<序号>。
 
-    ``raw_output`` 保存模型实际吐出的原文（拿不到时为空串）。只报「不符合 schema」
-    不足以排查——得看模型究竟返回了什么。把原文挂在异常上，轨迹写入点
-    （``StageContext.llm``）就能把它一并落进 ``agent_steps``，而不是任由原始输出
-    随异常栈一起消失（FIX-06 的保证要对**所有**失败路径成立，不只是阶段自己解析失败那条）。
+    ``raw_output`` 保存上游返回的原始文本（模型正文，或端点的错误响应体；拿不到时为空串）。
+    只报「不符合 schema」或「HTTP 403」不足以排查——得看上游究竟回了什么。把原文挂在
+    异常上，轨迹写入点（``StageContext.llm``）就能把它一并落进 ``agent_steps``，
+    而不是任由现场随异常栈一起消失（FIX-06 的保证要对**所有**失败路径成立）。
+
+    ``attempts`` 是失败前实际发出的尝试次数：默认超时 120s × 4 次尝试意味着一次调用
+    最长可拖近 8 分钟，「等了很久」到底是不是重试拖出来的，只有这个数字说得清。
     """
 
     code = "LLM-PROVIDER-001"
 
-    def __init__(self, *args: object, raw_output: str = "") -> None:
+    def __init__(self, *args: object, raw_output: str = "", attempts: int = 1) -> None:
         super().__init__(*args)
         self.raw_output = raw_output
+        self.attempts = attempts
 
 
 class ProviderUnavailable(ProviderError):
