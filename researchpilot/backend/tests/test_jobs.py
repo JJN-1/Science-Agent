@@ -6,6 +6,9 @@
 
 from __future__ import annotations
 
+import re
+from pathlib import Path
+
 import pytest
 from sqlalchemy import func, select
 
@@ -370,3 +373,46 @@ def test_list_for_project_returns_newest_first(session, session_factory):
     listed = jobs_dao.list_for_project(session, project.id)
     assert [j.id for j in listed] == [second.id, first.id]
     assert jobs_dao.get(session, 10**6) is None
+
+
+# ── 跨语言契约（后端事件类型 ↔ 前端收尾集合）────────────
+
+FRONTEND_CLIENT = Path(__file__).resolve().parents[2] / "frontend" / "src" / "api" / "client.ts"
+BACKEND_APP = Path(__file__).resolve().parents[1] / "app"
+
+
+def _frontend_stream_end_types() -> set[str]:
+    source = FRONTEND_CLIENT.read_text(encoding="utf-8")
+    block = re.search(r"STREAM_END_EVENT_TYPES\s*=\s*\[(.*?)\]", source, re.S)
+    assert block, "前端 client.ts 里找不到 STREAM_END_EVENT_TYPES —— 契约常量被改名或删掉了"
+    return set(re.findall(r"'([^']+)'", block.group(1)))
+
+
+def _backend_emitted_job_types() -> set[str]:
+    """扫后端源码里所有 ``"job.xxx"`` 字面量。
+
+    不 import 常量再比对，是因为收尾帧（``job.settled`` / ``job.not_found``）是
+    API 层直接拼进 SSE 的，没有对应的常量；扫源码才盖得住它们。
+    """
+    found: set[str] = set()
+    for path in (BACKEND_APP / "jobs" / "events.py", BACKEND_APP / "api" / "jobs.py"):
+        found |= set(re.findall(r'"(job\.[a-z_.]+)"', path.read_text(encoding="utf-8")))
+    return found
+
+
+def test_frontend_knows_every_terminal_event():
+    """后端认定的终态事件，前端必须都知道「收到它就收工」。
+
+    这条契约出过一次事：``job.settled``（订阅晚于终态时后端补播的收尾帧）一开始
+    不在前端的收尾集合里，前端只能靠 ``onerror`` 重连两轮才发现作业早结束了 ——
+    白白多等两秒，还多开一次连接。
+    """
+    assert set(TERMINAL_EVENT_TYPES) <= _frontend_stream_end_types()
+
+
+def test_frontend_stream_end_types_all_exist_on_the_backend():
+    """反向：前端不能凭空发明类型 —— 收尾集合里每一项都得是后端真会发的。"""
+    emitted = _backend_emitted_job_types()
+    assert emitted, "后端源码里没扫到任何 job.* 事件类型，扫描逻辑该更新了"
+    unknown = _frontend_stream_end_types() - emitted
+    assert not unknown, f"前端收尾集合里有后端不会发的类型：{sorted(unknown)}"

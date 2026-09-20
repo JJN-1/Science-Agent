@@ -13,7 +13,8 @@ import time
 import pytest
 from fastapi.testclient import TestClient
 
-from app.api.jobs import _event_stream
+from app.api import jobs as jobs_api
+from app.api.jobs import _event_stream, _sse
 from app.main import create_app
 
 
@@ -84,6 +85,20 @@ def _slow_provider(client, monkeypatch, seconds: float = 0.4) -> None:
         return real(request)
 
     monkeypatch.setattr(provider, "complete", slow)
+
+
+class _FakeRequest:
+    """直接驱动 SSE 生成器时冒充 ``Request``：只需要 ``app`` 与 ``is_disconnected``。
+
+    ``TestClient`` 会把响应体缓冲到结束才返回，所以「边跑边吐」这件事只能靠在
+    进程内逐帧消费生成器来证明。
+    """
+
+    def __init__(self, app) -> None:  # noqa: ANN001
+        self.app = app
+
+    async def is_disconnected(self) -> bool:
+        return False
 
 
 # ── 受理：不阻塞 ────────────────────────────────
@@ -194,13 +209,6 @@ def test_stream_delivers_while_job_is_running(client, monkeypatch):
     _slow_provider(client, monkeypatch, 0.6)
     project_id = _project(client, "增量投递")
     job_id = client.post(f"/api/projects/{project_id}/stages/S1/run").json()["job_id"]
-
-    class _FakeRequest:
-        def __init__(self, app):  # noqa: ANN001
-            self.app = app
-
-        async def is_disconnected(self) -> bool:
-            return False
 
     async def scenario():
         frames: list[dict] = []
@@ -325,3 +333,69 @@ def test_job_endpoints_404_on_unknown_targets(client):
     assert client.post("/api/projects/999999/stages/S1/run").status_code == 404
     assert client.post("/api/projects/999999/pipeline/run").status_code == 404
     assert client.post(f"/api/projects/{project_id}/stages/S99/run").status_code == 404
+
+
+# ── 帧契约与收尾帧 ───────────────────────────────
+
+def test_sse_frame_carries_only_id_and_data():
+    """帧形状是契约：只有 ``id`` + ``data``，事件类型放在 ``data.type`` 里。
+
+    一旦补上 ``event:`` 字段，浏览器只会触发同名监听器，前端的通用
+    ``onmessage`` 就再也不响 —— 而前端订阅正是靠它一条通道收全部事件的。
+    ``id`` 同时是续传游标，不能发成 ``id: None``。
+    """
+    frame = _sse(7, "step", {"kind": "thought"})
+    assert frame == 'id: 7\ndata: {"seq": 7, "type": "step", "payload": {"kind": "thought"}}\n\n'
+    assert "event:" not in frame
+    assert "\n\n" in frame
+
+    # 作业不存在：没有 seq 可当游标，只发 data
+    missing = _sse(None, "job.not_found", {"error": "作业不存在"})
+    assert missing.startswith("data: ")
+    assert "id:" not in missing
+
+
+def test_stream_emits_heartbeat_while_idle(client, monkeypatch):
+    """空闲期必须有注释心跳，否则中间层会按空闲超时把连接悄悄掐掉。
+
+    心跳走到 15s，测起来太慢；把阈值压到 0 逼它立刻发一帧。
+    """
+    monkeypatch.setattr(jobs_api, "HEARTBEAT_SECONDS", 0.0)
+    monkeypatch.setattr(jobs_api, "POLL_INTERVAL_SECONDS", 0.01)
+    # 造一个「永远在跑」的作业：轮询永远读到 running 且读不到新事件
+    monkeypatch.setattr(
+        jobs_api, "_poll",
+        lambda factory, job_id, after_seq: (
+            {"job_id": job_id, "status": "running", "kind": "stage",
+             "stage_id": "S1", "run_id": None, "error": None},
+            [],
+        ),
+    )
+
+    async def scenario() -> list[str]:
+        chunks: list[str] = []
+        async for chunk in _event_stream(_FakeRequest(client.app), 1, 0):
+            chunks.append(chunk)
+            if chunk.startswith(": ping"):
+                return chunks
+            assert len(chunks) < 50, "心跳始终没出现，流在被空转"
+        return chunks
+
+    chunks = asyncio.run(scenario())
+    assert chunks[-1] == ": ping\n\n"
+
+
+def test_stream_emits_not_found_frame_for_missing_job(client):
+    """作业不存在时给一帧明确的收尾帧再关流 —— 不能让订阅端一直挂着等。"""
+
+    async def scenario() -> list[dict]:
+        frames: list[dict] = []
+        async for chunk in _event_stream(_FakeRequest(client.app), 999_999, 0):
+            batch, _ = _parse_sse(chunk)
+            frames.extend(batch)
+        return frames
+
+    frames = asyncio.run(scenario())
+    assert len(frames) == 1
+    assert frames[0]["type"] == "job.not_found"
+    assert "作业不存在" in frames[0]["payload"]["error"]

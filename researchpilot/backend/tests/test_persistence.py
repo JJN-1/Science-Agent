@@ -16,7 +16,9 @@ from app.ai.budget import BudgetManager
 from app.ai.client import LlmGateway
 from app.ai.registry import CIRCUIT_KEY_PREFIX, ProviderRegistry
 from app.ai.routing import RouteCandidate, Router
+from app.jobs.events import emit
 from app.store.dao import app_config as app_config_dao
+from app.store.dao import jobs as jobs_dao
 from app.store.dao import llm_cache as llm_cache_dao
 from app.store.dao import projects as projects_dao
 from app.store.dao import runs as runs_dao
@@ -254,3 +256,54 @@ def test_purge_expired_removes_only_expired(session):
 
     assert llm_cache_dao.purge_expired(session) == 1
     assert llm_cache_dao.get(session, "keep") is not None
+
+
+# ── 作业台账与事件（FIX-03 / D2）───────────────────
+
+def test_job_ledger_and_events_survive_reconnect(session_factory):
+    """作业与事件都落库：换一个 session（相当于重开连接）照样读得回来。"""
+    with session_factory() as session:
+        project = projects_dao.create(session, title="作业台账", domain="cs-ai")
+        job = jobs_dao.create(session, project_id=project.id, kind="stage", stage_id="S1")
+        jobs_dao.mark_running(session, job.id)
+        jobs_dao.add_event(session, job_id=job.id, type="stage.start",
+                           payload={"stage_id": "S1", "run_id": None})
+        jobs_dao.finish(session, job.id, status="succeeded", run_id=None)
+        jobs_dao.add_event(session, job_id=job.id, type="job.succeeded",
+                           payload={"status": "succeeded"})
+        session.commit()
+        job_id = job.id
+
+    with session_factory() as session:
+        reloaded = jobs_dao.get(session, job_id)
+        assert reloaded is not None
+        assert reloaded.status == "succeeded"
+        assert reloaded.started_at is not None and reloaded.finished_at is not None
+
+        events = jobs_dao.events_after(session, job_id, 0)
+        assert [e.type for e in events] == ["stage.start", "job.succeeded"]
+        assert [e.seq for e in events] == [1, 2]  # seq 从 1 开始且连续
+        assert events[0].payload["stage_id"] == "S1"
+
+
+def test_event_is_visible_to_other_sessions_while_the_job_still_runs(session_factory):
+    """D2：事件逐条提交，所以作业还在跑时，读端就已经能看到已发生的事件。
+
+    这是 SSE 能实时投递的前提。若事件跟着业务事务一起提交，读端只能等作业结束
+    才看得到 —— 流就退化成了「跑完一次性吐」，FIX-03 要消灭的正是这个体验。
+    """
+    with session_factory() as session:
+        project = projects_dao.create(session, title="增量可见", domain="cs-ai")
+        job = jobs_dao.create(session, project_id=project.id, kind="stage", stage_id="S1")
+        jobs_dao.mark_running(session, job.id)
+        session.commit()
+        job_id = job.id
+
+        # 阶段还在跑：作业停在 running，但事件已经落盘
+        emit(session, job_id, "step", {"kind": "thought"})
+        assert jobs_dao.get(session, job_id).status == "running"
+
+        with session_factory() as reader:
+            assert [e.type for e in jobs_dao.events_after(reader, job_id, 0)] == ["step"]
+            assert jobs_dao.get(reader, job_id).status == "running"
+            assert jobs_dao.is_terminal(jobs_dao.get(reader, job_id)) is False
