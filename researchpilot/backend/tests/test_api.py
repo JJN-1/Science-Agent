@@ -113,11 +113,16 @@ def test_failed_stage_is_persisted_with_actionable_error(client, run_and_wait):
 
 
 def test_unparseable_output_is_kept_in_trajectory(client, run_and_wait):
-    """FIX-06：解析失败时原始输出必须留在轨迹里，否则无从排查模型到底吐了什么。"""
+    """FIX-06：解析失败时原始输出必须留在轨迹里，否则无从排查模型到底吐了什么。
+
+    形状校验上线后，这条路径**不再**由 S1 自己解析时发现，而是被网关的
+    ``LLM-SCHEMA-001`` 拦下——原始输出得由 ``StageContext.llm`` 的失败分支补记。
+    断言不变，说明「原文必须进轨迹」的保证对新的失败位置同样成立。
+    """
     project_id = client.post(
         "/api/projects", json={"title": "输出解析", "goal": "G"}
     ).json()["id"]
-    # 合法 JSON 但不是对象 → 通过 schema 校验却在 S1 解析阶段失败，正好命中该分支
+    # 合法 JSON 但不是对象 → 两次形状校验都不过，原始输出仍必须完整落轨迹
     client.app.state.ai_registry.get("mock")._response = "[1, 2, 3]"
 
     _, snapshot = run_and_wait(client, project_id, "S1")
@@ -128,6 +133,32 @@ def test_unparseable_output_is_kept_in_trajectory(client, run_and_wait):
     errors = [s for s in detail["steps"] if s["kind"] == "error"]
     assert len(errors) == 1
     assert errors[0]["content"]["raw"] == "[1, 2, 3]"
+
+
+def test_shape_violation_fails_stage_instead_of_succeeding_empty(client, run_and_wait):
+    """止血回归：模型回「合法 JSON 但形状不对」必须让阶段**失败**，不能空成功。
+
+    真实事故（用户报的「跑了几分钟、显示成功、一个结果都没有」）：`response_format=
+    json_object` 只保证「是 JSON」，不保证形状；某个后端于是回了
+
+        {"response": "……我生成了 3 个候选研究问题……", "format": "JSON", "note": "……"}
+
+    旧实现 `parsed.get("questions", [])` 拿到空列表照样写黑板、报 ``stage.succeeded``。
+    现在 schema 始终随 prompt 下发，形状违规两次即失败，并明确指出违规点。
+    """
+    project_id = client.post(
+        "/api/projects", json={"title": "形状违规", "goal": "G"}
+    ).json()["id"]
+    client.app.state.ai_registry.get("mock")._response = (
+        '{"response": "我已生成 3 个候选研究问题", "format": "JSON"}'
+    )
+
+    _, snapshot = run_and_wait(client, project_id, "S1")
+    assert snapshot["status"] == "failed"
+    assert "LLM-SCHEMA-001" in (snapshot["error"] or "")
+
+    # 关键：绝不能留下「空但成功」的黑板对象 —— 那正是用户看到「没结果」的来源
+    assert client.get(f"/api/projects/{project_id}/blackboard").json() == []
 
 
 def test_lifespan_wires_the_async_job_layer(client, run_and_wait):

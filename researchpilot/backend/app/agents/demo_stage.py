@@ -24,6 +24,7 @@ QUESTIONS_SCHEMA = {
     "properties": {
         "questions": {
             "type": "array",
+            "minItems": 1,
             "items": {
                 "type": "object",
                 "properties": {
@@ -68,18 +69,49 @@ class DemoStage(StageAgent):
         ]
 
 
+QUESTIONS_FIELDS = ("question", "rationale", "score")
+
+
 def _parse_questions(ctx, raw: str) -> list[dict]:  # noqa: ANN001
-    """解析 S1 的结构化输出；失败时把原始输出落进轨迹，便于事后排查（FIX-06）。"""
+    """解析 S1 的结构化输出；任何不合规都**抛错**，绝不返回空列表。
+
+    旧实现 `parsed.get("questions", [])` 在模型返回别的形状（真实事故：
+    `{"response": "……", "format": "JSON"}`）时静默返回 `[]`，于是写下空的黑板对象、
+    报 `stage.succeeded` —— 用户等了数分钟只换来「成功但没结果」。宁可失败并说清原因：
+    失败会走 `run_stage` 的 `except` 分支，落 `failed_attempt` 决策 + checkpoint，
+    最终以 `job.failed` 事件（带原因）推到前端。
+    """
     try:
         parsed = extract_json(raw)
     except ValueError as exc:
         ctx.record("error", {"text": f"S1 结构化输出解析失败：{exc}", "raw": raw})
-        raise
+        raise ValueError(f"S1 结构化输出解析失败：{exc}") from None
     if not isinstance(parsed, dict):
         ctx.record("error", {"text": "S1 结构化输出不是 JSON 对象", "raw": raw})
         raise ValueError("S1 结构化输出不是 JSON 对象")
-    questions = parsed.get("questions", [])
-    return questions if isinstance(questions, list) else []
+
+    questions = parsed.get("questions")
+    if not isinstance(questions, list):
+        got = "、".join(sorted(parsed)) or "（空对象）"
+        ctx.record("error", {
+            "text": f"S1 输出缺少 questions 数组（实际字段：{got}）", "raw": raw,
+        })
+        raise ValueError(f"S1 输出缺少 questions 数组（实际字段：{got}）")
+    if not questions:
+        ctx.record("error", {"text": "S1 输出的 questions 为空", "raw": raw})
+        raise ValueError("S1 输出的 questions 为空，未产出候选研究问题")
+
+    for index, item in enumerate(questions):
+        if not isinstance(item, dict):
+            ctx.record("error", {"text": f"S1 第 {index + 1} 个候选不是对象", "raw": raw})
+            raise ValueError(f"S1 第 {index + 1} 个候选不是对象")
+        missing = [f for f in QUESTIONS_FIELDS if not item.get(f)]
+        if missing:
+            ctx.record("error", {
+                "text": f"S1 第 {index + 1} 个候选缺字段 {'、'.join(missing)}", "raw": raw,
+            })
+            raise ValueError(f"S1 第 {index + 1} 个候选缺字段 {'、'.join(missing)}")
+    return questions
 
 
 class ScoutStage(StageAgent):

@@ -32,9 +32,19 @@ class ChatResponse:
 
 
 class ProviderError(Exception):
-    """AI 接入层错误基类，code 遵循 <域>-<类别>-<序号>。"""
+    """AI 接入层错误基类，code 遵循 <域>-<类别>-<序号>。
+
+    ``raw_output`` 保存模型实际吐出的原文（拿不到时为空串）。只报「不符合 schema」
+    不足以排查——得看模型究竟返回了什么。把原文挂在异常上，轨迹写入点
+    （``StageContext.llm``）就能把它一并落进 ``agent_steps``，而不是任由原始输出
+    随异常栈一起消失（FIX-06 的保证要对**所有**失败路径成立，不只是阶段自己解析失败那条）。
+    """
 
     code = "LLM-PROVIDER-001"
+
+    def __init__(self, *args: object, raw_output: str = "") -> None:
+        super().__init__(*args)
+        self.raw_output = raw_output
 
 
 class ProviderUnavailable(ProviderError):

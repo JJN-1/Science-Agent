@@ -18,6 +18,23 @@ from app.ai.providers.openai_compat import OpenAICompatProvider
 
 SCHEMA = {"type": "object", "properties": {"items": {"type": "array"}}}
 
+# 贴近真实 S1 的形状：`questions` 必需且非空，每项要有 question
+S1_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "questions": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+                "type": "object",
+                "properties": {"question": {"type": "string"}},
+                "required": ["question"],
+            },
+        }
+    },
+    "required": ["questions"],
+}
+
 
 @pytest.fixture(autouse=True)
 def fake_key(monkeypatch):
@@ -207,6 +224,81 @@ def test_degrade_schema_injection_for_missing_json_object():
     system = seen["body"]["messages"][0]
     assert system["role"] == "system"
     assert "JSON Schema" in system["content"]
+
+
+def test_degrade_injects_schema_even_with_json_object_capability():
+    """止血回归：声明了 ``json_object`` 的后端**同样**必须知道输出形状。
+
+    ``response_format=json_object`` 只保证「是 JSON」，不保证形状。旧实现据此跳过
+    schema 注入，于是模型只被告知「输出 JSON」却不知道要什么结构 —— 回一个
+    ``{"response": "……", "format": "JSON"}`` 是合法 JSON，就被当成成功吃掉了。
+    """
+    seen = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        import json as _json
+
+        seen["body"] = _json.loads(request.read())
+        return httpx.Response(200, json=_ok('{"items": [1]}'))
+
+    p = _provider(handler)  # 默认含 json_object
+    resp = complete_with_degradation(
+        p, ChatRequest(messages=[ChatMessage(role="user", content="hi")], schema=SCHEMA)
+    )
+    assert resp.degraded == []  # 能力齐全 → 不该出现任何降级标记
+    system = seen["body"]["messages"][0]
+    assert system["role"] == "system"
+    assert "JSON Schema" in system["content"]
+
+
+def test_degrade_merges_schema_into_existing_system_message():
+    """阶段本来就带 system prompt：schema 要并进去，不能造出两条 system 消息。"""
+    seen = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        import json as _json
+
+        seen["body"] = _json.loads(request.read())
+        return httpx.Response(200, json=_ok('{"items": [1]}'))
+
+    p = _provider(handler)
+    complete_with_degradation(p, ChatRequest(
+        messages=[ChatMessage(role="system", content="你是选题专家"),
+                  ChatMessage(role="user", content="hi")],
+        schema=SCHEMA,
+    ))
+    messages = seen["body"]["messages"]
+    assert [m["role"] for m in messages] == ["system", "user"]
+    assert "你是选题专家" in messages[0]["content"]
+    assert "JSON Schema" in messages[0]["content"]
+
+
+def test_degrade_shape_violation_retries_with_path_then_keeps_raw():
+    """「合法 JSON 但形状不对」必须重试并把**具体违规点**写进重试指令，最终失败。
+
+    只说「不是合法 JSON」会让模型困惑（它觉得自己给的确实是 JSON）而原地打转；
+    指出 ``$ 缺少必需字段 questions`` 才是可修复的指令。
+    """
+    calls: list[dict] = []
+    wrong = '{"response": "我已生成 3 个候选研究问题", "format": "JSON"}'
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        import json as _json
+
+        calls.append(_json.loads(request.read()))
+        return httpx.Response(200, json=_ok(wrong))
+
+    p = _provider(handler)
+    with pytest.raises(ProviderError) as excinfo:
+        complete_with_degradation(
+            p, ChatRequest(messages=[ChatMessage(role="user", content="hi")], schema=S1_SCHEMA)
+        )
+
+    assert len(calls) == 2  # 形状违规 → 重试一次
+    retry_user = calls[1]["messages"][-1]["content"]
+    assert "缺少必需字段 questions" in retry_user
+    assert "LLM-SCHEMA-001" in str(excinfo.value)
+    assert excinfo.value.raw_output == wrong  # 原文挂在异常上，供轨迹落盘（FIX-06）
 
 
 def test_degrade_retry_with_error_then_success():

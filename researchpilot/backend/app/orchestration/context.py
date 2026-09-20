@@ -4,6 +4,7 @@ from dataclasses import dataclass
 
 from sqlalchemy.orm import Session
 
+from app.ai.base import ProviderError
 from app.ai.client import LlmGateway
 from app.jobs.events import LLM_CALL, STEP, emit
 from app.store.dao import blackboard as blackboard_dao
@@ -101,9 +102,26 @@ class StageContext:
         def on_step(response, cost: float, cached: bool) -> None:  # noqa: ANN001
             self._emit_llm_step(response, cost, cached, tier)
 
-        return self.gateway.call(
-            self.session, project_id=self.project_id, run_id=self.run_id,
-            stage_id=self.stage_id, agent_id=self.agent_id, tier=tier,
-            messages=messages, schema=schema, max_tokens=max_tokens,
-            temperature=temperature, on_step=on_step,
-        )
+        try:
+            return self.gateway.call(
+                self.session, project_id=self.project_id, run_id=self.run_id,
+                stage_id=self.stage_id, agent_id=self.agent_id, tier=tier,
+                messages=messages, schema=schema, max_tokens=max_tokens,
+                temperature=temperature, on_step=on_step,
+            )
+        except ProviderError as exc:
+            self._record_llm_failure(exc, tier)
+            raise
+
+    def _record_llm_failure(self, exc: ProviderError, tier: str) -> None:
+        """调用失败时把模型原文留在轨迹里（FIX-06 对失败路径同样成立）。
+
+        形状校验失败（``LLM-SCHEMA-001``）意味着「模型答了，但答的不是要的形状」——
+        不看原文就无从判断是 prompt 没说清还是模型不听话。阶段内的解析分支已经会记
+        ``error``，但走不到那条分支的失败（例如网关侧的两次校验都不过）必须在这里补上，
+        否则原始输出只活在异常消息的 200 字截断里。
+        """
+        raw = exc.raw_output
+        if not raw:
+            return
+        self.record("error", {"text": f"[{tier}] {exc}", "raw": raw})
