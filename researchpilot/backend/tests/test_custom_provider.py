@@ -442,6 +442,35 @@ def test_provider_types_endpoint(client):
 
 # ── 自定义头 / 免鉴权端点 ─────────────────────────
 
+def test_credential_view_flags_implausibly_short_key(monkeypatch):
+    """「录了 Key」不等于「录对了 Key」。
+
+    健康探测打的是公开的 `GET /models` —— 那个端点不需要鉴权，于是配一条假 Key
+    照样显示「可用」。真实事故：凭据管理器里躺着一条 8 字符的占位值，provider 显示
+    可用，真调用 401「Missing Authentication header」，方向完全指错。
+    """
+    provider = OpenAICompatProvider("acme", {
+        "base_url": DEAD_URL, "models": ["m"], "vendor": "acme", "api_key_ref": "acme",
+    })
+    monkeypatch.setattr("app.ai.providers.openai_compat.keyring.get_password",
+                        lambda svc, ref: "sk-test")            # 7 字符的占位值
+    view = provider.credential_view()
+    assert view["has_key"] is True and view["key_suspicious"] is True
+
+    monkeypatch.setattr("app.ai.providers.openai_compat.keyring.get_password",
+                        lambda svc, ref: "sk-or-v1-" + "0" * 60)
+    assert provider.credential_view()["key_suspicious"] is False
+
+    # 免鉴权端点没有「Key 对不对」这回事
+    keyless = OpenAICompatProvider("local", {
+        "base_url": DEAD_URL, "models": ["m"], "vendor": "local", "api_key_ref": "",
+    })
+    assert keyless.credential_view() == {
+        "api_key_ref": "", "auth_required": False,
+        "has_key": False, "key_suspicious": False,
+    }
+
+
 def test_extra_headers_are_sent_and_override_bearer():
     provider = OpenAICompatProvider("local", {
         "base_url": DEAD_URL, "models": ["m"], "vendor": "local",

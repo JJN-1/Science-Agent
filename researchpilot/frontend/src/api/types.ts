@@ -130,6 +130,11 @@ export interface ProviderHealth {
   api_key_ref: string | null
   auth_required: boolean
   has_key: boolean
+  /**
+   * 凭据长度明显短于正常 Key：健康探测打的是公开端点，配个假 Key 也会显示「可用」，
+   * 这个提示把「录了」和「录对了」的差别摆出来。仅供参考，不拦截。
+   */
+  key_suspicious: boolean
   /** 引用位置，如 routing:plan / agent:scout */
   referenced_by: string[]
   source: ProviderSource

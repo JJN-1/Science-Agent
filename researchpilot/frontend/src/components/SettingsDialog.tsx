@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from 'react'
-import { App as AntdApp, AutoComplete, Modal, Popconfirm, Select, Table, Tag } from 'antd'
+import { App as AntdApp, AutoComplete, Modal, Popconfirm, Select, Table, Tag, Tooltip } from 'antd'
 import { api, ApiError } from '../api/client'
 import type { ProviderHealth, ProviderTypes, TierRoute } from '../api/types'
 import ProviderForm, { healthLabel } from './ProviderForm'
@@ -9,11 +9,21 @@ const TIERS = ['extract', 'plan', 'critique', 'synthesize', 'write'] as const
 
 const EMPTY_TYPES: ProviderTypes = { types: [], capabilities: [] }
 
-/** 凭据一览（表内一列）：一眼看出哪个后端还没配好。 */
+/** 凭据一览（表内一列）：一眼看出哪个后端还没配好 —— 以及配得对不对。 */
 function CredentialTag({ row }: { row: ProviderHealth }) {
   if (row.type === 'MockProvider') return <span style={{ color: 'var(--faint)' }}>—</span>
   if (!row.auth_required) return <Tag>无需鉴权</Tag>
-  return <Tag color={row.has_key ? 'green' : 'orange'}>{row.has_key ? '已录入' : '未录入'}</Tag>
+  if (!row.has_key) return <Tag color="orange">未录入</Tag>
+  // 健康探测打的是公开的 /models，假 Key 也是绿的；长度存疑必须说出来，
+  // 否则用户要到真跑起来吃 401 才知道 Key 根本没生效。
+  if (row.key_suspicious) {
+    return (
+      <Tooltip title="凭据长度明显短于正常 Key。健康探测用的是公开端点，配错也会显示「可用」；若运行时收到 401，请重新录入 Key">
+        <Tag color="gold">已录入·存疑</Tag>
+      </Tooltip>
+    )
+  }
+  return <Tag color="green">已录入</Tag>
 }
 
 /**

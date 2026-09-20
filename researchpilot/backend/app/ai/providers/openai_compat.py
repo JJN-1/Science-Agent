@@ -28,6 +28,10 @@ RETRYABLE_STATUS = {429, 500, 502, 503, 504}
 # 设置页每次打开都重新探测会让界面卡住数秒（§11.4 的轻量要求）。
 HEALTH_PROBE_TTL_S = 30.0
 
+# 凭据长度提示的下限：真实供应商的 Key 都远长于此（OpenRouter 约 70 字符）。
+# 只作**提示**，绝不作拦截 —— 本机自建端点的令牌可以是任意短串。
+MIN_PLAUSIBLE_KEY_LEN = 16
+
 
 class OpenAICompatProvider(ChatProvider):
     """OpenAI 兼容端点（DeepSeek/智谱/硅基流动/OpenAI 等，§8.1）。
@@ -188,10 +192,16 @@ class OpenAICompatProvider(ChatProvider):
             return HEALTH_DOWN
 
     def credential_view(self) -> dict:
+        key = self._peek_key()
         return {
             "api_key_ref": self.api_key_ref,
             "auth_required": self.auth_required,
-            "has_key": self._peek_key() is not None,
+            "has_key": key is not None,
+            # 「录了 Key」和「录对了 Key」是两回事。健康探测打的是公开的 `GET /models`
+            # —— 那个端点不需要鉴权，于是**配一个假 Key 照样显示「可用」**，用户点运行
+            # 才吃 401，而且报的是「Missing Authentication header」，指向完全错误的方向。
+            # 这里只给出一个长度存疑的提示，把差异摆到明面上；是否真的有效只有真调用知道。
+            "key_suspicious": key is not None and len(key) < MIN_PLAUSIBLE_KEY_LEN,
         }
 
     def invalidate_health(self) -> None:

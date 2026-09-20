@@ -196,7 +196,10 @@ export default function ProviderForm({
 
   const credentialHint = initial?.auth_required
     ? initial.has_key
-      ? `已录入（凭据引用名 ${initial.api_key_ref}）`
+      ? `已录入（凭据引用名 ${initial.api_key_ref}）` +
+        (initial.key_suspicious
+          ? '；长度明显短于正常 Key —— 健康探测用的是公开端点，配错也显示可用，运行时报 401 请重新粘贴'
+          : '')
       : `未录入（凭据引用名 ${initial.api_key_ref}）`
     : undefined
 
