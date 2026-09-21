@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import json
 import random
 import time
+from typing import Any
 
 import httpx
 import keyring
@@ -10,12 +12,14 @@ from app.ai.base import (
     HEALTH_DOWN,
     HEALTH_OK,
     HEALTH_UNCONFIGURED,
+    ChatMessage,
     ChatProvider,
     ChatRequest,
     ChatResponse,
     ProviderError,
     ProviderUnavailable,
     RateLimited,
+    ToolCall,
     monotonic,
     resolve_models,
 )
@@ -23,6 +27,64 @@ from app.ai.base import (
 KEYRING_SERVICE = "ResearchPilot"
 
 RETRYABLE_STATUS = {429, 500, 502, 503, 504}
+
+
+def _message_payload(message: ChatMessage) -> dict:
+    """把一条消息序列化成 OpenAI 形状。
+
+    两条容易漏的规则，漏了都会让**带工具调用的多轮请求**被端点直接拒收：
+
+    - ``role="tool"`` 的消息必须带 ``tool_call_id``（结果对回哪次调用）
+    - 带工具调用的 ``assistant`` 消息必须把 ``tool_calls`` 一起回放
+      （只发结果、不发它所回应的那次调用，请求不完整）
+
+    ``content`` 为 ``None`` 的助手消息在带工具调用时是常态，这里统一成空串 ——
+    让 ``None`` 漏到 HTTP 层会被端点当成缺字段。
+    """
+    payload: dict = {"role": message.role, "content": message.content or ""}
+    if message.tool_call_id:
+        payload["tool_call_id"] = message.tool_call_id
+    if message.tool_calls:
+        payload["tool_calls"] = [
+            {
+                "id": call.id,
+                "type": "function",
+                "function": {"name": call.name, "arguments": call.arguments},
+            }
+            for call in message.tool_calls
+        ]
+    return payload
+
+
+def _parse_tool_calls(raw: Any) -> list[ToolCall]:
+    """解析 ``choices[0].message.tool_calls``。
+
+    ``arguments`` 是 **JSON 字符串**，这里原样搬走、不做解析也不做修复 ——
+    解析失败要在调用点可见（``ToolCall.parse_arguments``）。上游偶尔会省掉 ``id``，
+    缺了就按位置补一个确定性的，否则结果无法回传（补出来的 id 只要在**本次会话内**
+    与调用一一对应即可，它不需要全局唯一）。
+    """
+    if not isinstance(raw, list):
+        return []
+    calls: list[ToolCall] = []
+    for index, item in enumerate(raw):
+        if not isinstance(item, dict):
+            continue
+        function = item.get("function")
+        if not isinstance(function, dict):
+            continue
+        name = str(function.get("name") or "").strip()
+        if not name:
+            continue
+        arguments = function.get("arguments")
+        if arguments is not None and not isinstance(arguments, str):
+            arguments = json.dumps(arguments, ensure_ascii=False, sort_keys=True)
+        calls.append(ToolCall(
+            id=str(item.get("id") or "").strip() or f"call_{index}",
+            name=name,
+            arguments=arguments or "",
+        ))
+    return calls
 
 # 健康探测结果缓存时长（秒）：health() 会发起真实网络请求，
 # 设置页每次打开都重新探测会让界面卡住数秒（§11.4 的轻量要求）。
@@ -93,12 +155,18 @@ class OpenAICompatProvider(ChatProvider):
         model = request.model or self.model
         payload: dict = {
             "model": model,
-            "messages": [{"role": m.role, "content": m.content} for m in request.messages],
+            "messages": [_message_payload(m) for m in request.messages],
             "max_tokens": request.max_tokens,
             "temperature": request.temperature,
         }
         if request.schema and "json_object" in self.capabilities:
             payload["response_format"] = {"type": "json_object"}
+        # 带工具时不下发 response_format：多数端点把「结构化输出」与「工具调用」视为
+        # 互斥的两种出参形态，同时要求会让模型只能二选一，或直接被端点判为参数非法。
+        if request.tools and "tools" in self.capabilities:
+            payload["tools"] = request.tools
+            if request.tool_choice is not None:
+                payload["tool_choice"] = request.tool_choice
         started = monotonic()
         data, attempts = self._post(payload)
         # 延迟必须真测：记账里全是 0 时，「用户等了几分钟」和「调用只要 200ms」
@@ -106,14 +174,18 @@ class OpenAICompatProvider(ChatProvider):
         latency_ms = int((monotonic() - started) * 1000)
         choice = (data.get("choices") or [{}])[0].get("message", {})
         usage = data.get("usage", {})
+        tool_calls = _parse_tool_calls(choice.get("tool_calls"))
         return ChatResponse(
-            text=choice.get("content", ""),
+            # 模型选择调工具时 content 常为 null；直接透传 None 会在下游变成
+            # 「文本是 None」而不是「这一轮没有文本」，两者语义不同。
+            text=choice.get("content") or "",
             provider=self.name,
             model=data.get("model") or model,
             prompt_tokens=int(usage.get("prompt_tokens", 0)),
             completion_tokens=int(usage.get("completion_tokens", 0)),
             latency_ms=latency_ms,
             attempts=attempts,
+            tool_calls=tool_calls or None,
         )
 
     def _post(self, payload: dict) -> tuple[dict, int]:

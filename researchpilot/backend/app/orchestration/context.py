@@ -77,6 +77,10 @@ class StageContext:
             "cached": cached,
             "degraded": list(response.degraded),
             "run_id": self.run_id,
+            # 只带 id + name：界面需要在「模型调用结算」这一帧上看出它提出了哪些工具调用，
+            # 而参数可能很大 —— 完整记录在 agent_steps 里（与「事件不抄原文」同一条约定）。
+            "tool_calls": [{"id": c.id, "name": c.name}
+                           for c in (response.tool_calls or [])],
         })
 
     def write_blackboard(self, obj_type: str, payload: dict, evidence: list | None = None) -> None:
@@ -109,7 +113,8 @@ class StageContext:
 
     # ── US-201/203：模型调用唯一入口 ─────────────
     def llm(self, tier: str, messages: list, schema: dict | None = None,
-            max_tokens: int = 1024, temperature: float = 0.7):
+            max_tokens: int = 1024, temperature: float = 0.7,
+            tools: list | None = None, tool_choice: str | dict | None = None):
         if self.gateway is None:
             raise RuntimeError("gateway 未注入，无法调用模型")
 
@@ -124,7 +129,8 @@ class StageContext:
                 self.session, project_id=self.project_id, run_id=self.run_id,
                 stage_id=self.stage_id, agent_id=self.agent_id, tier=tier,
                 messages=messages, schema=schema, max_tokens=max_tokens,
-                temperature=temperature, on_step=on_step, on_start=on_start,
+                temperature=temperature, tools=tools, tool_choice=tool_choice,
+                on_step=on_step, on_start=on_start,
             )
         except ProviderError as exc:
             self._record_llm_failure(exc, tier)

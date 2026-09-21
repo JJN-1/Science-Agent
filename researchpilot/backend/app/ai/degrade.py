@@ -6,6 +6,7 @@ from app.ai.base import (
     ChatRequest,
     ChatResponse,
     ProviderError,
+    ToolCapabilityMissing,
 )
 from app.ai.json_utils import extract_json
 from app.ai.schema_utils import schema_errors, schema_json
@@ -51,7 +52,22 @@ def complete_with_degradation(provider: ChatProvider, request: ChatRequest) -> C
       与上面的「始终下发」是两件事）
     - 形状校验失败 → 携带违规点重试一次（降级标记 `schema_retry`）
     - 重试仍失败 → `LLM-SCHEMA-001`
+    - **带工具且 provider 未声明 `tools` 能力 → 抛 `ToolCapabilityMissing`**（US-409）。
+      `json_object` 缺了可以用 prompt 兜（所以只标降级），`tools` 缺了**兜不住** ——
+      没法靠提示词让一个不认识工具协议的端点吐出合规的 `tool_calls`。
+      静默丢掉工具定义更糟：模型会「没调工具就直接作答」，而这与「它认为无需调用工具」
+      在界面上长得一模一样。
+    - **响应含 `tool_calls` 时不做 schema 校验**：那一轮模型选择的是调工具而非作答，
+      `content` 本就为空；拿空文本去撞结构化校验只会白白重试并最终报 `LLM-SCHEMA-001`。
+      结构化输出的要求属于**最终答案**。
     """
+    if request.tools and "tools" not in provider.capabilities:
+        raise ToolCapabilityMissing(
+            f"LLM-TOOLS-002: provider {provider.name} 未声明 tools 能力，"
+            f"无法承载带工具定义的调用（声明为 {'、'.join(sorted(provider.capabilities)) or '无'}）",
+            provider=provider.name,
+        )
+
     degraded: list[str] = []
     messages = list(request.messages)
 
@@ -67,6 +83,11 @@ def complete_with_degradation(provider: ChatProvider, request: ChatRequest) -> C
             degraded.append("schema_prompt")
 
     response = provider.complete(_request_with(request, messages))
+
+    if response.tool_calls:
+        # 这一轮模型选择调工具：没有文本可校验，也不该校验（见函数开头说明）。
+        response.degraded = degraded + response.degraded
+        return response
 
     if not request.schema:
         response.degraded = degraded + response.degraded
@@ -96,8 +117,16 @@ def complete_with_degradation(provider: ChatProvider, request: ChatRequest) -> C
 
 
 def _request_with(request: ChatRequest, messages: list[ChatMessage]) -> ChatRequest:
+    """按新消息列表重建请求。
+
+    ⚠️ **每次给 `ChatRequest` 加字段都必须同步这里。** 这个函数手工逐字段重建，
+    漏一个字段不会报错，只会让**降级重试那一次**悄悄少带那个字段：`model` 已经踩过
+    这个坑（重试时回落到 models[0]，用户选了模型却没用上），`tools` 若漏掉，
+    重试就是「不带工具再问一遍」—— 模型自然答「我没法调用工具」。
+    因此新增字段一律配一条独立单测（见 tests/test_tool_protocol.py）。
+    """
     return ChatRequest(
         messages=messages, tier=request.tier, schema=request.schema,
         max_tokens=request.max_tokens, temperature=request.temperature,
-        model=request.model,
+        model=request.model, tools=request.tools, tool_choice=request.tool_choice,
     )

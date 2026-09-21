@@ -7,7 +7,15 @@ from dataclasses import replace
 
 from sqlalchemy.orm import Session
 
-from app.ai.base import ChatMessage, ChatRequest, ChatResponse, ProviderError, monotonic
+from app.ai.base import (
+    ChatMessage,
+    ChatRequest,
+    ChatResponse,
+    ProviderError,
+    ToolCall,
+    ToolCapabilityMissing,
+    monotonic,
+)
 from app.ai.budget import BudgetManager
 from app.ai.degrade import complete_with_degradation
 from app.ai.registry import ProviderRegistry
@@ -29,11 +37,16 @@ def _serialize(response: ChatResponse) -> dict:
         "latency_ms": response.latency_ms,
         "attempts": response.attempts,
         "degraded": list(response.degraded),
+        # ⚠️ 必须带上：漏了它，缓存命中会把「模型调用了工具」变成「模型什么都没说」，
+        # 内核据此认为该轮无需执行工具，于是静默跳过一整步（缓存命中恰恰是最难
+        # 被发现的一类差异 —— 它只在第二次跑同一输入时才出现）。
+        "tool_calls": [c.to_dict() for c in (response.tool_calls or [])],
     }
 
 
 def _deserialize(payload: dict) -> ChatResponse:
     """还原缓存响应；latency_ms 归零——本次没有发生网络往返。"""
+    raw_calls = payload.get("tool_calls") or []
     return ChatResponse(
         text=payload["text"],
         provider=payload["provider"],
@@ -43,6 +56,7 @@ def _deserialize(payload: dict) -> ChatResponse:
         latency_ms=0,
         degraded=list(payload.get("degraded") or []),
         attempts=int(payload.get("attempts", 1)),
+        tool_calls=[ToolCall(**call) for call in raw_calls] or None,
     )
 
 
@@ -82,12 +96,14 @@ class LlmGateway:
         schema: dict | None = None,
         max_tokens: int = 1024,
         temperature: float = 0.7,
+        tools: list[dict] | None = None,
+        tool_choice: str | dict | None = None,
         on_step: Callable[[ChatResponse, float, bool], None] | None = None,
         on_start: Callable[[str, list[dict]], None] | None = None,
     ) -> ChatResponse:
         self.budget.check(session, project_id, agent_id, run_id)
 
-        cached = self._lookup_cache(session, tier, messages, schema)
+        cached = self._lookup_cache(session, tier, messages, schema, tools, tool_choice)
         if cached is not None:
             self._record(session, project_id=project_id, run_id=run_id,
                          stage_id=stage_id, agent_id=agent_id, tier=tier,
@@ -99,6 +115,7 @@ class LlmGateway:
         request = ChatRequest(
             messages=messages, tier=tier, schema=schema,
             max_tokens=max_tokens, temperature=temperature,
+            tools=tools, tool_choice=tool_choice,
         )
         if on_start is not None:
             # 把整条候选项链报出去：用户看到的是「在等谁、还有几个备选」，
@@ -124,7 +141,7 @@ class LlmGateway:
                 session,
                 cache_key=self._cache_key(
                     RouteCandidate(response.provider, response.model),
-                    messages, schema, tier,
+                    messages, schema, tier, tools, tool_choice,
                 ),
                 provider=response.provider,
                 model=response.model,
@@ -140,7 +157,8 @@ class LlmGateway:
         return response
 
     def _lookup_cache(self, session: Session, tier: str, messages: list[ChatMessage],
-                      schema: dict | None) -> ChatResponse | None:
+                      schema: dict | None, tools: list[dict] | None = None,
+                      tool_choice: str | dict | None = None) -> ChatResponse | None:
         """按候选链顺序逐个试命中，在第一个「当前可用」的候选处停下（D4）。
 
         停下的理由：候选链的顺序就是偏好顺序。若首候选 A 已恢复可用，就该走 A——
@@ -150,7 +168,7 @@ class LlmGateway:
         if not self.cache_enabled:
             return None
         for cand in self.router.candidates(tier):
-            key = self._cache_key(cand, messages, schema, tier)
+            key = self._cache_key(cand, messages, schema, tier, tools, tool_choice)
             row = llm_cache_dao.get(session, key)
             if row is not None:
                 return _deserialize(row.response)
@@ -176,6 +194,14 @@ class LlmGateway:
                 response = complete_with_degradation(
                     provider, replace(request, model=cand.model or None)
                 )
+            except ToolCapabilityMissing as exc:
+                # 能力不匹配是**配置问题**，不是后端故障：只跳过，不记失败。
+                # 若在这里 record_failure，一个「没配 tools 的后端被带工具的档位引用」
+                # 会在若干次调用后把它的熔断打开，连累它在**别的档位**上也变不可用。
+                last_error = exc
+                exc.provider = exc.provider or cand.provider
+                exc.model = exc.model or cand.model
+                continue
             except ProviderError as exc:
                 last_error = exc
                 # 补上归属：provider 自己不知道被谁调度，但失败记账必须落到具体后端
@@ -188,10 +214,33 @@ class LlmGateway:
         raise last_error or ProviderError("LLM-PROVIDER-001: 无可用模型后端")
 
     def _cache_key(self, cand, messages: list[ChatMessage], schema: dict | None,
-                   tier: str) -> str:
+                   tier: str, tools: list[dict] | None = None,
+                   tool_choice: str | dict | None = None) -> str:
+        """(provider, model, tier, messages, schema, tools, tool_choice) 的规范化哈希。
+
+        ``tools`` / ``tool_choice`` **必须进键**：同一段对话带不同的工具集，模型的
+        选择空间完全不同，答案自然不同。不进键的话「先跑了带 A 工具的会话、再跑
+        带 B 工具的会话」会命中同一条缓存 —— 后者拿到的是前者的答案，
+        而且看起来完全正常（这类串缓存最难被发现）。
+
+        这里放**完整的** ``tools`` 而不是「摘要」：摘要要自己定义归一化规则，
+        规则一旦漏掉某个字段（例如函数描述的改动）就会碰撞；而它最终是被 sha256
+        吃掉的，体积不构成理由 —— 唯一的要求是确定性，``sort_keys`` 已经保证。
+        """
         raw = json.dumps(
-            {"p": cand.provider, "m": cand.model, "t": tier,
-             "msgs": [[m.role, m.content] for m in messages], "s": schema},
+            {
+                "p": cand.provider, "m": cand.model, "t": tier,
+                "msgs": [
+                    [
+                        m.role, m.content, m.tool_call_id,
+                        [[c.id, c.name, c.arguments] for c in (m.tool_calls or [])],
+                    ]
+                    for m in messages
+                ],
+                "s": schema,
+                "tools": tools,
+                "tc": tool_choice,
+            },
             ensure_ascii=False, sort_keys=True,
         )
         return hashlib.sha256(raw.encode("utf-8")).hexdigest()
@@ -220,6 +269,9 @@ class LlmGateway:
             "attempts": response.attempts,
             "cached": cached,
             "degraded": response.degraded,
+            # 记下来，事后才答得出「这一轮模型到底调没调工具、调的什么」——
+            # 只记 text 的话，调工具的那一轮在轨迹里就是一条空文本。
+            "tool_calls": [c.to_dict() for c in (response.tool_calls or [])],
         })
 
     def _record_failure(self, session: Session, *, project_id: int, run_id: int,
