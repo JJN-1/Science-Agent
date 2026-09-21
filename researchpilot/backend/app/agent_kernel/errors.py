@@ -28,6 +28,23 @@ class ContextBudgetError(KernelError):
     code = "AGENT-CTX-001"
 
 
+class ToolError(KernelError):
+    """工具契约、白名单或调用参数不合法（US-404）。
+
+    子码：
+
+    - ``AGENT-TOOL-001`` 工具契约非法（名字为空、权限等级未知、超时/上限非正）或名称重复、未注册
+    - ``AGENT-TOOL-002`` 工具不在调用方的白名单内（§5.3 最小权限）
+    - ``AGENT-TOOL-003`` 调用参数不符合该工具的 JSON Schema
+
+    这三类都**在工具真正跑起来之前**抛出，与「工具跑了但失败了」严格分开：后者是
+    ``ToolResult(ok=False)``（模型看得见、可以换参数重试，见 D9），前者是调用方
+    自己写错了 —— 把它也做成 ok=False，等于让模型去「修」一个它无权修改的白名单。
+    """
+
+    code = "AGENT-TOOL-001"
+
+
 class PlanError(KernelError):
     """计划内容或状态迁移非法（US-403）。
 

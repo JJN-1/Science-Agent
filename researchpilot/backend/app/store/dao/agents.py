@@ -33,16 +33,36 @@ def upsert(
     tier: str,
     role: str = "stage",
     tools: list | None = None,
-    budget_steps: int = 20,
-    budget_cost: float = 2.0,
+    budget_steps: int | None = None,
+    budget_cost: float | None = None,
 ) -> Agent:
+    """插入或更新一个 Agent 行。
+
+    ``tools`` / ``budget_steps`` / ``budget_cost`` 与 ``name`` / ``tier`` 的区别是
+    **``None`` 表示「本次不动这个字段」**，而不是「用默认值覆盖」：
+
+    - ``agents.tools`` 在 US-404 之前是一列死数据（没有任何读取点），一旦开始由
+      ``AgentSpec`` 播种，就必须**连已存在的行也更新** —— 只更新插入路径的话，
+      升级上来的安装永远拿不到白名单，表现为「新装的能用、老装的永远被拒」
+    - ``budget_steps=0`` 是合法值（测试用它模拟「一步就熔断」），所以判据必须是
+      ``is not None`` 而不是真值判断
+    """
     agent = get_by_agent_id(session, agent_id)
     if agent is None:
         agent = Agent(
-            agent_id=agent_id, name=name, tier=tier, role=role, tools=tools or [],
-            budget_steps=budget_steps, budget_cost=budget_cost,
+            agent_id=agent_id, name=name, tier=tier, role=role,
+            tools=list(tools or []),
+            budget_steps=20 if budget_steps is None else budget_steps,
+            budget_cost=2.0 if budget_cost is None else budget_cost,
         )
         session.add(agent)
-    else:
-        agent.name, agent.tier, agent.role = name, tier, role
+        return agent
+
+    agent.name, agent.tier, agent.role = name, tier, role
+    if tools is not None:
+        agent.tools = list(tools)
+    if budget_steps is not None:
+        agent.budget_steps = budget_steps
+    if budget_cost is not None:
+        agent.budget_cost = budget_cost
     return agent

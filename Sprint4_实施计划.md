@@ -198,6 +198,17 @@ class ToolSpec:
     result_max_bytes: int
 ```
 
+**第 4 步落地时的形状**（与上面同构，补上了缺省值并明确了失败通道）：
+
+- `ToolSpec` 冻结，缺省 `permission="read"` / `idempotent=True` / `timeout_s=30.0` /
+  `result_max_bytes=32768`（D10）。`__post_init__` 负责 trim 与校验：空名、空描述、
+  未知权限、非正超时/上限一律抛 `AGENT-TOOL-001`
+- `Tool.run(args, ctx) -> ToolResult`。`ToolContext` 携带 `session` / `project_id` /
+  `job_id` / `agent_id` / `conversation_id`，**由内核注入**
+- `ToolRegistry.invoke(name, args, ctx, *, allowed=None)` 是**唯一**触发工具副作用的入口：
+  白名单 → 参数 schema → 执行 → 计时 → 截断（D10 头尾保留 + 写明丢了多少字节）
+- `ToolSpec.to_tool_definition()` 产出 OpenAI 的 `tools` 元素（第 5 步交给 `ChatRequest.tools`）
+
 **§5.3 的六个字段与本计划的对应关系**（它们是内核算法的真正输入，不能再悬空）：
 
 | §5.3 字段 | 内核里的落点 | 本计划哪一步 |
@@ -280,7 +291,7 @@ class ToolSpec:
 | 1 | `feat(US-401/402)` 会话持久化 + 上下文裁剪 | ✅ 已完成 | 回归 228 passed（基线 202，+26）；`tmp/migration_safety.py`（真实库副本 16 张表 193 行一字不差、新表幂等）；`tmp/smoke_sprint4.py`（真实 config.yaml 冒烟） |
 | 2 | `feat(US-403)` 计划器 | ✅ 已完成 | 回归 **275 passed**（+47）；migration 6 加表安全（同两脚本，已泛化支持 `NEW_TABLES` 指定）；`react` 请求被明确拒绝而非静默降级 |
 | 3 | `feat(US-409)` 工具调用协议层 | ✅ 已完成 | 回归 **308 passed**（+33）；`test_tool_protocol.py` 33 条，做过**变异检查**（去掉 `_request_with` 的字段同步与 `_serialize` 的 tool_calls → 7 条如实失败）；未进熔断的能力不匹配有独立异常类型 |
-| 4 | `feat(US-404)` 工具注册表 | ☐ | — |
+| 4 | `feat(US-404)` 工具注册表 | ✅ 已完成 | 回归 **366 passed**（+58）；新增 `test_tool_registry.py` / `test_agent_specs.py` / `test_tools_api.py` / DAO 三例；**变异检查 4/4 转红**（`tmp/mutation_us404.py`）；`tmp/migration_safety.py` 与 `tmp/smoke_sprint4.py`（真实 config.yaml + 真实库副本，脚本已加 US-404 段） |
 | 5 | `feat(US-405)` 内核循环 | ☐ | — |
 | 6 | `feat(US-406)` 权限与沙箱 | ☐ | — |
 | 7 | `feat(US-407)` 执行控制 | ☐ | — |
@@ -318,6 +329,27 @@ class ToolSpec:
 - ⚠️ **能力不匹配用独立异常 `ToolCapabilityMissing`（`LLM-TOOLS-002`），降级链只跳过、
   不记失败**：否则「没配 tools 的后端被带工具的档位引用」这个**配置问题**会在 5 次调用后
   打开该后端熔断，连累它在**别的档位**上也不可用 —— 故障横向扩散到无关调用
+
+**第 4 步的五处契约选择**（后续步骤不要改）：
+
+- **`run_pipeline` 的编排函数是注入的**（`main.py` 传 `orchestrator.run_pipeline`），
+  内核文件不 import `app.orchestration` —— 方向本来就是编排 → 内核，反向 import 成环。
+  注入之后 `agent_kernel/tools/` 可以脱库、脱编排单测
+- ⚠️ **`project_id` / `session` 由 `ToolContext` 注入，绝不从 `arguments` 取**。
+  越权入口通常不是权限判断写错了，而是「这个值本来就不该由调用方给」：模型若能指定
+  `project_id`，它就等于能跨项目读写
+- ⚠️ **「工具失败」与「调用方违规」走两条通道**：工具自己失败 → `ToolResult(ok=False)`，
+  模型看得见、能换参数重试（D9 的错误自愈计数就建立在这个字段上）；白名单 / 参数 schema /
+  未注册 → 抛 `ToolError`（`AGENT-TOOL-001/002/003`），**在工具跑起来之前**，副作用为零。
+  把后者也做成 `ok=False`，等于让模型去「修」一个它无权修改的白名单
+- ⚠️ **`run_pipeline` 的 `stage_ids` 必填**：留空即「跑完全链路」这个默认值太贵
+  （8 个阶段、真金白银），要求调用方显式列出。权限定 `execute` 而非 `dangerous` ——
+  它不删数据也不出网；定成 `dangerous` 会让每次调用都要批准，把审批疲劳变成常态
+- **`agents.tools` 的 `upsert` 语义是「`None` = 本次不动这个字段」**，且**必须更新已存在的行**：
+  只更新插入路径的话，升级上来的安装永远拿不到白名单（新装的能用、老装的永远被拒）。
+  注意判据用 `is not None` —— `budget_steps=0`（一步即熔断）是合法值
+- **`AgentSpec` 不预造支撑 Agent（Critic / Curator / Steward / Human）的 spec**：
+  它们还没有执行体，字段含义（评审阈值、记忆淘汰策略、审批边界）要等实现时才定得准
 
 
 ## 依赖与约束

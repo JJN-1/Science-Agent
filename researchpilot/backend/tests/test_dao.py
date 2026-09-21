@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from app.store.dao import agents as agents_dao
 from app.store.dao import blackboard as bb_dao
 from app.store.dao import projects as projects_dao
 from app.store.dao import runs as runs_dao
@@ -46,3 +47,63 @@ def test_run_steps_sequence_and_finish(session):
     assert reloaded.steps == 2
     assert reloaded.finished_at is not None
     assert [s.kind for s in runs_dao.list_steps(session, run.id)] == ["thought", "result"]
+
+
+# ── agents.upsert 的 None 语义（US-404）──────────
+# `agents.tools` 在 US-404 之前是一列死数据。它一开始由 AgentSpec 播种，就必须
+# **连已存在的行也更新**（只更新插入路径 = 老安装永远拿不到白名单）。
+
+def test_agents_upsert_updates_contract_fields_on_existing_row(session):
+    created = agents_dao.upsert(session, "scout", "Scout", tier="plan")
+    session.flush()
+    assert created.tools == []
+
+    agents_dao.upsert(
+        session, "scout", "Scout", tier="plan",
+        tools=["run_pipeline"], budget_steps=20, budget_cost=2.0,
+    )
+    session.flush()
+    reloaded = agents_dao.get_by_agent_id(session, "scout")
+    assert reloaded.tools == ["run_pipeline"]
+    assert reloaded.id == created.id      # 更新而不是插了一行新的
+
+
+def test_agents_upsert_none_means_leave_untouched(session):
+    """``None`` = 本次不动这个字段，不是「用默认值覆盖」。
+
+    没有这条语义，任何一次「只改名字」的播种都会把用户/别处设好的白名单与预算抹掉，
+    而且不报错。
+    """
+    agents_dao.upsert(
+        session, "scout", "Scout", tier="plan",
+        tools=["run_pipeline"], budget_steps=7, budget_cost=1.5,
+    )
+    session.flush()
+
+    agents_dao.upsert(session, "scout", "Scout 改名", tier="extract")
+    session.flush()
+
+    reloaded = agents_dao.get_by_agent_id(session, "scout")
+    assert reloaded.name == "Scout 改名" and reloaded.tier == "extract"
+    assert reloaded.tools == ["run_pipeline"]
+    assert reloaded.budget_steps == 7 and reloaded.budget_cost == 1.5
+
+
+def test_agents_upsert_zero_budget_is_a_real_value(session):
+    """``budget_steps=0`` 是合法值（测试用它模拟「一步就熔断」）。
+
+    判据必须是 ``is not None`` 而不是真值判断 —— 写成 ``if budget_steps:`` 时，
+    **把预算调到 0 会被静默忽略**，表现为「明明设了 0，却还在继续跑」。
+    必须先把行建出来再改，才能走到更新路径：只建一行的话，真值判断在新插入路径上
+    也恰好得到 0（`budget_steps=0 if ... else 20`），测试会绿着漏掉这个 bug。
+    """
+    agents_dao.upsert(session, "scout", "Scout", tier="plan", budget_steps=5, budget_cost=1.0)
+    session.flush()
+    assert agents_dao.get_by_agent_id(session, "scout").budget_steps == 5
+
+    agents_dao.upsert(session, "scout", "Scout", tier="plan", budget_steps=0, budget_cost=0.0)
+    session.flush()
+    reloaded = agents_dao.get_by_agent_id(session, "scout")
+    assert reloaded.budget_steps == 0
+    assert reloaded.budget_cost == 0.0
+

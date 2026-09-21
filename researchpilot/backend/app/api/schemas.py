@@ -233,6 +233,23 @@ class TaskPlanUpdate(BaseModel):
     status: str | None = None
 
 
+class ToolOut(BaseModel):
+    """一个内核工具（US-404）。``parameters`` 直接就是给模型看的 JSON Schema。
+
+    ``allowed_agents`` 由 ``AgentSpec`` 反查得到，而不是工具自报 —— 工具说自己能被谁调用
+    没有意义：**白名单是调用方的属性**，否则每个工具都能给自己扩权。
+    """
+
+    name: str
+    description: str
+    parameters: dict
+    permission: str
+    idempotent: bool
+    timeout_s: float
+    result_max_bytes: int
+    allowed_agents: list[str] = []
+
+
 class TaskPlanOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
