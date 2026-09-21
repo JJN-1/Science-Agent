@@ -16,6 +16,7 @@ from sqlalchemy import inspect, text
 from app.store.dao import conversations as conversations_dao
 from app.store.dao import messages as messages_dao
 from app.store.dao import projects as projects_dao
+from app.store.dao import task_plans as task_plans_dao
 from app.store.db import make_engine, make_session_factory
 from app.store.migrations import alembic_config, upgrade_to_head
 from app.store.models import Project
@@ -93,9 +94,73 @@ def test_upgrade_to_head_is_idempotent(tmp_path):
         engine.dispose()
 
 
-# Sprint 4 · migration 5：conversations / messages
+# Sprint 4 · migration 5/6：conversations / messages、task_plans
 BEFORE_CONVERSATIONS = "b1c4e7a92d38"
 SPRINT4_TABLES = ("conversations", "messages")
+BEFORE_TASK_PLANS = "3e7a5c91b4f2"
+TASK_PLAN_TABLES = ("task_plans",)
+
+
+def test_sprint4_migration_adds_task_plans_without_touching_rows(tmp_path):
+    """结构化任务计划表同样只加表；已写入的会话/消息不能受影响。
+
+    ``task_plans`` 有外键指向 ``conversations``，所以这条测试比 migration 5 多守一件事：
+    **加外键不能把父表重建一遍** —— SQLite 上加 FK 常靠重建表实现，重建父表就等于
+    把已有会话删光。这里先把会话写进去，再升到 head，最后确认它还在。
+    """
+    engine = make_engine(tmp_path / "app.db")
+    try:
+        command.upgrade(alembic_config(engine), BEFORE_TASK_PLANS)
+        assert not (set(TASK_PLAN_TABLES) & _table_names(engine)), "旧版本上就已经有新表了"
+
+        project_id = _seed_project(engine, "迁移前")
+        session = make_session_factory(engine)()
+        try:
+            conversation = conversations_dao.create(
+                session, project_id=project_id, title="迁移前的会话",
+            )
+            messages_dao.create(
+                session, conversation_id=conversation.id, role="user",
+                content="迁移前就说过的话", tokens=5,
+            )
+            session.commit()
+            conversation_id = conversation.id
+        finally:
+            session.close()
+
+        before = _row_counts(engine, _table_names(engine))
+
+        upgrade_to_head(engine)
+
+        assert set(TASK_PLAN_TABLES) <= _table_names(engine)
+        # 老表行数一个都不能变 —— 尤其 conversations 不能因为加外键被重建
+        assert _row_counts(engine, before.keys()) == before
+
+        session = make_session_factory(engine)()
+        try:
+            assert conversations_dao.get(session, conversation_id).title == "迁移前的会话"
+            kept = messages_dao.list_for_conversation(session, conversation_id)
+            assert [m.content for m in kept] == ["迁移前就说过的话"]
+
+            plan = task_plans_dao.create(
+                session, conversation_id=conversation_id,
+                steps=[{"id": "s1", "title": "迁移后写入"}],
+                mode="plan_execute", deterministic=True, seed=0,
+            )
+            session.commit()
+            plan_id = plan.id
+        finally:
+            session.close()
+
+        upgrade_to_head(engine)  # 启动路径的无条件调用
+
+        session = make_session_factory(engine)()
+        try:
+            assert task_plans_dao.get(session, plan_id).steps[0]["title"] == "迁移后写入"
+        finally:
+            session.close()
+    finally:
+        engine.dispose()
 
 
 def test_sprint4_migration_adds_conversation_tables_without_touching_rows(tmp_path):

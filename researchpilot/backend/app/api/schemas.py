@@ -183,3 +183,68 @@ class ContextPreviewOut(BaseModel):
     summarized: bool
     notes: list[str]
     messages: list[dict]
+
+
+class PlanStepOut(BaseModel):
+    """计划步骤。``id`` 是稳定标识而非序号 —— 检查点靠它定位「从哪一步继续」。"""
+
+    id: str
+    title: str
+    intent: str = ""
+    tool: str | None = None
+    params: dict = {}
+    status: str = "pending"
+
+
+class PlanStepIn(BaseModel):
+    """人工修改时提交的步骤。
+
+    ``status`` 可省略：省略表示「沿用同 id 步骤的既有状态」，而不是「重置为 pending」。
+    把「没提交」和「提交了 pending」区分开，是为了让编辑计划这件事永远不会
+    顺手把已有进度抹掉 —— 那类静默的数据丢失最难被发现。
+    """
+
+    id: str
+    title: str
+    intent: str = ""
+    tool: str | None = None
+    params: dict = {}
+    status: str | None = None
+
+
+class TaskPlanCreate(BaseModel):
+    """生成一份计划。
+
+    ``deterministic=True`` 时**不使用模型**，直接取编排模板 —— 步骤序列因此可复现。
+    """
+
+    goal: str = ""
+    mode: str | None = None
+    deterministic: bool = False
+    template_id: str | None = None
+
+
+class TaskPlanUpdate(BaseModel):
+    """人工修改。``status`` 目前只接受 ``approved``（draft → approved）。"""
+
+    steps: list[PlanStepIn] | None = None
+    title: str | None = Field(default=None, max_length=255)
+    rationale: str | None = None
+    status: str | None = None
+
+
+class TaskPlanOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    conversation_id: int
+    version: int
+    status: str
+    mode: str
+    deterministic: bool
+    seed: int | None
+    title: str
+    rationale: str
+    steps: list[PlanStepOut]
+    created_at: datetime
+    updated_at: datetime

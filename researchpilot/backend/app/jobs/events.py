@@ -22,6 +22,15 @@ STEP = "step"          # 轨迹步骤的镜像（think / decide / record）
 LLM_START = "llm.start"  # 模型调用**发起**（等待期间的唯一进度信号）
 LLM_CALL = "llm.call"  # 模型调用结算
 
+# 内核层事件（Sprint 4）。**「模型叙述的步骤」与「系统执行的工具」分开命名**（D12）：
+# 步骤种类用 note，工具执行才用 tool.*。同名会让「声称做了」与「真的做了」在界面上
+# 不可分辨，而区分这两件事正是审计价值的全部来源。
+PLAN_UPDATED = "plan.updated"    # 计划生成 / 人工修改（US-403）
+TOOL_CALL = "tool.call"          # 工具调用发起（US-404/405；Sprint 4 第 4 步定名后启用）
+TOOL_RESULT = "tool.result"      # 工具调用结算
+ASSISTANT_DELTA = "assistant.delta"  # 助手流式增量（US-405）
+APPROVAL_REQUIRED = "approval.required"  # 危险操作待批准（US-406）
+
 # 收到其中之一即表示作业已结束，SSE 可以正常关闭
 TERMINAL_EVENT_TYPES = (JOB_SUCCEEDED, JOB_FAILED, JOB_PAUSED)
 

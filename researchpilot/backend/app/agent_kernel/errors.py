@@ -26,3 +26,20 @@ class ContextBudgetError(KernelError):
     """
 
     code = "AGENT-CTX-001"
+
+
+class PlanError(KernelError):
+    """计划内容或状态迁移非法（US-403）。
+
+    子码：
+
+    - ``AGENT-PLAN-001`` 计划内容非法（缺 id/title、id 重复、模式未知、空步骤）
+    - ``AGENT-PLAN-002`` 确定性模式与编排模式冲突（D7 规定 deterministic 恒为 plan_execute）
+    - ``AGENT-PLAN-003`` 违反编辑规则（确定性计划不许改步骤 / 已批准的不能再改）
+
+    单独分类而不是复用 001 的原因：调用方对这三类的处置完全不同 ——
+    001 是「模型给的东西不能用，重试或回退」，002 是「用户传参自相矛盾」，
+    003 是「这次操作本身就不该发生」。混成一个码，前端只能笼统提示。
+    """
+
+    code = "AGENT-PLAN-001"

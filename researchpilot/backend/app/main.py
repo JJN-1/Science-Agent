@@ -10,7 +10,16 @@ from app.ai.budget import BudgetManager
 from app.ai.client import LlmGateway
 from app.ai.registry import ProviderRegistry as AIProviderRegistry
 from app.ai.routing import Router
-from app.api import conversations, governance, jobs, projects, runs, settings, stages
+from app.api import (
+    conversations,
+    governance,
+    jobs,
+    projects,
+    runs,
+    settings,
+    stages,
+    task_plans,
+)
 from app.config import ensure_data_dir, load_config
 from app.jobs.runner import JobRunner
 from app.observability.logging import get_logger, setup_logging
@@ -90,6 +99,7 @@ def create_app() -> FastAPI:
     )
     app.include_router(projects.router)
     app.include_router(conversations.router)
+    app.include_router(task_plans.router)
     app.include_router(stages.router)
     app.include_router(jobs.router)
     app.include_router(runs.router)

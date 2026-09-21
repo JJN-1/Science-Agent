@@ -350,3 +350,45 @@ class Message(Base):
     tool_call_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     tokens: Mapped[int] = mapped_column(Integer, default=0)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+
+# 计划状态：draft → approved → executing → done / failed（US-403）
+PLAN_STATUSES = ("draft", "approved", "executing", "done", "failed")
+PLAN_TERMINAL_STATUSES = ("done", "failed")
+# 编排模式（D7：deterministic 恒为 plan_execute）
+PLAN_MODES = ("plan_execute", "react")
+# 步骤状态
+PLAN_STEP_STATUSES = ("pending", "running", "done", "failed", "skipped")
+
+
+class TaskPlan(Base):
+    """结构化任务计划（US-403）。
+
+    ``steps`` 是**结构化对象数组**而不是自由文本 —— 这一条同时支撑两件事：
+
+    1. **阶段二的科研模式就是替换这张表的计划模板**（衔接约定 2）；文本计划没法被
+       「只换模板」
+    2. **G2 第 7 条要断言「两次跑出相同步骤序列」**；文本计划没法逐项比较
+
+    ``deterministic`` 与 ``seed`` 都落库而不是留在内存里：确定性是给**复现与消融
+    实验**用的（设计 §12.4），事后必须能证明「这次跑确实是确定性的」——
+    只存一个布尔值在运行时变量里，等于没存。
+    """
+
+    __tablename__ = "task_plans"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    conversation_id: Mapped[int] = mapped_column(
+        ForeignKey("conversations.id", ondelete="CASCADE"), index=True
+    )
+    #: 同一会话内的修订号，每次人工修改 +1；执行内容由 kernel_checkpoints 快照钉住
+    version: Mapped[int] = mapped_column(Integer, default=1)
+    status: Mapped[str] = mapped_column(String(16), default="draft", index=True)
+    mode: Mapped[str] = mapped_column(String(16), default="plan_execute")
+    deterministic: Mapped[bool] = mapped_column(default=False)
+    seed: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    title: Mapped[str] = mapped_column(String(255), default="")
+    rationale: Mapped[str] = mapped_column(Text, default="")
+    steps: Mapped[list] = mapped_column(JSON, default=list)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)
