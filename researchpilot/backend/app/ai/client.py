@@ -98,12 +98,13 @@ class LlmGateway:
         temperature: float = 0.7,
         tools: list[dict] | None = None,
         tool_choice: str | dict | None = None,
+        seed: int | None = None,
         on_step: Callable[[ChatResponse, float, bool], None] | None = None,
         on_start: Callable[[str, list[dict]], None] | None = None,
     ) -> ChatResponse:
         self.budget.check(session, project_id, agent_id, run_id)
 
-        cached = self._lookup_cache(session, tier, messages, schema, tools, tool_choice)
+        cached = self._lookup_cache(session, tier, messages, schema, tools, tool_choice, seed)
         if cached is not None:
             self._record(session, project_id=project_id, run_id=run_id,
                          stage_id=stage_id, agent_id=agent_id, tier=tier,
@@ -115,7 +116,7 @@ class LlmGateway:
         request = ChatRequest(
             messages=messages, tier=tier, schema=schema,
             max_tokens=max_tokens, temperature=temperature,
-            tools=tools, tool_choice=tool_choice,
+            tools=tools, tool_choice=tool_choice, seed=seed,
         )
         if on_start is not None:
             # 把整条候选项链报出去：用户看到的是「在等谁、还有几个备选」，
@@ -158,7 +159,8 @@ class LlmGateway:
 
     def _lookup_cache(self, session: Session, tier: str, messages: list[ChatMessage],
                       schema: dict | None, tools: list[dict] | None = None,
-                      tool_choice: str | dict | None = None) -> ChatResponse | None:
+                      tool_choice: str | dict | None = None,
+                      seed: int | None = None) -> ChatResponse | None:
         """按候选链顺序逐个试命中，在第一个「当前可用」的候选处停下（D4）。
 
         停下的理由：候选链的顺序就是偏好顺序。若首候选 A 已恢复可用，就该走 A——
@@ -168,7 +170,7 @@ class LlmGateway:
         if not self.cache_enabled:
             return None
         for cand in self.router.candidates(tier):
-            key = self._cache_key(cand, messages, schema, tier, tools, tool_choice)
+            key = self._cache_key(cand, messages, schema, tier, tools, tool_choice, seed)
             row = llm_cache_dao.get(session, key)
             if row is not None:
                 return _deserialize(row.response)
@@ -215,13 +217,17 @@ class LlmGateway:
 
     def _cache_key(self, cand, messages: list[ChatMessage], schema: dict | None,
                    tier: str, tools: list[dict] | None = None,
-                   tool_choice: str | dict | None = None) -> str:
-        """(provider, model, tier, messages, schema, tools, tool_choice) 的规范化哈希。
+                   tool_choice: str | dict | None = None,
+                   seed: int | None = None) -> str:
+        """(provider, model, tier, messages, schema, tools, tool_choice, seed) 的规范化哈希。
 
         ``tools`` / ``tool_choice`` **必须进键**：同一段对话带不同的工具集，模型的
         选择空间完全不同，答案自然不同。不进键的话「先跑了带 A 工具的会话、再跑
         带 B 工具的会话」会命中同一条缓存 —— 后者拿到的是前者的答案，
         而且看起来完全正常（这类串缓存最难被发现）。
+
+        ``seed`` 同理进键：它的用途就是把采样钉在一条确定路径上，两个不同的 seed
+        是两次不同的请求，共用键会让「确定性模式」拿到一次非确定性调用的缓存。
 
         这里放**完整的** ``tools`` 而不是「摘要」：摘要要自己定义归一化规则，
         规则一旦漏掉某个字段（例如函数描述的改动）就会碰撞；而它最终是被 sha256
@@ -240,6 +246,7 @@ class LlmGateway:
                 "s": schema,
                 "tools": tools,
                 "tc": tool_choice,
+                "seed": seed,
             },
             ensure_ascii=False, sort_keys=True,
         )

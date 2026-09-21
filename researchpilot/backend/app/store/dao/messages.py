@@ -14,6 +14,7 @@ def create(
     role: str,
     content: str,
     tool_call_id: str | None = None,
+    tool_calls: list[dict] | None = None,
     tokens: int,
 ) -> Message:
     """追加一条消息。
@@ -22,12 +23,18 @@ def create(
     而 ``0`` 会让下一次上下文裁剪以为这条消息不占预算 —— 静默的超窗比报错更难查。
     估算函数在 ``agent_kernel.tokens``，由调用方（API / 内核）算好传进来，
     这样 store 层不必反向依赖内核层。
+
+    ``tool_calls`` 只在 ``role="assistant"`` 且该轮调了工具时出现（US-405）。
+    它必须与随后的 ``tool`` 结果消息**成对落库**：协议要求 tool 结果能对应上带
+    ``tool_calls`` 的 assistant 消息，而历史是跨请求复用的 —— 只落一半，
+    第二句话就会被上游 400 拒收。
     """
     message = Message(
         conversation_id=conversation_id,
         role=role,
         content=content,
         tool_call_id=tool_call_id,
+        tool_calls=list(tool_calls) if tool_calls else None,
         tokens=tokens,
     )
     session.add(message)

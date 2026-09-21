@@ -167,6 +167,10 @@ class OpenAICompatProvider(ChatProvider):
             payload["tools"] = request.tools
             if request.tool_choice is not None:
                 payload["tool_choice"] = request.tool_choice
+        # seed 只在**显式给了**的时候才下发：把它当默认值传一个 0，
+        # 会让所有普通调用都被钉在同一采样路径上，用户看到的多样性凭空消失。
+        if request.seed is not None:
+            payload["seed"] = request.seed
         started = monotonic()
         data, attempts = self._post(payload)
         # 延迟必须真测：记账里全是 0 时，「用户等了几分钟」和「调用只要 200ms」

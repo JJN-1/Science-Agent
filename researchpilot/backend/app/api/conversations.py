@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from sqlalchemy.orm import Session
 
 from app.agent_kernel import context as kernel_context
@@ -92,18 +92,29 @@ def update_conversation(
 @router.post(
     "/api/conversations/{conversation_id}/messages",
     response_model=MessageAccepted,
-    status_code=201,
+    status_code=202,
 )
 def append_message(
     conversation_id: int,
     payload: MessageCreate,
+    request: Request,
     session: Session = Depends(get_session),
 ):
-    """追加一条用户消息（D14：``job_id`` 暂为 null）。
+    """追加一条用户消息，并受理一次内核运行（US-405 接上循环后）。
 
     ``role`` 只接受 ``user``：assistant / tool 消息由内核在进程内直接写库。
     开放角色字段等于允许客户端伪造「助手说过什么」，而那会污染审计轨迹 ——
     轨迹的价值恰恰在于它只可能由系统自己产生。
+
+    **状态码从 201 改成 202**：已经受理，但答复还没产生。返回 201 会让前端以为
+    「资源已就绪」，而此刻模型一次都还没调用。响应体的形状**没变**
+    （``{message, job_id}``），只是 ``job_id`` 从恒为 ``null`` 变成真实的
+    ``kind=chat`` 作业 id —— 这正是 D14 让第 1 步就定型成可空字段的目的。
+
+    消息在**受理作业之前显式 commit**：worker 是另一条线程、另一个 session，
+    它按 job_id 开跑时若读不到这条用户消息，本轮上下文里就没有用户刚说的那句话 ——
+    表现为「模型答非所问」，而且只在高频操作下偶发。依赖请求末尾那次自动提交是不够的：
+    入队发生在提交之前。
     """
     if conversations_dao.get(session, conversation_id) is None:
         raise HTTPException(status_code=404, detail="会话不存在")
@@ -125,7 +136,20 @@ def append_message(
     if conversation is not None and not conversation.title:
         conversations_dao.rename(session, conversation_id, payload.content.strip()[:40])
 
-    return MessageAccepted(message=MessageOut.model_validate(row), job_id=None)
+    accepted = MessageOut.model_validate(row)
+    session.commit()  # 见 docstring：必须先于入队
+
+    job_runner = getattr(request.app.state, "job_runner", None)
+    if job_runner is None:
+        # 内核未装配（例如只做会话持久化的窄测试）——不假装派了活，如实返回 null
+        return MessageAccepted(message=accepted, job_id=None)
+
+    conversation = conversations_dao.get(session, conversation_id)
+    job = job_runner.submit(
+        session, project_id=conversation.project_id, kind="chat",
+        params={"conversation_id": conversation_id},
+    )
+    return MessageAccepted(message=accepted, job_id=job.id)
 
 
 @router.get(

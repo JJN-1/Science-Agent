@@ -42,15 +42,24 @@ class JobRunner:
     执行跑在 ``anyio.to_thread`` 的工作线程里 —— 编排层是同步 SQLAlchemy，
     与事件循环同线程会把整个服务卡死。线程里自建 session，绝不复用请求 session：
     请求在受理那一刻就结束了。
+
+    作业分三种：``stage`` / ``pipeline`` 归 ``Orchestrator``，``chat`` 归内核循环
+    （US-405 / D3）。内核循环**复用这条通道而不是另开一条** ——
+    SSE 断线续传、``Last-Event-ID``、取消、僵尸作业自愈都已经在这里验证过一遍了，
+    再开一条执行通道等于把它们重做一遍，还会分裂成两套语义。
     """
 
     def __init__(
         self,
         session_factory: sessionmaker,
         orchestrator_provider: Callable[[], Any],
+        chat_handler: Callable[[Session, int, dict, int], int] | None = None,
     ) -> None:
         self._session_factory = session_factory
         self._orchestrator_provider = orchestrator_provider
+        #: ``(session, project_id, params, job_id) -> run_id``。内核循环由装配方注入，
+        #: 作业层不认识内核 —— 它只负责「按 kind 派活」，认识内核会让这一层跟着内核一起改。
+        self._chat_handler = chat_handler
         self._queue: asyncio.Queue[int] = asyncio.Queue()
         self._worker: asyncio.Task | None = None
         self._task: asyncio.Task | None = None
@@ -203,7 +212,14 @@ class JobRunner:
                 logger.info("job_running", job_id=job_id, kind=kind, stage_id=stage_id)
 
                 orchestrator = self._orchestrator_provider()
-                if kind == "pipeline":
+                if kind == "chat":
+                    if self._chat_handler is None:
+                        raise RuntimeError(
+                            "收到 kind=chat 作业，但装配时没有注入 chat_handler"
+                            "（内核循环未接线）"
+                        )
+                    run_id = self._chat_handler(session, project_id, params, job_id)
+                elif kind == "pipeline":
                     run_ids = orchestrator.run_pipeline(
                         session, project_id, params.get("stage_ids"), job_id=job_id,
                     )

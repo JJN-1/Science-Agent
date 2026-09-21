@@ -121,6 +121,11 @@ class ChatRequest:
     #: ``"auto"`` / ``"none"`` / ``"required"``，或指定某个函数对象。``None`` 表示不传，
     #: 由端点自行决定缺省行为。
     tool_choice: str | dict | None = None
+    #: 采样种子（D7 的确定性模式）。**不是所有端点都支持**，且支持它的端点也只是
+    #: 「尽力而为」—— 官方措辞是 best-effort。因此它是复现的**辅助**手段：
+    #: 真正把不确定性摁住的是 ``temperature=0``；两者都给上，才谈得上「同一输入两次
+    #: 相同结果」这件事在协议层面成立。``None`` = 不传（既有调用点零改动）。
+    seed: int | None = None
 
 
 @dataclass

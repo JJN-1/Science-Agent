@@ -111,6 +111,10 @@ class Plan:
     seed: int | None = None
     title: str = ""
     rationale: str = ""
+    #: ``task_plans.id``。放在最后并带默认值，是为了让既有按位置构造 ``Plan`` 的
+    #: 调用点零改动。落它是因为事件与检查点要引用「是哪一份计划」—— 靠标题或时间
+    #: 去认，两份同名计划（重规划很常见）就分不清了。
+    plan_id: int | None = None
 
     def to_steps_payload(self) -> list[dict[str, Any]]:
         return [step.to_dict() for step in self.steps]
@@ -142,6 +146,7 @@ class Plan:
             seed=getattr(row, "seed", None),
             title=getattr(row, "title", "") or "",
             rationale=getattr(row, "rationale", "") or "",
+            plan_id=getattr(row, "id", None),
         )
 
 

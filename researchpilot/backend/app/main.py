@@ -5,7 +5,9 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from app.agent_kernel import context as kernel_context
 from app.agent_kernel import specs as kernel_specs
+from app.agent_kernel.loop import KernelLoop
 from app.agent_kernel.tools.pipeline import RunPipelineTool
 from app.agent_kernel.tools.registry import ToolRegistry
 from app.agents.demo_stage import register_all
@@ -27,6 +29,7 @@ from app.api import tools as tools_api
 from app.config import ensure_data_dir, load_config
 from app.jobs.runner import JobRunner
 from app.observability.logging import get_logger, setup_logging
+from app.orchestration import kernel_store
 from app.orchestration.orchestrator import STAGE_ORDER, Orchestrator, StageRegistry
 from app.store.dao import agents as agents_dao
 from app.store.dao import jobs as jobs_dao
@@ -83,7 +86,36 @@ async def lifespan(app: FastAPI):
 
     # 异步作业层（FIX-03）：受理即返回，执行交给进程内单 worker。
     # orchestrator 用 provider 延迟取，热重载后仍拿到最新的那一个。
-    job_runner = JobRunner(session_factory, lambda: app.state.orchestrator)
+    #
+    # 内核循环（US-405）挂在同一条通道上（D3）：`kind=chat` 走 `kernel_store.run_chat_job`。
+    # 它需要 `session_factory` —— 并行执行只读工具时每个调用借一个独立 Session
+    # （SQLAlchemy 的 Session 不是线程安全的）。
+    kernel_cfg = config.get("kernel", {}) or {}
+    kernel_loop = KernelLoop(
+        gateway=gateway,
+        tools=tool_registry,
+        spec=kernel_specs.CONVERSATION_SPEC,
+        session_factory=session_factory,
+        max_steps=kernel_cfg.get("max_steps"),
+        parallel=bool(kernel_cfg.get("parallel", True)),
+        budget_tokens=int(kernel_cfg.get(
+            "budget_tokens", kernel_context.DEFAULT_BUDGET_TOKENS,
+        )),
+        recent_turns=int(kernel_cfg.get(
+            "recent_turns", kernel_context.DEFAULT_RECENT_TURNS,
+        )),
+        max_tokens=int(kernel_cfg.get("max_tokens", 1024)),
+    )
+    app.state.kernel_loop = kernel_loop
+
+    job_runner = JobRunner(
+        session_factory,
+        lambda: app.state.orchestrator,
+        chat_handler=lambda session, project_id, params, job_id: kernel_store.run_chat_job(
+            app.state.kernel_loop, session,
+            project_id=project_id, params=params, job_id=job_id,
+        ),
+    )
     app.state.job_runner = job_runner
 
     # agents 表播种（US-201 契约：档位/预算随 Agent 定义）+ 运行期状态恢复（FIX-05）
@@ -99,6 +131,17 @@ async def lifespan(app: FastAPI):
                 budget_steps=spec.max_steps if spec else None,
                 budget_cost=spec.max_cost_usd if spec else None,
             )
+        # 会话内核（US-405）也要有一行：`BudgetManager` 是按 `agents` 表里的
+        # budget_steps / budget_cost 判 Agent 级熔断的，缺了这一行，会话路径就只剩
+        # 项目级闸门 —— 「步数上限」在会话里会静默失效。它不属于 S1–S8，故单独播种。
+        kernel_agent = kernel_specs.CONVERSATION_SPEC
+        agents_dao.upsert(
+            session, agent_id=kernel_agent.id, name="会话内核", role="kernel",
+            tier=kernel_agent.tier,
+            tools=list(kernel_agent.tools),
+            budget_steps=kernel_agent.max_steps,
+            budget_cost=kernel_agent.max_cost_usd,
+        )
         ai_registry.load_circuits(session)      # 熔断状态跨重启保留
         llm_cache_dao.purge_expired(session)    # 清掉过期缓存
         recovered = jobs_dao.recover_orphans(session)  # 僵尸作业自愈

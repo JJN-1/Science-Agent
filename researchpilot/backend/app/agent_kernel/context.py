@@ -20,6 +20,7 @@ from app.agent_kernel.tokens import (
     estimate_message_tokens,
     estimate_tokens,
 )
+from app.ai.base import ToolArgumentsError, ToolCall
 
 # ── 槽位（常数顺序 = 裁剪梯队顺序，见 D8）──────
 SLOT_SYSTEM = "system"
@@ -49,18 +50,40 @@ class ContextMessage:
     role: str
     content: str
     tool_call_id: str | None = None
+    #: ``role="assistant"`` 且该轮调了工具时带上它（US-405）。**必须一路带到出站请求**：
+    #: 协议要求 ``tool`` 结果消息能对应上一条带 ``tool_calls`` 的 assistant 消息，
+    #: 上下文装配若把它丢掉，模型看到的就是一串没有起因的工具结果，且端点直接拒收。
+    tool_calls: tuple[ToolCall, ...] | None = None
 
     @property
     def tokens(self) -> int:
-        return estimate_message_tokens(self.role, self.content)
+        """估算值。工具调用的参数也算进去 —— 它们在回放时确实要占上游的窗口，
+        漏掉就等于让裁剪以为这条消息比实际小（``tokens`` 模块的约定是宁可偏高）。"""
+        total = estimate_message_tokens(self.role, self.content)
+        for call in self.tool_calls or ():
+            total += estimate_message_tokens("tool_call", call.name + call.arguments)
+        return total
 
     @classmethod
     def from_row(cls, row: Any) -> ContextMessage:
-        """从 ``messages`` 表的一行构造（鸭子类型，刻意不 import ORM 模型）。"""
+        """从 ``messages`` 表的一行构造（鸭子类型，刻意不 import ORM 模型）。
+
+        工具调用的解析**不抛错**：这里在读取路径上，一条形状不对的历史记录不该让
+        整个会话装配失败（与 ``Plan.from_row`` 同一条约定 —— 脏数据该被看见，
+        但不该在读取路径上炸掉）。非法条目跳过，剩下的照常装配。
+        """
+        raw_calls = getattr(row, "tool_calls", None) or []
+        calls: list[ToolCall] = []
+        for item in raw_calls:
+            try:
+                calls.append(ToolCall.from_dict(item))
+            except ToolArgumentsError:
+                continue
         return cls(
             role=getattr(row, "role", "user"),
             content=getattr(row, "content", "") or "",
             tool_call_id=getattr(row, "tool_call_id", None),
+            tool_calls=tuple(calls) or None,
         )
 
 
@@ -175,6 +198,76 @@ def _digest(turns: Sequence[Sequence[ContextMessage]]) -> str:
     return "\n".join(lines)
 
 
+# ── 协议对齐 ────────────────────────────────────
+
+def _align_tool_pairs(
+    messages: Sequence[ContextMessage],
+) -> tuple[list[ContextMessage], list[str]]:
+    """把工具调用与工具结果对齐成**协议合法**的形状。
+
+    端点的硬约束是双向的：``tool`` 结果必须能对应上一条带同名 ``tool_calls`` 的
+    assistant 消息，**反过来**带 ``tool_calls`` 的 assistant 消息也必须跟齐每一条结果。
+    任一侧落单，整条请求 400 被拒（不是忽略那一条）—— 失败的是这一整次对话。
+
+    裁剪本身不会拆散它们：整轮丢弃会连调用带结果一起丢，摘要化把整轮压成一条
+    system 消息。真正会产生孤儿的是「历史被 ``limit`` 从中间截断」与
+    「进程在写完 assistant、还没写 tool 结果时中断」这两类装配入口。
+    所以这里做的是**兜底对齐**，而不是把裁剪逻辑再写一遍。
+
+    对齐规则（都不编造内容）：
+    - 结果找不到对应调用 → 丢掉该结果
+    - 调用找不到对应结果 → 只保留**仍有结果**的那几条调用；全无结果时清空该字段
+      （``tool_calls`` 存在却为空列表同样是非法的）
+
+    编造一条「结果未保留」的假结果也能过协议，但那是在往模型上下文里塞没发生过的事 ——
+    与 D10「不静默截断」是同一条底线：宁可少一条，不要多一条假的。
+    """
+    answered = {
+        m.tool_call_id for m in messages if m.role == "tool" and m.tool_call_id
+    }
+    declared = {
+        call.id
+        for m in messages
+        if m.role == "assistant" and m.tool_calls
+        for call in m.tool_calls
+    }
+
+    kept: list[ContextMessage] = []
+    dropped_results = 0
+    trimmed_calls = 0
+    for message in messages:
+        if message.role == "tool":
+            if message.tool_call_id and message.tool_call_id in declared:
+                kept.append(message)
+            else:
+                dropped_results += 1
+            continue
+        if message.role == "assistant" and message.tool_calls:
+            complete = tuple(
+                call for call in message.tool_calls if call.id in answered
+            )
+            if len(complete) != len(message.tool_calls):
+                trimmed_calls += len(message.tool_calls) - len(complete)
+                kept.append(ContextMessage(
+                    message.role, message.content, message.tool_call_id,
+                    complete or None,
+                ))
+                continue
+        kept.append(message)
+
+    notes: list[str] = []
+    if dropped_results:
+        notes.append(
+            f"丢弃了 {dropped_results} 条找不到对应调用的工具结果"
+            "（留着会让端点拒收整条请求）"
+        )
+    if trimmed_calls:
+        notes.append(
+            f"从 assistant 消息上清掉了 {trimmed_calls} 条没有结果回应的工具调用"
+        )
+    return kept, notes
+
+
 # ── 装配 ────────────────────────────────────────
 
 def assemble(
@@ -256,6 +349,7 @@ def assemble(
             if shrunk != item.message.content:
                 item.message = ContextMessage(
                     item.message.role, shrunk, item.message.tool_call_id,
+                    item.message.tool_calls,
                 )
                 notes.append("摘要被进一步压缩")
 
@@ -276,6 +370,7 @@ def assemble(
                         + _TRUNCATE_MARK.format(n=len(content) - TOOL_RESULT_MAX_CHARS)
                         + content[-tail:],
                         item.message.tool_call_id,
+                        item.message.tool_calls,
                     )
                     shrunk_any = True
         if shrunk_any:
@@ -304,6 +399,8 @@ def assemble(
     messages = [item.message for item in pinned]
     messages += [item.message for item in history_items]
     messages += [item.message for turn in kept for item in turn.items]
+    messages, orphan_notes = _align_tool_pairs(messages)
+    notes.extend(orphan_notes)
 
     return AssemblyResult(
         messages=messages,

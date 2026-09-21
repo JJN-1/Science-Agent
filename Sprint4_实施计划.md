@@ -149,12 +149,17 @@ Key 约 70 字符）。而 provider 健康仍显示 `ok` —— 因为健康探�
 
 ### 1. 数据模型（migration 5，`down_revision = b1c4e7a92d38`）
 
+> 实际落地拆成三个迁移（原计划合成一个，按步拆开更好核对）：
+> 5 = `3e7a5c91b4f2`（`conversations` / `messages`）、6 = `8b2f6c04d1e9`（`task_plans`）、
+> **7 = `a7d3f8c21b64`（`tool_calls` 表 + `messages.tool_calls` 列）**。
+> 加列**必须可空**：老 `messages` 行没有值可填，非空会当场升级失败。
+
 | 表 | 关键字段 |
 |---|---|
 | `conversations` | id、project_id、title、status(`active`/`archived`)、created_at、updated_at |
-| `messages` | id、conversation_id、role(`user`/`assistant`/`tool`/`system`)、content、tool_call_id、tokens、created_at |
+| `messages` | id、conversation_id、role(`user`/`assistant`/`tool`/`system`)、content、tool_call_id、tool_calls(JSON, 可空)、tokens、created_at |
 | `task_plans` | id、conversation_id、version、status(`draft`/`approved`/`executing`/`done`/`failed`)、mode(`plan_execute`/`react`)、steps(JSON)、created_at、updated_at |
-| `tool_calls` | id、conversation_id、run_id、tool_name、args(JSON)、permission(`read`/`write`/`execute`/`dangerous`)、status、result(JSON)、error、approval_id、duration_ms、created_at |
+| `tool_calls` | id、conversation_id、run_id、tool_name、args(JSON)、permission(`read`/`write`/`execute`/`dangerous`)、status(`ok`/`failed`/`rejected`)、result(JSON)、error、approval_id、duration_ms、created_at |
 | `kernel_checkpoints` | id、conversation_id、plan_id、step_index、status、snapshot(JSON)、created_at |
 
 `task_plans.steps` 是**结构化对象**而非自由文本 —— 阶段二要能整体替换计划模板。
@@ -226,6 +231,23 @@ class ToolSpec:
 上限 `kernel.max_steps`（默认 20）。同轮内无依赖的工具调用用 `anyio` 任务组并发，
 **结果按调用序回填**（乱序回填会让模型的因果推断错位）。
 
+**第 5 步落地时的形状**：
+
+- `app/agent_kernel/loop.py`：`KernelRun`（坐标）/ `LoopOutcome`（战果）/
+  `CallOutcome`（一次调用的结算，`key = (tool, args_hash(args))`）/ `KernelStore` 协议 /
+  `KernelLoop`。入口 `run(session, *, run, store, plan=None, spec=None)`
+- 模式由**生效中的计划**决定：有计划 → `plan_execute`（`tool_choice` 强制到该步声明的工具），
+  没有 → `react`。`deterministic` 恒为 `plan_execute`，且 temperature 0 + 固定 seed + 禁并行（D7）
+- `app/orchestration/kernel_store.py`：`SqlKernelStore` 实现协议；
+  `open_chat_run()` 解析契约 / 建 run 行 / 装 store；`run_chat_job()` 是注入给 `JobRunner`
+  的 `chat_handler`。可执行计划状态 = `approved` / `executing`（**`draft` 不在其中**：
+  批准即冻结）
+- `JobRunner.__init__` 收 `chat_handler`，`kind == "chat"` 走它；`main.py` 里接上
+  `kernel_store.run_chat_job(app.state.kernel_loop, ...)`
+- 新表 `tool_calls`（migration 7 `a7d3f8c21b64`）+ `messages.tool_calls` 列；
+  `task_plans_dao.save_progress()` 与 `update_content()` **分开**（前者执行期只推状态、
+  不加 `version`、不限状态；后者人工改内容、只在 `draft`、`version` 加一）
+
 ### 5. 权限闸门
 
 | 等级 | 行为 |
@@ -247,9 +269,14 @@ class ToolSpec:
 `{ "message": MessageOut, "job_id": int | null }`（D14）：
 
 - **第 1 步**：写用户消息、返回 `201`，`job_id` 恒为 `null` —— 内核还没就位，不假装派活
-- **第 5 步**：内核循环接上后改为 `202`，`job_id` 为 `kind=chat` 作业的 id
+- **第 5 步**：内核循环接上后改为 `202`，`job_id` 为 `kind=chat` 作业的 id ✅
 
 这样前端从第一天就按可空处理，第 5 步不需要回头改已经联调过的契约。
+
+⚠️ 第 5 步落地时补的一条：**消息必须在受理作业之前显式 `commit`**。worker 是另一条线程、
+另一个 session，它按 `job_id` 开跑时若读不到这条用户消息，本轮上下文里就没有用户刚说的
+那句话 —— 表现为「模型答非所问」，且只在高频操作下偶发。依赖请求末尾那次自动提交是不够的：
+入队发生在提交之前。
 
 新增事件类型：`plan.updated`、`assistant.delta`、`tool.call`、`tool.result`、
 `approval.required`。**沿用 Sprint 3 的帧约定：只有 `id:` + `data:`，类型在 `data.type`。**
@@ -292,7 +319,7 @@ class ToolSpec:
 | 2 | `feat(US-403)` 计划器 | ✅ 已完成 | 回归 **275 passed**（+47）；migration 6 加表安全（同两脚本，已泛化支持 `NEW_TABLES` 指定）；`react` 请求被明确拒绝而非静默降级 |
 | 3 | `feat(US-409)` 工具调用协议层 | ✅ 已完成 | 回归 **308 passed**（+33）；`test_tool_protocol.py` 33 条，做过**变异检查**（去掉 `_request_with` 的字段同步与 `_serialize` 的 tool_calls → 7 条如实失败）；未进熔断的能力不匹配有独立异常类型 |
 | 4 | `feat(US-404)` 工具注册表 | ✅ 已完成 | 回归 **366 passed**（+58）；新增 `test_tool_registry.py` / `test_agent_specs.py` / `test_tools_api.py` / DAO 三例；**变异检查 4/4 转红**（`tmp/mutation_us404.py`）；`tmp/migration_safety.py` 与 `tmp/smoke_sprint4.py`（真实 config.yaml + 真实库副本，脚本已加 US-404 段） |
-| 5 | `feat(US-405)` 内核循环 | ☐ | — |
+| 5 | `feat(US-405)` 内核循环 | ✅ 已完成 | 回归 **407 passed**（+41）；`test_kernel_loop.py` 33 条（不碰数据库：`KernelStore` 协议 + 假件，逐条断言 `tool_choice` 强制、并行峰值、按调用序回填、`(tool, args_hash)` 计数）；**变异检查 4/4 转红**（`tmp/mutation_us405.py`，含未变异对照组自检）；`tmp/migration_safety.py` 新增「新增列」核对（16 张老表 193 行一字不差 / 4 张新表 / `messages.tool_calls` 列齐备 / 幂等）；`tmp/smoke_sprint4.py` 加 US-405 段（真实库副本上跑通 react 与 plan_execute 两条路） |
 | 6 | `feat(US-406)` 权限与沙箱 | ☐ | — |
 | 7 | `feat(US-407)` 执行控制 | ☐ | — |
 | 8 | `feat` 前端会话界面 | ☐ | — |
@@ -351,6 +378,35 @@ class ToolSpec:
 - **`AgentSpec` 不预造支撑 Agent（Critic / Curator / Steward / Human）的 spec**：
   它们还没有执行体，字段含义（评审阈值、记忆淘汰策略、审批边界）要等实现时才定得准
 
+**第 5 步的八处契约选择**（后续步骤不要改）：
+
+- ⚠️ **内核核心不 import `app.store`**：循环只认 `KernelStore` 协议（八条窄方法），
+  实现是 `app/orchestration/kernel_store.py::SqlKernelStore` —— 唯一同时认识 DAO 与内核的一方。
+  方向与第 4 步 `run_pipeline` 的注入一致（应用 → 内核）。换来的是循环的 **33 条单测一条
+  都不需要数据库**：接了真实库之后，断言会退化成「跑完没报错」，而这里要钉的是
+  中间那几步的形状
+- ⚠️ **计划步骤声明了工具、模型却只回文本 → 那一步记 `skipped`，不是 `done`**
+  （`_close_step`）。记 `done` 会让计划卡片显示「已完成」而实际什么都没发生 ——
+  这是 D12「不把声称当执行」在内核内部的那一半：界面上分不出「工具真跑了」与
+  「模型说自己跑了」，数据库就更不能替它混淆。跳过必须**带原因**写进 `plan.updated`
+- ⚠️ **`called` 集合按步清零**，否则上一步调过的工具会替下一步「证明它跑过」——
+  把「工具名出现过」当成「这一步执行了」，正是跳过检测唯一要区分的那件事
+- ⚠️ **并行只对同轮多个 `read` 工具**，且每个调用借**独立 Session**（`Session` 不是线程安全的）；
+  结果**按调用序**回填。乱序会让模型的因果推断错位：它看到结果 2 在结果 1 前面，
+  只会假设自己的调用顺序与发起时不同，于是开始重排推理步骤去「解释」这个顺序
+- ⚠️ **`plan.updated`（done）必须早于 `stage.succeeded` 发出**。按「收到终态即停止消费」
+  实现的 SSE 读端会漏掉终态之后的任何一条 —— 表现为「跑完了但卡片还停在第一步」。
+  **终态事件必须真的是最后一条**
+- ⚠️ **预算熔断在循环内转成 `paused`，且计划回到 `approved`**（不是 `failed`）：复用 S3 的
+  「暂停 → 审批 → 恢复」语义（D4）；留在 `executing` 会让重规划接口被 `has_running_plan`
+  永远挡住，用户失去唯一的出路
+- ⚠️ **`messages.tool_calls` 出到接口上**（`MessageOut`）：终态一律以数据库重拉为准，
+  SSE 断了之后要重建这轮对话，助手那句「我来读一下」就得能指出它指的是哪次调用 ——
+  否则后面那条 tool 消息挂着的 `tool_call_id` 找不到对手方
+- **`CONVERSATION_SPEC`（`id="kernel"` / `stage="chat"`）单独播种成一行 agents**：
+  `BudgetManager` 按 `agents.budget_steps` 判 Agent 级熔断，缺这一行，会话路径上
+  只剩项目级闸门 ——「步数上限」在会话里会静默失效
+
 
 ## 依赖与约束
 
@@ -367,7 +423,7 @@ class ToolSpec:
 | 1 | 3 工具 × ≥5 步真实任务跑通 | `scripts/kernel_walkthrough.py` + 输出存档 | ☐ |
 | 2 | 全程流式可见 | 上述脚本收集的 `job_events` 序列（含 `tool.call`/`tool.result`） | ☐ |
 | 3 | 危险操作可批准 | `run_command` 触发审批 → 批准 → 继续执行的事件留证 | ☐ |
-| 4 | 预算超限可暂停并恢复 | 复用 S3 的预算熔断路径 + 内核循环下的等价用例 | ☐ |
+| 4 | 预算超限可暂停并恢复 | 复用 S3 的预算熔断路径 + 内核循环下的等价用例 | ⚠️ 内核侧用例已就位（`test_budget_exceeded_pauses_instead_of_failing`、`test_budget_pause_returns_the_plan_to_approved`）；端到端恢复走第 7 步 |
 | 5 | 中断可恢复 | 取消 → 从 `kernel_checkpoints` 续跑，步骤序号连续 | ☐ |
 | 6 | `GET /api/tools` 返回全部工具及权限等级 | 接口快照 | ☐ |
 | 7 | `deterministic` 模式可用 | **同一输入连跑两次，计划与步骤序列逐项相等**（第 9 步落成 golden case，见下方说明） | ☐ |

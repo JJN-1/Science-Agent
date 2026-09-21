@@ -156,7 +156,7 @@ def test_every_declared_tool_is_registered():
 
 def test_unknown_tools_reports_which_agents_declared_them():
     missing = specs.unknown_tools(set())
-    assert missing == {"run_pipeline": [spec.id for spec in specs.STAGE_AGENT_SPECS]}
+    assert missing == {"run_pipeline": [spec.id for spec in specs.ALL_AGENT_SPECS]}
 
 
 def test_run_pipeline_is_allowed_for_every_stage_agent():
@@ -164,9 +164,15 @@ def test_run_pipeline_is_allowed_for_every_stage_agent():
 
     「每个阶段都能推进编排」看着像全放行，但真正的约束是负向的那一半：
     这八个白名单里**都不含**沙箱与网络工具。
+
+    US-405 起会话内核（``kernel``）也在列表里 —— 会话要能推进编排（衔接约定 1），
+    而它同样**不含**沙箱工具：第 6 步加 ``run_command`` 时，只有 ``executor`` 拿得到。
     """
-    assert specs.agents_allowing("run_pipeline") == [spec.id for spec in specs.STAGE_AGENT_SPECS]
+    assert specs.agents_allowing("run_pipeline") == [
+        spec.id for spec in specs.ALL_AGENT_SPECS
+    ]
     assert specs.agents_allowing("run_command") == []
+    assert "kernel" in specs.agents_allowing("run_pipeline")
 
 
 def test_support_agents_are_not_speculatively_declared():

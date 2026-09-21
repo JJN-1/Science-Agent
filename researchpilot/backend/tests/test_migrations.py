@@ -10,6 +10,8 @@ Sprint 3 一口气加了 5 张表（`budget_grants` / `app_config` / `llm_cache`
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
+
 from alembic import command
 from sqlalchemy import inspect, text
 
@@ -17,6 +19,7 @@ from app.store.dao import conversations as conversations_dao
 from app.store.dao import messages as messages_dao
 from app.store.dao import projects as projects_dao
 from app.store.dao import task_plans as task_plans_dao
+from app.store.dao import tool_calls as tool_calls_dao
 from app.store.db import make_engine, make_session_factory
 from app.store.migrations import alembic_config, upgrade_to_head
 from app.store.models import Project
@@ -119,14 +122,27 @@ def test_sprint4_migration_adds_task_plans_without_touching_rows(tmp_path):
             conversation = conversations_dao.create(
                 session, project_id=project_id, title="迁移前的会话",
             )
-            messages_dao.create(
-                session, conversation_id=conversation.id, role="user",
-                content="迁移前就说过的话", tokens=5,
-            )
             session.commit()
             conversation_id = conversation.id
         finally:
             session.close()
+
+        # ⚠️ 这一步**必须**用裸 SQL，不能用 ``messages_dao.create``：
+        # 当前 ORM 模型的 ``messages`` 已经带上 migration 7 新加的 ``tool_calls``，
+        # 用它往「还没有那一列」的旧库上写，INSERT 会直接报「no such column」——
+        # 失败的是「拿未来的形状写过去的库」这件事本身，而不是被测的迁移。
+        with engine.begin() as conn:
+            conn.execute(
+                text(
+                    "INSERT INTO messages"
+                    " (conversation_id, role, content, tokens, created_at)"
+                    " VALUES (:cid, 'user', :content, 5, :now)"
+                ),
+                {
+                    "cid": conversation_id, "content": "迁移前就说过的话",
+                    "now": datetime.now(UTC),
+                },
+            )
 
         before = _row_counts(engine, _table_names(engine))
 
@@ -141,6 +157,10 @@ def test_sprint4_migration_adds_task_plans_without_touching_rows(tmp_path):
             assert conversations_dao.get(session, conversation_id).title == "迁移前的会话"
             kept = messages_dao.list_for_conversation(session, conversation_id)
             assert [m.content for m in kept] == ["迁移前就说过的话"]
+            # 新增的可空列在**既有行上必须是 NULL**。它要是被设成 NOT NULL，
+            # 迁移会在真实库上直接失败（既有行没有可填的值）——
+            # 这条断言钉的就是「这一列确实是可空的」。
+            assert kept[0].tool_calls is None
 
             plan = task_plans_dao.create(
                 session, conversation_id=conversation_id,
@@ -201,6 +221,102 @@ def test_sprint4_migration_adds_conversation_tables_without_touching_rows(tmp_pa
             rows = messages_dao.list_for_conversation(session, conversation_id)
             assert [m.content for m in rows] == ["不该被重建冲掉"]
             assert conversations_dao.get(session, conversation_id).title == "迁移后写入"
+        finally:
+            session.close()
+    finally:
+        engine.dispose()
+
+
+# Sprint 4 · migration 7：tool_calls 表 + messages.tool_calls 列
+BEFORE_TOOL_CALLS = "8b2f6c04d1e9"
+KERNEL_TABLES = ("tool_calls",)
+
+
+def test_sprint4_migration_adds_tool_calls_and_message_column(tmp_path):
+    """migration 7 同时做两件事：加 `tool_calls` 表、给 `messages` 加一列。
+
+    «加列» 比 «加表» 多一类翻车方式：SQLite 上 ``ALTER TABLE ADD COLUMN`` 本身是安全的，
+    但**列的可空性**错了就会在真实库上失败（既有行没有可填的值）。所以这里的断言分两层：
+    升级后老消息还在、且它的新列是 NULL（可空），然后新写入才带得上工具调用。
+    """
+    engine = make_engine(tmp_path / "app.db")
+    try:
+        command.upgrade(alembic_config(engine), BEFORE_TOOL_CALLS)
+        assert not (set(KERNEL_TABLES) & _table_names(engine)), "旧版本上就已经有新表了"
+        assert "tool_calls" not in {
+            col["name"] for col in inspect(engine).get_columns("messages")
+        }, "旧版本的 messages 上不该有 tool_calls 列"
+
+        project_id = _seed_project(engine, "迁移前")
+        session = make_session_factory(engine)()
+        try:
+            conversation = conversations_dao.create(
+                session, project_id=project_id, title="迁移前的会话",
+            )
+            session.commit()
+            conversation_id = conversation.id
+        finally:
+            session.close()
+
+        # 同上：旧库没有这一列，只能用裸 SQL 写「迁移前」的消息
+        with engine.begin() as conn:
+            conn.execute(
+                text(
+                    "INSERT INTO messages"
+                    " (conversation_id, role, content, tokens, created_at)"
+                    " VALUES (:cid, 'user', :content, 5, :now)"
+                ),
+                {
+                    "cid": conversation_id, "content": "迁移前就说过的话",
+                    "now": datetime.now(UTC),
+                },
+            )
+        before = _row_counts(engine, _table_names(engine))
+
+        upgrade_to_head(engine)
+
+        assert set(KERNEL_TABLES) <= _table_names(engine)
+        assert "tool_calls" in {
+            col["name"] for col in inspect(engine).get_columns("messages")
+        }
+        assert _row_counts(engine, before.keys()) == before
+
+        session = make_session_factory(engine)()
+        try:
+            kept = messages_dao.list_for_conversation(session, conversation_id)
+            assert [m.content for m in kept] == ["迁移前就说过的话"]
+            assert kept[0].tool_calls is None, "新增列必须是可空的，否则既有行无法升级"
+
+            # 新列真的可用：一对「assistant 带调用 + tool 给结果」要能落库并读回
+            messages_dao.create(
+                session, conversation_id=conversation_id, role="assistant", content="",
+                tool_calls=[{"id": "c1", "name": "run_pipeline", "arguments": "{}"}],
+                tokens=3,
+            )
+            messages_dao.create(
+                session, conversation_id=conversation_id, role="tool", content='{"ok":true}',
+                tool_call_id="c1", tokens=3,
+            )
+            audit = tool_calls_dao.create(
+                session, conversation_id=conversation_id, run_id=None,
+                tool_name="run_pipeline", args={"stage_ids": ["S1"]},
+                permission="execute", status="ok", result={"run_ids": [1]},
+                duration_ms=12,
+            )
+            session.commit()
+            audit_id = audit.id
+        finally:
+            session.close()
+
+        upgrade_to_head(engine)  # 启动路径的无条件调用
+
+        session = make_session_factory(engine)()
+        try:
+            rows = messages_dao.list_for_conversation(session, conversation_id)
+            assert rows[-2].tool_calls[0]["id"] == "c1"
+            assert rows[-1].tool_call_id == "c1"
+            assert tool_calls_dao.get(session, audit_id).args == {"stage_ids": ["S1"]}
+            assert tool_calls_dao.count_for_conversation(session, conversation_id) == 1
         finally:
             session.close()
     finally:

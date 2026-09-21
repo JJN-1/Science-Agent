@@ -101,6 +101,30 @@ def update_content(
     return plan
 
 
+def save_progress(
+    session: Session, plan_id: int, *, steps: list[dict] | None = None,
+) -> TaskPlan | None:
+    """执行期写回各步状态（US-405）。**不动 ``version``、不限状态**。
+
+    与 ``update_content`` 分开是因为两者约束相反：
+
+    - ``update_content`` 是**人工修改内容**：只在 ``draft`` 允许，且 ``version`` 加一
+    - ``save_progress`` 是**内核推进执行**：只在 ``approved`` / ``executing`` 发生，
+      而它改的只有各步 ``status`` —— 步骤的 id / title / intent / tool / params 一个字
+      都不动，否则「批准即冻结」就失效了（执行中的计划被改了内容，检查点指不回当时那份）
+
+    把两者合成一个函数，迟早会出现「内核顺手改了计划内容却把 version 加一」，
+    或者「人工改内容绕过了 draft 限制」。
+    """
+    plan = session.get(TaskPlan, plan_id)
+    if plan is None:
+        return None
+    if steps is not None:
+        plan.steps = list(steps)
+    session.flush()
+    return plan
+
+
 def set_status(session: Session, plan_id: int, status: str) -> TaskPlan | None:
     plan = session.get(TaskPlan, plan_id)
     if plan is None:

@@ -12,6 +12,7 @@ import pytest
 from app.agent_kernel import context as ctx
 from app.agent_kernel.errors import ContextBudgetError
 from app.agent_kernel.tokens import estimate_message_tokens, estimate_tokens
+from app.ai.base import ToolCall
 
 
 def _turn(index: int, *, answer: str = "答") -> list[ctx.ContextMessage]:
@@ -124,9 +125,18 @@ def test_injected_summarizer_replaces_local_digest():
 # ── 裁剪梯队 ────────────────────────────────────
 
 def test_tool_results_are_truncated_with_visible_marker():
-    """D10：静默截断等于对模型撒谎 —— 必须留下截断标记。"""
+    """D10：静默截断等于对模型撒谎 —— 必须留下截断标记。
+
+    历史里**必须**同时有「发起调用的 assistant 消息」：US-405 起装配会做协议对齐，
+    落单的 tool 结果会被丢掉（见 ``test_orphan_tool_result_is_dropped``）——
+    这正是端点要的行为（结果找不到调用时，整条请求会被拒收）。
+    """
     history = [
         ctx.ContextMessage("user", "跑一下"),
+        ctx.ContextMessage(
+            "assistant", "",
+            tool_calls=(ToolCall(id="t1", name="echo", arguments="{}"),),
+        ),
         ctx.ContextMessage("tool", "x" * 8000, tool_call_id="t1"),
     ]
     result = ctx.assemble(history, budget_tokens=1500, recent_turns=5)
@@ -193,3 +203,99 @@ def test_notes_always_state_what_was_altered():
     result = ctx.assemble(_history(11), budget_tokens=900, recent_turns=4)
     assert result.notes
     assert any("摘要" in note for note in result.notes)
+
+
+# ── 工具调用的协议对齐（US-405）──────────────────
+#
+# 端点的约束是**双向**的：``tool`` 结果必须能对应上带同名 ``tool_calls`` 的 assistant
+# 消息，反之带 ``tool_calls`` 的 assistant 也必须跟齐结果。任一侧落单，**整条请求**
+# 会被 400 拒收 —— 失败的不是那一条消息，是这一次对话。
+
+def _call(call_id: str, name: str = "echo") -> ToolCall:
+    return ToolCall(id=call_id, name=name, arguments="{}")
+
+
+def test_orphan_tool_result_is_dropped():
+    """结果找不到它的调用 → 丢掉，并记台账。留着会让整条请求发不出去。"""
+    history = [
+        ctx.ContextMessage("user", "问"),
+        ctx.ContextMessage("tool", "孤儿结果", tool_call_id="ghost"),
+    ]
+    result = ctx.assemble(history, recent_turns=5)
+
+    assert [m.role for m in result.messages] == ["user"]
+    assert any("找不到对应调用" in note for note in result.notes)
+
+
+def test_assistant_tool_calls_are_trimmed_to_answered_ones():
+    """调用找不到结果 → 只保留仍有结果的那几条；全无结果则清空该字段。
+
+    ``tool_calls=[]`` 同样非法，所以「全丢光」必须是 ``None`` 而不是空列表。
+    """
+    history = [
+        ctx.ContextMessage("user", "问"),
+        ctx.ContextMessage(
+            "assistant", "",
+            tool_calls=(_call("a1"), _call("a2"), _call("a3")),
+        ),
+        ctx.ContextMessage("tool", "只有第二个有结果", tool_call_id="a2"),
+    ]
+    result = ctx.assemble(history, recent_turns=5)
+
+    assistant = next(m for m in result.messages if m.role == "assistant")
+    assert [c.id for c in assistant.tool_calls] == ["a2"]
+    assert any("没有结果回应" in note for note in result.notes)
+
+    empty = ctx.assemble(
+        [
+            ctx.ContextMessage("user", "问"),
+            ctx.ContextMessage("assistant", "没有工具的一轮", tool_calls=(_call("b1"),)),
+        ],
+        recent_turns=5,
+    )
+    kept_assistant = next(m for m in empty.messages if m.role == "assistant")
+    assert kept_assistant.tool_calls is None
+
+
+def test_matched_pairs_pass_through_untouched():
+    """配对完整时**一点都不动** —— 兜底逻辑只该在真的坏掉时才生效。"""
+    history = [
+        ctx.ContextMessage("user", "跑一下"),
+        ctx.ContextMessage("assistant", "", tool_calls=(_call("c1"),)),
+        ctx.ContextMessage("tool", "结果", tool_call_id="c1"),
+    ]
+    result = ctx.assemble(history, recent_turns=5)
+
+    assert [m.role for m in result.messages] == ["user", "assistant", "tool"]
+    assistant = result.messages[1]
+    assert [c.id for c in assistant.tool_calls] == ["c1"]
+    assert not any("丢弃了" in note or "清掉了" in note for note in result.notes)
+
+
+def test_tool_call_arguments_count_toward_tokens():
+    """工具调用的参数在回放时确实要占上游窗口，估算必须算上它。
+
+    不算的话裁剪会以为这条消息比实际小 —— ``tokens`` 模块的约定是宁可偏高。
+    """
+    without = ctx.ContextMessage("assistant", "")
+    with_calls = ctx.ContextMessage(
+        "assistant", "",
+        tool_calls=(ToolCall(id="d1", name="echo", arguments='{"text": "很长的一段参数"}'),),
+    )
+    assert with_calls.tokens > without.tokens
+
+
+def test_context_message_reads_tool_calls_from_row_duck_typed():
+    """读路径**不抛错**：一条形状不对的历史记录不该让整个会话装配失败。"""
+    class Row:
+        role = "assistant"
+        content = ""
+        tool_call_id = None
+        tool_calls = [
+            {"id": "e1", "name": "echo", "arguments": "{}"},
+            "这条不是对象，应当被跳过",
+            {"name": ""},  # 缺 name 也跳过
+        ]
+
+    message = ctx.ContextMessage.from_row(Row())
+    assert [c.id for c in message.tool_calls] == ["e1"]

@@ -60,8 +60,10 @@ def test_allowed_agents_comes_from_agent_specs(client):
     from app.agent_kernel import specs
 
     row = _tools(client)["run_pipeline"]
-    assert row["allowed_agents"] == [spec.id for spec in specs.STAGE_AGENT_SPECS]
-    assert len(row["allowed_agents"]) == 8
+    # 8 个阶段 Agent + 会话内核（US-405）。会话内核也在内是**对的**：
+    # 它确实能调 run_pipeline（衔接约定 1），漏掉它这一栏就是在说一件不成立的事。
+    assert row["allowed_agents"] == [spec.id for spec in specs.ALL_AGENT_SPECS]
+    assert len(row["allowed_agents"]) == 9
 
 
 # ── 装配期守卫 ──────────────────────────────────
@@ -87,8 +89,14 @@ def test_startup_seeds_agent_whitelists_from_specs(client, session):
     from app.agent_kernel import specs
 
     rows = {row.agent_id: row for row in agents_dao.list_all(session)}
-    assert len(rows) == 8
+    # 8 个阶段 Agent + 1 个会话内核（US-405 播种，否则会话路径上 Agent 级
+    # 步数/成本闸门会因为查不到 agents 行而静默失效）
+    assert len(rows) == 9
     for spec in specs.STAGE_AGENT_SPECS:
         assert rows[spec.id].tools == ["run_pipeline"]
         assert rows[spec.id].budget_steps == spec.max_steps
         assert rows[spec.id].budget_cost == spec.max_cost_usd
+    kernel = rows[specs.CONVERSATION_SPEC.id]
+    assert kernel.tools == list(specs.CONVERSATION_SPEC.tools)
+    assert kernel.budget_steps == specs.CONVERSATION_SPEC.max_steps
+    assert kernel.role == "kernel"

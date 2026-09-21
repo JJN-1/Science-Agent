@@ -148,6 +148,10 @@ class MessageOut(BaseModel):
     tool_call_id: str | None
     tokens: int
     created_at: datetime
+    # 模型这一轮提出的工具调用（US-405）。终端状态重拉时必须带上它：SSE 断了之后
+    # 前端只能靠数据库重建对话，缺了这一列，助手那句「我来读一下文件」就看不到
+    # 它指的是哪次调用，而 tool 消息又挂着 tool_call_id —— 两边对不上。
+    tool_calls: list[dict] | None = None
 
 
 class MessageAccepted(BaseModel):

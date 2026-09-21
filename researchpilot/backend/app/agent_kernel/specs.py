@@ -154,10 +154,38 @@ STAGE_AGENT_SPECS: tuple[AgentSpec, ...] = (
     ),
 )
 
+#: 会话内核的契约（US-405）。**不属于任何科研阶段**（``stage="chat"``）：
+#: 它是「用户在一个会话里说话、内核回应」这条路径上的执行者，与 S1–S8 的领域 Agent
+#: 是两回事 —— 后者有阶段产物与阶段档位，前者只有对话与工具调用。
+#:
+#: 工具面**刻意最小**。第 6 步把沙箱读写与 ``run_command`` 只挂到 ``executor`` 上，
+#: 届时会话要动用它们必须**显式声明** ``agent_id=executor`` ——「默认最严、提权要写明」
+#: 正是 §5.3 的最小权限原则。反过来的默认（会话默认拿全部工具）会让「我只是问了个问题」
+#: 也能触发一次真实的命令执行。
+#:
+#: ``requires_critic=False`` / ``human_checkpoint=NONE``：会话是人机同步交互的，
+#: 人就在屏幕前，再插一道事中检查点只是把同一件事问两遍。危险**动作**的闸门挂在
+#: 工具权限上（第 6 步），不挂在会话上。
+CONVERSATION_SPEC = AgentSpec(
+    id="kernel", stage="chat", tier="plan",
+    tools=("run_pipeline",),
+    max_steps=20,
+    max_cost_usd=2.0,
+    requires_critic=False,
+    human_checkpoint=CHECKPOINT_NONE,
+)
+
+#: 全部契约（阶段 Agent + 会话内核）。``agents_allowing`` / ``unknown_tools`` 用它，
+#: 因为它们回答的是「谁能调这个工具」—— 漏掉会话内核，``GET /api/tools`` 就会
+#: 声称 run_pipeline 无人可用，而会话明明能调它。
+ALL_AGENT_SPECS: tuple[AgentSpec, ...] = STAGE_AGENT_SPECS + (CONVERSATION_SPEC,)
+
 #: 支撑 Agent（§5.2）**本步不建 spec**：Critic / Curator / Steward / Human 目前都还没有
 #: 执行体（阶段二交付）。先写一份没人消费、也无从验证的契约，只会让「设计已对齐」变成
 #: 一种错觉 —— 它们各自的字段含义（评审阈值、记忆淘汰策略、审批边界）要等实现时才定得准。
-BY_AGENT_ID: dict[str, AgentSpec] = {spec.id: spec for spec in STAGE_AGENT_SPECS}
+BY_AGENT_ID: dict[str, AgentSpec] = {spec.id: spec for spec in ALL_AGENT_SPECS}
+#: 按阶段查**只映射阶段 Agent**：``"chat"`` 不是一个科研阶段，放进来会让
+#: 「S1–S8 是否齐全」这类检查把会话内核也算进去。
 BY_STAGE: dict[str, AgentSpec] = {spec.stage: spec for spec in STAGE_AGENT_SPECS}
 
 
@@ -174,7 +202,7 @@ def agents_allowing(tool_name: str) -> list[str]:
 
     返回有序列表：界面按它渲染权限徽标，顺序稳定才不会有「每次刷新顺序都变」的观感。
     """
-    return [spec.id for spec in STAGE_AGENT_SPECS if tool_name in spec.tools]
+    return [spec.id for spec in ALL_AGENT_SPECS if tool_name in spec.tools]
 
 
 def unknown_tools(registered: set[str]) -> dict[str, list[str]]:
@@ -184,7 +212,7 @@ def unknown_tools(registered: set[str]) -> dict[str, list[str]]:
     交互路径严格）。阶段二某个领域包还没装、工具还没实现，不应该让整个应用起不来。
     """
     missing: dict[str, list[str]] = {}
-    for spec in STAGE_AGENT_SPECS:
+    for spec in ALL_AGENT_SPECS:
         for tool in spec.tools:
             if tool not in registered:
                 missing.setdefault(tool, []).append(spec.id)

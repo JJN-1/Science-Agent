@@ -105,8 +105,16 @@ def test_create_conversation_requires_existing_project(client):
     assert created.json()["status"] == "active"
 
 
-def test_append_message_returns_null_job_id_and_estimated_tokens(client):
-    """D14：内核未就位时 job_id 必须是 null，且响应形状已定型，第 5 步只换值。"""
+def test_append_message_accepts_a_chat_job(client, wait_job):
+    """US-405 起 ``POST /messages`` 受理一次内核运行：202 + 真实的 ``job_id``。
+
+    D14 的兑现方式正是「**只换值不动形状**」：响应体还是 ``{message, job_id}``，
+    只是 ``job_id`` 从恒为 ``null`` 变成了 ``kind=chat`` 作业的 id ——
+    前端从第 1 步起就按可空处理，所以这次改动没有破坏任何已经联调过的契约。
+
+    状态码 201 → 202 是必须的：答复此刻**还没产生**，返回 201 会让前端以为
+    「资源已就绪」，而模型一次都还没调用。
+    """
     project = client.post("/api/projects", json={"title": "P"}).json()
     conversation = client.post(
         "/api/conversations", json={"project_id": project["id"]},
@@ -116,11 +124,36 @@ def test_append_message_returns_null_job_id_and_estimated_tokens(client):
         f"/api/conversations/{conversation['id']}/messages",
         json={"content": "研究一下稀疏注意力"},
     )
-    assert resp.status_code == 201
+    assert resp.status_code == 202
     body = resp.json()
-    assert body["job_id"] is None
     assert body["message"]["role"] == "user"
     assert body["message"]["tokens"] > 0
+    assert body["job_id"] is not None
+
+    snapshot = wait_job(client, body["job_id"])
+    assert snapshot["kind"] == "chat"
+    assert snapshot["status"] == "succeeded", snapshot["error"]
+    assert snapshot["run_id"] is not None
+
+    # 用户那句话必须**先落地再派活**：worker 是另一条线程、另一个 session，
+    # 提交晚了它本轮就看不到这句话（表现为「模型答非所问」，且只偶发）。
+    detail = client.get(f"/api/conversations/{conversation['id']}").json()
+    assert detail["messages"][0]["content"] == "研究一下稀疏注意力"
+
+
+def test_append_message_rejects_non_user_roles(client):
+    """``role`` 只接受 ``user``。开放它等于允许客户端伪造「助手说过什么」。"""
+    project = client.post("/api/projects", json={"title": "P"}).json()
+    conversation = client.post(
+        "/api/conversations", json={"project_id": project["id"]},
+    ).json()
+
+    resp = client.post(
+        f"/api/conversations/{conversation['id']}/messages",
+        json={"content": "我假装是助手", "role": "assistant"},
+    )
+    assert resp.status_code == 400
+    assert "user" in resp.json()["detail"]
 
 
 def test_first_message_becomes_the_conversation_title(client):
@@ -164,6 +197,36 @@ def test_detail_reports_messages_and_total_tokens(client):
     detail = client.get(f"/api/conversations/{conversation['id']}").json()
     assert [m["content"] for m in detail["messages"]] == ["第一句", "第二句"]
     assert detail["total_tokens"] == sum(m["tokens"] for m in detail["messages"])
+
+
+def test_detail_exposes_tool_calls_for_rebuilding_after_a_dropped_stream(session, client):
+    """``messages.tool_calls`` 必须出到接口上（US-405）。
+
+    终态一律以数据库重拉为准（前端既有约定）。SSE 断了之后要重建这轮对话，
+    助手那句「我来读一下」就得能指出它指的是哪次调用 —— 否则后面那条 tool 消息
+    挂着的 ``tool_call_id`` 找不到对手方，重建出来的轨迹里工具结果凭空出现。
+    """
+    project = client.post("/api/projects", json={"title": "P"}).json()
+    conversation = client.post(
+        "/api/conversations", json={"project_id": project["id"]},
+    ).json()
+    messages_dao.create(
+        session, conversation_id=conversation["id"], role="assistant",
+        content="我来读一下这个文件", tokens=9,
+        tool_calls=[{"id": "c1", "name": "read_file", "arguments": '{"path": "a.txt"}'}],
+    )
+    messages_dao.create(
+        session, conversation_id=conversation["id"], role="tool",
+        content="文件内容", tool_call_id="c1", tokens=4,
+    )
+    session.commit()
+
+    rows = client.get(f"/api/conversations/{conversation['id']}").json()["messages"]
+    assert rows[0]["tool_calls"] == [
+        {"id": "c1", "name": "read_file", "arguments": '{"path": "a.txt"}'},
+    ], rows[0]
+    assert rows[0]["tool_calls"][0]["id"] == rows[1]["tool_call_id"]
+    assert rows[1]["tool_calls"] is None
 
 
 def test_patch_can_archive_and_reactivate(client):

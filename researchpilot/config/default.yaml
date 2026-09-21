@@ -29,8 +29,14 @@ ai:
       type: mock
       models: [mock-small]
       vendor: mock
-      capabilities: [json_object]
+      # mock 确实支持工具调用（按 `tool_script` 产确定性调用），所以能力清单里必须有
+      # `tools`。少了它，内核循环的带工具请求会在降级链上被逐个跳过，最终报
+      # 「无可用模型后端」—— 那是**配置**问题，却长成了「后端全挂了」的样子。
+      capabilities: [json_object, tools]
       price: {input: 0.0, output: 0.0}
+      # 内核循环（US-405）的空转脚本：第 N 次调用吐出第 N 条工具调用，用尽后回到普通文本作答，
+      # 于是会话会自己结束。用法见 docs / tmp 下的内核冒烟脚本；生产端点不需要这一段。
+      tool_script: []
       response: '{"questions": [{"question": "如何提升图神经网络推荐模型的可解释性", "rationale": "现有 GNN 推荐方法决策过程不透明，缺乏可解释性研究", "score": 0.82}, {"question": "图神经网络推荐系统中的过平滑问题的缓解策略", "rationale": "层数加深导致性能下降，是 GNN 推荐的主要瓶颈", "score": 0.75}, {"question": "基于对比学习的图神经网络冷启动推荐", "rationale": "冷启动场景下结构信息利用不足", "score": 0.68}]}'
   routing:
     extract:    [{provider: mock, model: mock-small}]
@@ -57,3 +63,13 @@ ai:
   cache:
     enabled: true
     ttl_seconds: 604800   # 7 天
+
+# ── 内核循环（US-405）──────────────────────────
+# 会话里「用户说一句 → 内核决定做什么 → 调工具 → 回填结果」这条路径的参数。
+# 全部可省：缺省值见 app/agent_kernel/loop.py 的模块常量。
+kernel:
+  max_steps: 20        # 单次运行的最大轮数（每轮 = 一次模型调用）。AgentSpec.max_steps 的全局覆盖
+  parallel: true       # 同轮多个**只读**工具并发执行；deterministic 模式下强制关闭（D7）
+  budget_tokens: 8192  # 单次上下文装配的 token 预算（裁剪梯队见 D8）
+  recent_turns: 8      # 保留最近多少轮完整对话，更早的摘要化
+  max_tokens: 1024     # 单次模型调用的输出上限

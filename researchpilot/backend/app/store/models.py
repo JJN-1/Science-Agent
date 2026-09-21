@@ -272,7 +272,7 @@ class Job(Base):
     project_id: Mapped[int] = mapped_column(
         ForeignKey("projects.id", ondelete="CASCADE"), index=True
     )
-    kind: Mapped[str] = mapped_column(String(16))  # stage | pipeline
+    kind: Mapped[str] = mapped_column(String(16))  # stage | pipeline | chat
     stage_id: Mapped[str | None] = mapped_column(String(8), nullable=True)
     status: Mapped[str] = mapped_column(String(16), default="queued", index=True)
     run_id: Mapped[int | None] = mapped_column(
@@ -348,6 +348,11 @@ class Message(Base):
     content: Mapped[str] = mapped_column(Text, default="")
     # assistant 发起的工具调用与随后的工具结果靠它配对；普通消息为 None
     tool_call_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    #: ``role="assistant"`` 且该轮调用了工具时，**必须**把调用一起存下来。
+    #: OpenAI 协议要求 ``tool`` 消息能对应上一条带 ``tool_calls`` 的 ``assistant`` 消息，
+    #: 缺任一条整条请求会被拒收；而历史是跨请求复用的 —— 不存这一列，第一次对话能跑通、
+    #: 第二次必然被 400 顶回来（最难归因的一类故障）。
+    tool_calls: Mapped[list | None] = mapped_column(JSON, nullable=True)
     tokens: Mapped[int] = mapped_column(Integer, default=0)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
 
@@ -392,3 +397,45 @@ class TaskPlan(Base):
     steps: Mapped[list] = mapped_column(JSON, default=list)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)
+
+
+#: 一次工具调用的三种结局。``failed`` 与 ``rejected`` **刻意分开**（D12）：
+#: 前者是「工具跑了但失败了」（模型看得见、可换参数重试，D9 的自愈计数按它累计），
+#: 后者是「调用方违规，工具根本没跑」（未注册 / 不在白名单 / 参数不合 schema，副作用为零）。
+#: 合成一个值之后，「这次没干成」就无法区分「试过了不行」与「压根不该试」。
+TOOL_CALL_STATUSES = ("ok", "failed", "rejected")
+
+
+class ToolCall(Base):
+    """系统真实执行过的一次工具调用（US-405）。
+
+    与 ``job_events`` 里的 ``tool.call`` / ``tool.result`` 是同一件事的两份记录：
+    事件是**实时**投递给界面的那一条，这张表是**可查询**的那一份 ——
+    「这个会话调了多少次工具、被拒了几次、各花了多久」必须能一条 SQL 问出来，
+    而不是把事件流读一遍再在内存里数（G2 第 7 条的 golden case 也依赖它）。
+
+    ``permission`` 取自 ``ToolSpec``（D5 的静态属性）而不是模型自称：
+    权限分级一旦可被调用方声明，等于没有分级。
+    """
+
+    __tablename__ = "tool_calls"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    conversation_id: Mapped[int] = mapped_column(
+        ForeignKey("conversations.id", ondelete="CASCADE"), index=True
+    )
+    run_id: Mapped[int | None] = mapped_column(
+        ForeignKey("agent_runs.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    tool_name: Mapped[str] = mapped_column(String(64))
+    args: Mapped[dict] = mapped_column(JSON, default=dict)
+    permission: Mapped[str] = mapped_column(String(16))
+    status: Mapped[str] = mapped_column(String(16))
+    result: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    error: Mapped[str] = mapped_column(Text, default="")
+    #: 危险操作的人工批准单（第 6 步接线）。本步恒为 NULL。
+    approval_id: Mapped[int | None] = mapped_column(
+        ForeignKey("approvals.id", ondelete="SET NULL"), nullable=True
+    )
+    duration_ms: Mapped[int] = mapped_column(Integer, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
