@@ -6,8 +6,8 @@
 漂移的表现会是「某个 Agent 的档位被悄悄降级」或「白名单漏了一个阶段」。
 
 另一半价值是**负向断言**：§5.3 的权限最小化说的是「哪些工具**不在**白名单里」。
-这一条现在就要写下来 —— 等第 6 步真的加了 ``run_command``，漏给某个 Agent 就是
-「处理文献内容的 Agent 拿到了执行权限」，而那正是提示注入最想要的入口。
+US-406 之前这条断言挡在「还没加工具」的前面；现在沙箱工具真的存在了，它挡的是
+「漏给某个 Agent」——而那正是提示注入最想要的入口（处理文献内容的 Agent 拿到执行权限）。
 """
 
 from __future__ import annotations
@@ -16,15 +16,19 @@ import pytest
 
 from app.agent_kernel import specs
 from app.agent_kernel.errors import KernelError
-from app.agent_kernel.tools.pipeline import RunPipelineTool
-from app.agent_kernel.tools.registry import ToolRegistry
+from app.agent_kernel.sandbox import SandboxPolicy
+from app.agent_kernel.tools.factory import (
+    SANDBOX_TOOL_NAMES,
+    WITHHELD_TOOL_NAMES,
+    build_registry,
+)
 from app.agents.demo_stage import STAGE_DEFS
 from app.orchestration.orchestrator import STAGE_ORDER
 from app.store.dao import agents as agents_dao
 
-#: 第 6 步之后才会存在的工具。**现在就把它们列出来**，好让「不该有的地方不许有」
-#: 这条断言从此生效，而不是等加完工具才开始担心。
-FUTURE_SANDBOX_TOOLS = ("run_command", "read_file", "write_file", "list_dir", "glob", "http_get")
+#: 唯一持有沙箱工具的 Agent（US-406）。§5.3 权限最小化落在这一条上：
+#: 其余每个 Agent 的白名单都必须**不含** ``SANDBOX_TOOL_NAMES``。
+SANDBOX_HOLDER = "executor"
 
 
 # ── 与既有定义对钉 ──────────────────────────────
@@ -129,34 +133,77 @@ def test_checkpoint_constants_cover_design_literal():
 
 # ── 权限最小化：负向断言 ────────────────────────
 
-def test_no_stage_agent_holds_sandbox_tools_yet():
-    """第 4 步只有 run_pipeline 一个工具，沙箱工具属于第 6 步。
+def test_sandbox_tools_are_hold_only_by_executor():
+    """US-406：沙箱工具**只**给 ``executor``，其余七个阶段与会话内核一律不含。
 
-    这条断言现在就要挡在前面：等第 6 步加 ``run_command`` 时，它会失败并强迫
-    实现者**显式**决定给谁 —— 而不是「顺手按字母序全给上」。
+    这是本文件里最重要的一条。``SANDBOX_TOOL_NAMES`` 里既有只读的 ``read_file``
+    也有 ``run_command`` —— 而一个「能读文件」的 Agent 与一个「能执行命令」的 Agent
+    在威胁模型上是同一件事：``read_file`` 能读到的内容会被送进模型上下文，
+    而上下文里的文本就是下一轮注入的载体。
     """
     for spec in specs.STAGE_AGENT_SPECS:
-        leaked = set(spec.tools) & set(FUTURE_SANDBOX_TOOLS)
-        assert not leaked, f"{spec.id} 提前拿到了沙箱工具 {leaked}"
+        leaked = set(spec.tools) & set(SANDBOX_TOOL_NAMES)
+        if spec.id == SANDBOX_HOLDER:
+            assert leaked == set(SANDBOX_TOOL_NAMES), (
+                f"{spec.id} 应当持有全部沙箱工具，实际只持有 {sorted(leaked)}"
+            )
+        else:
+            assert not leaked, f"{spec.id} 不该拿到沙箱工具 {sorted(leaked)}"
+
+
+def test_conversation_kernel_holds_no_sandbox_tool():
+    """会话内核的工具面必须最小：要跑命令得显式写 ``agent_id=executor``。
+
+    「默认最严、提权要写明」是 §5.3 的落地方式。这里若漏了，
+    「用户只是问了个问题」就能触发一次真实的命令执行。
+    """
+    assert not set(specs.CONVERSATION_SPEC.tools) & set(SANDBOX_TOOL_NAMES)
 
 
 def test_literature_agents_hold_no_writing_or_network_tools():
-    """§5.3 明文：「处理文献内容的 Agent 不持有文件写权限、不持有网络工具、不持有密钥」。"""
+    """§5.3 明文：「处理文献内容的 Agent 不持有文件写权限、不持有网络工具、不持有密钥」。
+
+    这是 ``test_sandbox_tools_are_hold_only_by_executor`` 之外的**另一层**：
+    它按「处理不可信输入」这个角度挑出那几个 Agent，把结论说成一句人能读的话。
+    两层都留着不是冗余 —— 前者挡实现漂移，后者挡「有人按字母序把工具全给上」。
+    """
+    forbidden = {"write_file", "read_file", "list_dir", "glob", "grep", "run_command"}
+    forbidden |= set(WITHHELD_TOOL_NAMES)
     for agent_id in ("librarian", "formalizer", "analyst", "writer"):
         tools = set(specs.by_agent_id(agent_id).tools)
-        assert not tools & {"write_file", "read_file", "run_command", "http_get"}
+        assert not tools & forbidden, f"{agent_id} 拿到了 {sorted(tools & forbidden)}"
+
+
+def test_withheld_tools_are_absent_everywhere():
+    """本版**不提供**的工具（``http_get``）不允许出现在任何白名单里。
+
+    D6 的裁定是网络暴露面靠「没有工具」缩小，而不是靠「工具会自觉」。
+    一个躺在白名单里、注册表里却没有的名字，会以「调用时被拒」的形式暴露给模型，
+    读起来像一次偶发故障。
+    """
+    for spec in specs.ALL_AGENT_SPECS:
+        assert not set(spec.tools) & set(WITHHELD_TOOL_NAMES), spec.id
 
 
 def test_every_declared_tool_is_registered():
-    """白名单里写了、注册表里没有 = 调用时必被拒。装配期只告警，所以这里替它把关。"""
-    registry = ToolRegistry()
-    registry.register(RunPipelineTool(runner=lambda *a, **k: [], stage_ids=STAGE_ORDER))
+    """白名单里写了、注册表里没有 = 调用时必被拒。装配期只告警，所以这里替它把关。
+
+    注册表用 ``build_registry`` 构造 —— 也就是生产用的那一个装配函数。
+    测试自己拼一份工具清单的话，「测试绿、生产少一个工具」会一直藏着。
+    """
+    registry = build_registry(
+        runner=lambda *a, **k: [], stage_ids=STAGE_ORDER,
+        policy=SandboxPolicy.from_config("unused"),
+    )
     assert specs.unknown_tools(set(registry.names())) == {}
 
 
 def test_unknown_tools_reports_which_agents_declared_them():
     missing = specs.unknown_tools(set())
-    assert missing == {"run_pipeline": [spec.id for spec in specs.ALL_AGENT_SPECS]}
+    assert missing["run_pipeline"] == [spec.id for spec in specs.ALL_AGENT_SPECS]
+    # 沙箱工具只被 executor 声明，因此「没注册」时的责任人也只有它一个
+    assert missing["run_command"] == [SANDBOX_HOLDER]
+    assert missing["read_file"] == [SANDBOX_HOLDER]
 
 
 def test_run_pipeline_is_allowed_for_every_stage_agent():
@@ -166,12 +213,13 @@ def test_run_pipeline_is_allowed_for_every_stage_agent():
     这八个白名单里**都不含**沙箱与网络工具。
 
     US-405 起会话内核（``kernel``）也在列表里 —— 会话要能推进编排（衔接约定 1），
-    而它同样**不含**沙箱工具：第 6 步加 ``run_command`` 时，只有 ``executor`` 拿得到。
+    而它同样**不含**沙箱工具（US-406 之后仍然如此）。
     """
     assert specs.agents_allowing("run_pipeline") == [
         spec.id for spec in specs.ALL_AGENT_SPECS
     ]
-    assert specs.agents_allowing("run_command") == []
+    assert specs.agents_allowing("run_command") == [SANDBOX_HOLDER]
+    assert specs.agents_allowing("read_file") == [SANDBOX_HOLDER]
     assert "kernel" in specs.agents_allowing("run_pipeline")
 
 

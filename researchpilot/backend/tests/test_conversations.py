@@ -13,6 +13,7 @@ from datetime import datetime
 import pytest
 from fastapi.testclient import TestClient
 
+from app.agent_kernel.tokens import estimate_message_tokens
 from app.main import create_app
 from app.store.dao import conversations as conversations_dao
 from app.store.dao import messages as messages_dao
@@ -184,18 +185,39 @@ def test_append_message_rejects_forged_assistant_role(client):
     assert "role=user" in resp.json()["detail"]
 
 
-def test_detail_reports_messages_and_total_tokens(client):
+def test_detail_reports_messages_and_total_tokens(client, wait_job):
+    """详情要带回消息与 token 合计。
+
+    ⚠️ **这条测试曾经是不确定的**，2026-09-21 发现并修掉：US-405 起每条用户消息都会
+    受理一次 ``kind=chat`` 内核运行，助手回复由 worker 线程**异步**落库。原先断言
+    ``[m["content"] ...] == ["第一句", "第二句"]``，等价于「助手回复还没写进来」——
+    那测的是两个线程谁先跑到。实测重复 5 次有 2 次红。
+
+    随机红/绿的断言比没有断言更糟：它会教人忽略红色。现在先等到终态再断言，
+    也不再假设回复与用户消息的**交错**顺序（单 worker 保证互不穿插，但不保证
+    用户的第二条一定排在助手第一条回复之后）。
+    """
     project = client.post("/api/projects", json={"title": "P"}).json()
     conversation = client.post(
         "/api/conversations", json={"project_id": project["id"]},
     ).json()
+
+    job_ids = []
     for text in ("第一句", "第二句"):
-        client.post(
+        resp = client.post(
             f"/api/conversations/{conversation['id']}/messages", json={"content": text},
         )
+        assert resp.status_code == 202, resp.text
+        job_ids.append(resp.json()["job_id"])
+    for job_id in job_ids:
+        assert wait_job(client, job_id)["status"] == "succeeded"
 
     detail = client.get(f"/api/conversations/{conversation['id']}").json()
-    assert [m["content"] for m in detail["messages"]] == ["第一句", "第二句"]
+    roles = [m["role"] for m in detail["messages"]]
+    assert roles.count("user") == 2 and roles.count("assistant") == 2
+    assert [
+        m["content"] for m in detail["messages"] if m["role"] == "user"
+    ] == ["第一句", "第二句"]
     assert detail["total_tokens"] == sum(m["tokens"] for m in detail["messages"])
 
 
@@ -257,17 +279,26 @@ def test_patch_can_archive_and_reactivate(client):
     ).status_code == 400
 
 
-def test_context_preview_exposes_the_trimming_ledger(client):
-    """把「裁了什么」摆到接口上：只写进日志的裁剪，裁错了也没人会发现。"""
+def test_context_preview_exposes_the_trimming_ledger(client, session):
+    """把「裁了什么」摆到接口上：只写进日志的裁剪，裁错了也没人会发现。
+
+    ⚠️ 前提用 DAO **直接落库**，不走 ``POST /messages``。后者每条都会受理一次
+    ``kind=chat`` 内核运行，助手回复异步落库 —— 那样这条测试就变成在赌
+    「GET 会不会先于 worker 跑到」（实测：刚 POST 完是 6 条，3 秒后是 12 条）。
+    ``kept_turns``/``collapsed_turns`` 是从消息条数算出来的，多一条就全错，
+    而它错的时候看起来像「裁剪逻辑坏了」。
+    """
     project = client.post("/api/projects", json={"title": "P"}).json()
     conversation = client.post(
         "/api/conversations", json={"project_id": project["id"]},
     ).json()
     for index in range(6):
-        client.post(
-            f"/api/conversations/{conversation['id']}/messages",
-            json={"content": f"第{index}轮：请分析这个问题"},
+        content = f"第{index}轮：请分析这个问题"
+        messages_dao.create(
+            session, conversation_id=conversation["id"], role="user",
+            content=content, tokens=estimate_message_tokens("user", content),
         )
+    session.commit()
 
     preview = client.get(
         f"/api/conversations/{conversation['id']}/context?budget_tokens=4000&recent_turns=2",

@@ -60,6 +60,16 @@ class ToolSpec:
     idempotent: bool = True
     timeout_s: float = 30.0
     result_max_bytes: int = DEFAULT_RESULT_MAX_BYTES
+    #: ``execute`` 类工具的**审批记忆作用域**参数名（D5）。
+    #:
+    #: 填了它，「批准一次」只对该参数值生效（例如某个目录）；留空则记忆粒度是整个工具。
+    #: 当前**没有任何工具填它** —— 唯一的 execute 工具 ``run_pipeline`` 没有目录语义，
+    #: 给它硬造一个只会变成没人消费的字段。第 9 步加进有目录语义的 execute 工具时，
+    #: 这里填上参数名即可生效，``permissions.authorize`` 不需要改。
+    #:
+    #: ⚠️ 它**不进** ``to_tool_definition()``：那是给模型的协议字段，多一个键会让部分
+    #: 端点直接 400，而它本来就是给闸门看的、不是给模型看的。
+    scope_arg: str | None = None
 
     def __post_init__(self) -> None:
         name = self.name.strip()

@@ -40,3 +40,15 @@ def decide(session: Session, approval_id: int, status: str) -> Approval | None:
     row.decided_at = datetime.now(UTC)  # 补记审批时间，此前一直为 NULL
     session.flush()
     return row
+
+
+def list_for_run(session: Session, run_id: int, status: str | None = None) -> list[Approval]:
+    """某个 run 名下的审批单（可按状态过滤）。
+
+    ``run_id`` 是这里的关键：同一个项目随时可能挂着好几张待批单
+    （预算熔断、危险操作各一张），按 ``project_id`` 查会答错「这次暂停是为了什么」。
+    """
+    stmt = select(Approval).where(Approval.run_id == run_id).order_by(Approval.id)
+    if status is not None:
+        stmt = stmt.where(Approval.status == status)
+    return list(session.scalars(stmt).all())

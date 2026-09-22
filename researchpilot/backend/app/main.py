@@ -8,8 +8,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.agent_kernel import context as kernel_context
 from app.agent_kernel import specs as kernel_specs
 from app.agent_kernel.loop import KernelLoop
-from app.agent_kernel.tools.pipeline import RunPipelineTool
-from app.agent_kernel.tools.registry import ToolRegistry
+from app.agent_kernel.sandbox import SandboxPolicy
+from app.agent_kernel.tools.factory import build_registry
 from app.agents.demo_stage import register_all
 from app.ai.budget import BudgetManager
 from app.ai.client import LlmGateway
@@ -69,14 +69,22 @@ async def lifespan(app: FastAPI):
     register_all(registry)
     app.state.orchestrator = Orchestrator(registry, gateway)
 
-    # 内核工具注册表（US-404）。`run_pipeline` 把 S1–S8 确定性编排作为**一个能力**
+    # 内核工具注册表（US-404/406）。`run_pipeline` 把 S1–S8 确定性编排作为**一个能力**
     # 暴露出来（§4.1「S1–S8 确定性编排作为其一种技能」），但调度状态机仍在 Orchestrator
-    # 手里（D1）。编排函数是**注入**的：内核层不 import 编排层（方向是编排 → 内核）。
-    tool_registry = ToolRegistry()
-    tool_registry.register(RunPipelineTool(
+    # 手里（D1）；沙箱工具（US-406）的边界由 `SandboxPolicy` 给出。两者都是**注入**的：
+    # 内核层不 import 编排层（方向是编排 → 内核），也不知道数据目录在哪。
+    #
+    # 装配收口在 `build_registry`：这里少注册一个工具，`unknown_tools` 只会告警，
+    # 而「白名单里有、注册表里没有」会一直藏到调用时才暴露。测试用的是同一个函数。
+    sandbox_policy = SandboxPolicy.from_config(
+        root / "workspace", config.get("sandbox") or {},
+    )
+    app.state.sandbox_policy = sandbox_policy
+    tool_registry = build_registry(
         runner=app.state.orchestrator.run_pipeline,
         stage_ids=STAGE_ORDER,
-    ))
+        policy=sandbox_policy,
+    )
     app.state.tool_registry = tool_registry
     # 白名单里写了、注册表里没有的工具：**加载期只告警**（与 Router.from_config 同一条
     # 约定 —— 阶段二某个工具还没实现，不该让整个应用起不来）。

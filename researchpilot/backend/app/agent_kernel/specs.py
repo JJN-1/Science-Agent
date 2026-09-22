@@ -10,12 +10,12 @@
 | `requires_critic` / `human_checkpoint` | ✅ 声明 | 阶段二（Critic 接线）与第 6 步（中断点） |
 | `reads` / `writes` | ✅ 声明 | 第 6 步（黑板对象类型权限） |
 
-⚠️ **``tools`` 的价值主要是否向断言**。今天八个阶段 Agent 的白名单里都只有
-``run_pipeline``（编排模板的每一步都要它），看起来像「全放行」；但 §5.3 的
-权限最小化原则说的是**哪些工具不在里面** —— 处理文献内容的 Agent 不持有文件写权限、
-不持有网络工具、不持有密钥。第 6 步加进 ``run_command`` / ``read_file`` 时，
-只有 ``executor`` 能拿到，其余七个的白名单必须**仍然不含**它们（有测试钉住）。
-把白名单做成「正向列举」而不是「不做」，意义就在这里。
+⚠️ **``tools`` 的价值主要是否向断言**（US-406 之后尤其明显）。八个阶段 Agent 里
+只有 ``executor`` 的白名单里多了沙箱工具，其余七个**仍然只有** ``run_pipeline`` ——
+看起来像「全放行」，但 §5.3 权限最小化说的正是**哪些工具不在里面**：
+处理文献内容的 Agent 不持有文件写权限、不持有网络工具、不持有密钥。
+把白名单做成「正向列举」而不是「不做」，意义就在这里：漏给某个 Agent 一条，
+测试会红，而不是等到一次注入把命令执行权交出去才发现。
 """
 
 from __future__ import annotations
@@ -24,6 +24,13 @@ from dataclasses import dataclass
 from typing import Any
 
 from app.agent_kernel.errors import KernelError
+from app.agent_kernel.tools.factory import SANDBOX_TOOL_NAMES
+
+#: 沙箱工具在白名单里的名字。**从工具装配点取而不是在这里另写一份**：
+#: 白名单是「谁能调什么」，而「有什么」的答案在 ``tools/factory.py``。
+#: 两处各写一份的漂移表现是「白名单里写了一个不存在于注册表的工具」——
+#: 装配期只告警（``unknown_tools``），于是它到调用时才变成一次被拒的调用。
+SANDBOX_TOOLS: tuple[str, ...] = SANDBOX_TOOL_NAMES
 
 #: 中断点时机（§6.5 按风险分级）。字段取值与设计 §5.3 的 Literal 一致。
 CHECKPOINT_NONE = "none"          # 自动通过，事后可审
@@ -122,8 +129,16 @@ STAGE_AGENT_SPECS: tuple[AgentSpec, ...] = (
     ),
     AgentSpec(
         id="executor", stage="S5", tier="extract",
-        # 第 6 步会把沙箱里的读写与 run_command 只挂到这一个 Agent 上（§5.3 权限最小化）
-        tools=("run_pipeline",),
+        # ⚠️ **唯一持有沙箱工具的 Agent**（US-406，§5.3 权限最小化）。
+        #
+        # 为什么只有它：S5 是整条链上唯一需要「真的动文件、真的跑命令」的阶段 ——
+        # 前四个阶段的产物都是文本与结构化对象（写黑板），后三个阶段是解读与成稿。
+        # 把 `run_command` 给 `librarian`，就等于让「读文献」这条路径能执行任意命令；
+        # 而那正是提示注入最想要的落点（文献内容本身是不可信输入）。
+        #
+        # 这份清单的**负向部分才是重点**：其余七个阶段与会话内核的白名单里都必须
+        # 仍然不含它们，有测试逐条钉住（`test_sandbox_tools_are_hold_only_by_executor`）。
+        tools=(*SANDBOX_TOOLS, "run_pipeline"),
         reads=("experiment_plan",),
         writes=("execution_result", "artifact"),
         # 高：**真实执行实验**有真实副作用与真实开销
@@ -158,8 +173,8 @@ STAGE_AGENT_SPECS: tuple[AgentSpec, ...] = (
 #: 它是「用户在一个会话里说话、内核回应」这条路径上的执行者，与 S1–S8 的领域 Agent
 #: 是两回事 —— 后者有阶段产物与阶段档位，前者只有对话与工具调用。
 #:
-#: 工具面**刻意最小**。第 6 步把沙箱读写与 ``run_command`` 只挂到 ``executor`` 上，
-#: 届时会话要动用它们必须**显式声明** ``agent_id=executor`` ——「默认最严、提权要写明」
+#: 工具面**刻意最小**。沙箱读写与 ``run_command`` 只挂在 ``executor`` 上（US-406），
+#: 会话要动用它们必须**显式声明** ``agent_id=executor`` ——「默认最严、提权要写明」
 #: 正是 §5.3 的最小权限原则。反过来的默认（会话默认拿全部工具）会让「我只是问了个问题」
 #: 也能触发一次真实的命令执行。
 #:

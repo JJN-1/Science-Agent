@@ -18,13 +18,16 @@ from typing import Any
 from sqlalchemy.orm import Session
 
 from app.agent_kernel import context as kernel_context
+from app.agent_kernel import permissions as kernel_permissions
 from app.agent_kernel import planner
 from app.agent_kernel import specs as kernel_specs
 from app.agent_kernel.loop import KernelRun
+from app.agent_kernel.permissions import ApprovalRequired, PendingCall
 from app.agent_kernel.tokens import estimate_message_tokens
 from app.ai.base import ToolArgumentsError, ToolCall
 from app.ai.budget import BudgetExceeded
-from app.jobs.events import STAGE_PAUSED, emit
+from app.jobs.events import APPROVAL_REQUIRED, STAGE_PAUSED, emit
+from app.store.dao import app_config as app_config_dao
 from app.store.dao import approvals as approvals_dao
 from app.store.dao import checkpoints as checkpoint_dao
 from app.store.dao import conversations as conversations_dao
@@ -42,10 +45,16 @@ EXECUTABLE_PLAN_STATUSES = ("approved", "executing")
 
 @dataclass
 class ChatRun:
-    """一次会话内核运行的装配结果：坐标 + 已经接好库的 store。"""
+    """一次会话内核运行的装配结果：坐标 + 已经接好库的 store + 生效的 Agent 契约。
+
+    ``agent_spec`` 与 ``spec``（``KernelRun``）是两回事，别混：前者是 **Agent 契约**
+    （档位、白名单），后者是**这次运行的坐标**。批准后恢复要拿白名单重新校验参数，
+    那时候装配点已经走远了 —— 少了这一份，恢复只能去猜该用谁的白名单。
+    """
 
     spec: KernelRun
     store: SqlKernelStore
+    agent_spec: kernel_specs.AgentSpec
 
     def __iter__(self):
         """让 ``run, store = chat_run(...)`` 这种写法也能用。"""
@@ -146,6 +155,7 @@ class SqlKernelStore:
             result=result,
             error=outcome.error,
             duration_ms=outcome.duration_ms,
+            approval_id=getattr(outcome, "approval_id", None),
         )
 
     def save_plan(self, plan: planner.Plan) -> None:
@@ -186,6 +196,66 @@ class SqlKernelStore:
             emit(self.session, self.job_id, event_type, payload)
         except Exception:  # noqa: BLE001 —— 发事件失败不该盖掉真正的失败原因
             self.session.rollback()
+
+    def approval_grants(self) -> set[str]:
+        """已生效的审批记忆键（US-406 / D5）。
+
+        存在 ``app_config`` 而不是进程内存里，是为了跨重启有效：只记内存的话，
+        用户昨天批准过的动作今天会再要一遍批准，而「刚批过又要批」正是审批疲劳的
+        来源 —— 疲劳之后，人会在不看内容的情况下点同意。
+        """
+        stored = app_config_dao.get_prefix(self.session, kernel_permissions.GRANT_PREFIX)
+        # ``get_prefix`` 返回的是**去掉前缀**的键，这里补回去：闸门比较的是完整键，
+        # 少补这一步，集合里每一个都不命中，表现为「批准了但下次还要批」。
+        return {f"{kernel_permissions.GRANT_PREFIX}{name}" for name in stored}
+
+    def pause_for_approval(self, exc: ApprovalRequired) -> None:
+        """需要人工批准 → 暂停 + 审批单（US-406 / D4：复用 approvals 表，kind=dangerous）。
+
+        与 ``pause_for_budget`` 逐项对齐：run 置 paused、开一张审批单、存现场、发事件。
+        内核另做一套的话，用户会在同一个界面上看到两种形状的审批卡。
+
+        ``detail`` 里同时带 ``pending``（要批的）与 ``round``（整轮全部）：
+        后者是**恢复时的执行清单** —— 挂起的是一整轮，只重放需要批准的那几条，
+        assistant 那条消息里的 ``tool_calls`` 就永远配不齐结果。
+        """
+        runs_dao.finish_run(self.session, run_id=self.run_id, status="paused")
+        row = approvals_dao.create(
+            self.session, project_id=self.project_id,
+            kind=kernel_permissions.APPROVAL_KIND_DANGEROUS, run_id=self.run_id,
+            detail={
+                "source": "tool_permission",
+                "stage_id": self.stage_id,
+                "agent_id": self.agent_id,
+                "conversation_id": self.conversation_id,
+                **exc.detail(),
+            },
+        )
+        # 先 flush 拿到 ``id``：approval.required 事件要带上它，界面才能把
+        # 「这条待批准」直接指到审批单上；不带的话前端只能按 (run_id, kind) 反查，
+        # 而同一个 run 前后可能暂停过不止一次。
+        self.session.flush()
+        approval_id = row.id
+        checkpoint_dao.save_checkpoint(
+            self.session, project_id=self.project_id, stage_id=self.stage_id,
+            status="paused",
+            snapshot={
+                "stage_id": self.stage_id, "run_id": self.run_id,
+                "conversation_id": self.conversation_id,
+                "reason": "tool_permission", "approval_id": approval_id,
+            },
+        )
+        self.session.commit()
+        self.emit(STAGE_PAUSED, {
+            "run_id": self.run_id, "reason": "tool_permission",
+            "conversation_id": self.conversation_id, "approval_id": approval_id,
+        })
+        self.emit(APPROVAL_REQUIRED, {
+            "run_id": self.run_id, "approval_id": approval_id,
+            "conversation_id": self.conversation_id,
+            "reason": exc.reason,
+            "pending": [call.to_dict() for call in exc.pending],
+        })
 
     def pause_for_budget(self, exc: BudgetExceeded, *, suggested_grant: float) -> None:
         """预算熔断 → 暂停 + 审批单（§8.5 的既有语义，内核复用而不是另起一套，D4）。
@@ -267,6 +337,7 @@ def open_chat_run(
             job_id=job_id, goal=goal,
         ),
         store=store,
+        agent_spec=spec,
     )
 
 
@@ -289,6 +360,10 @@ def run_chat_job(
     缺 ``conversation_id`` **直接抛错**：猜一个会话比报错危险得多 ——
     用户会看到另一个会话里凭空多出一轮对话。
 
+    **``approve_calls`` 是「批准后恢复」的入口（US-406）**：审批 + 执行
+    不在 HTTP 请求里同步做完，而是回到这条已验证过的作业通道上 ——
+    SSE 断线续传、取消、僵尸作业自愈都已经在这里跑过一遍，另开一条会分裂语义。
+
     这里不吞任何异常：作业层的兜底负责把失败落成 ``job.failed``，
     而内核错误的码写在 ``str(exc)`` 里，一路带到事件与 ``agent_runs.error``。
     """
@@ -303,5 +378,42 @@ def run_chat_job(
         agent_id=params.get("agent_id"),
         goal=str(params.get("goal") or ""),
     )
-    loop.run(session, run=chat.spec, store=chat.store)
+
+    approved = params.get("approve_calls") or []
+    if approved:
+        # 只有**拿到内容**才恢复。空列表是「这次没有要重放的调用」，与
+        # 「恢复了但一条都没执行」在审计里必须长得不一样。
+        _replay_approved_calls(
+            loop, session, chat, approved,
+            approval_id=params.get("approval_id"),
+        )
+
+    # ⚠️ ``spec=chat.agent_spec`` 必须显式传。不传的话 ``run`` 回落到 ``loop.spec``
+    # （装配时绑的 ``CONVERSATION_SPEC``），于是**同一个 run 里出现两份契约**：
+    # 重放那一轮按 ``agent_id`` 解析出的白名单执行，续跑那一轮按会话内核的白名单判定。
+    # 表现为「明明提权到 executor 了，下一步却说自己不允许读文件」——
+    # 而且 ``agent_runs.agent_id`` 写的是 executor，审计上看起来权限一直都在。
+    loop.run(session, run=chat.spec, store=chat.store, spec=chat.agent_spec)
     return chat.spec.run_id
+
+
+def _replay_approved_calls(
+    loop: Any,
+    session: Session,
+    chat: ChatRun,
+    approved: list[dict[str, Any]],
+    *,
+    approval_id: int | None,
+) -> None:
+    """重放人工批准的那一轮调用，并把结果写回对话（US-406）。
+
+    先把它 `commit` 再让循环接管：``loop.run`` 会另起一轮去模型那边，
+    而它读的是**数据库里**的历史 —— 没提交的话，模型这一轮看到的上下文里
+    没有刚执行出来的工具结果，于是会把同一件事再做一遍。
+    """
+    round_calls = tuple(PendingCall.from_dict(item) for item in approved)
+    loop.execute_approved(
+        session, run=chat.spec, store=chat.store, round_calls=round_calls,
+        spec=chat.agent_spec, approval_id=approval_id,
+    )
+    session.commit()

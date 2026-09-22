@@ -27,3 +27,18 @@ def list_tools(request: Request):
         {**row, "allowed_agents": kernel_specs.agents_allowing(row["name"])}
         for row in registry.describe()
     ]
+
+
+@router.get("/api/sandbox")
+def sandbox(request: Request) -> dict:
+    """沙箱能力与边界（US-406）。**两张清单一起返回**。
+
+    ``enforced`` 与 ``not_implemented`` 成对出现，是 D6 的直接要求：含糊地声称
+    「有沙箱」比明确说「这几条还没做」危险得多 —— 用户会据此把真实实验交给它跑。
+    只报能力不报边界，这个接口就成了一张宣传单；只报边界不报能力，用户又无从知道
+    哪些防护是可以依赖的。
+    """
+    policy = getattr(request.app.state, "sandbox_policy", None)
+    if policy is None:
+        raise HTTPException(status_code=503, detail="沙箱策略尚未装配")
+    return policy.describe()

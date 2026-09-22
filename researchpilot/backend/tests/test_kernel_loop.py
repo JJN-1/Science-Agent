@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import threading
 import time
+from typing import Any
 
 import pytest
 
@@ -22,6 +23,7 @@ from app.agent_kernel import loop as kernel_loop
 from app.agent_kernel import planner
 from app.agent_kernel.errors import LoopLimitError, StepFailureError
 from app.agent_kernel.loop import KernelLoop, KernelRun
+from app.agent_kernel.permissions import grant_key
 from app.agent_kernel.specs import AgentSpec
 from app.agent_kernel.tools.base import (
     EXECUTE,
@@ -56,6 +58,11 @@ class FakeStore:
         self.run_status: list[tuple[str, str | None]] = []
         self.saved_plans: list[planner.Plan] = []
         self.paused: tuple[BudgetExceeded, float] | None = None
+        #: 已生效的审批记忆键（US-406）。默认空 —— 也就是「什么都没批过」，
+        #: 这正是权限测试最想要的那个初值。
+        self.grants: set[str] = set()
+        #: 因需人工批准而挂起的那些（US-406）
+        self.approvals: list[Any] = []
 
     def history(self):
         return list(self.messages)
@@ -87,6 +94,12 @@ class FakeStore:
 
     def pause_for_budget(self, exc, *, suggested_grant):
         self.paused = (exc, suggested_grant)
+
+    def approval_grants(self):
+        return set(self.grants)
+
+    def pause_for_approval(self, exc):
+        self.approvals.append(exc)
 
     # 断言辅助
     def event_types(self) -> list[str]:
@@ -807,6 +820,10 @@ def test_every_step_shows_up_in_the_event_stream():
     echo = ProbeTool("echo", EXECUTE)
     gateway = FakeGateway([reply(calls=[("c1", "echo", '{"a":1}')]), reply(text="收工")])
     store = FakeStore(plan=_plan(planner.PlanStep("s1", "第一步", tool="echo")))
+    # US-406 起 ``execute`` 档要**首次人工批准**。这里给一条已生效的审批记忆，
+    # 让这条测试继续只回答「事件的顺序与内容」这一个问题；
+    # 「没批就挂起」由 test_permissions / test_approval_flow 专门覆盖。
+    store.grants = {grant_key("echo")}
     make_loop(echo, gateway=gateway).run(_Session(), run=RUN, store=store)
 
     types = store.event_types()

@@ -53,7 +53,7 @@ import contextlib
 import dataclasses
 import hashlib
 import json
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Collection, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
@@ -61,6 +61,12 @@ import anyio
 
 from app.agent_kernel import context as kernel_context
 from app.agent_kernel.errors import KernelError, LoopLimitError, StepFailureError, ToolError
+from app.agent_kernel.permissions import (
+    ApprovalRequired,
+    PendingCall,
+    authorize,
+    scope_of,
+)
 from app.agent_kernel.planner import PLAN_EXECUTE, REACT, Plan, PlanStep
 from app.agent_kernel.specs import CONVERSATION_SPEC, AgentSpec
 from app.agent_kernel.tools.base import READ, ToolContext, ToolResult
@@ -93,6 +99,9 @@ EVENT_LLM_START = "llm.start"
 EVENT_STAGE_START = "stage.start"
 EVENT_STAGE_SUCCEEDED = "stage.succeeded"
 EVENT_STAGE_FAILED = "stage.failed"
+# 危险操作待批准（US-406）。界面上它**必须**与「模型在思考」区分开：
+# 这条事件出来之后内核就停住了，在等人；没有它，用户看到的是「卡住不动」。
+EVENT_APPROVAL_REQUIRED = "approval.required"
 
 #: 未注册 / 不在白名单 / 参数不合 schema 时给模型的回执提示。
 #: 这三个都是**模型能自己修的问题**（换个工具或换组参数），所以把话说全。
@@ -161,6 +170,10 @@ class CallOutcome:
     error: str = ""
     duration_ms: int = 0
     truncated: bool = False
+    #: 本次调用是「人工批准之后」才执行的（US-406）。落进 ``tool_calls.approval_id``，
+    #: 让「这条命令是谁批的」在审计表里有一条可查的边 —— 只记在事件流里的话，
+    #: 事后要回答这个问题就得把事件翻一遍再在内存里关联。
+    approval_id: int | None = None
 
     @property
     def key(self) -> tuple[str, str]:
@@ -236,6 +249,17 @@ class KernelStore(Protocol):
 
     def emit(self, event_type: str, payload: dict[str, Any]) -> None:
         """写一条作业事件（立即提交，SSE 读端才看得见）。"""
+
+    def approval_grants(self) -> Collection[str]:
+        """已生效的审批记忆键（``app_config`` 里的 ``tool_grant:*``，D5）。
+
+        由 store 提供而不是让闸门去查库：``authorize`` 保持纯函数，
+        判定就能脱库逐档断言 —— 而「哪些动作需要批准」恰恰是最该被钉死、
+        又最不该依赖数据库状态的东西。
+        """
+
+    def pause_for_approval(self, exc: ApprovalRequired) -> None:
+        """需要人工批准 → 暂停 + 审批单（D4：复用 approvals 表，``kind=dangerous``）。"""
 
     def pause_for_budget(self, exc: BudgetExceeded, *, suggested_grant: float) -> None:
         """预算熔断 → 暂停 + 审批单（复用既有语义，见 D4）。"""
@@ -338,6 +362,21 @@ class KernelLoop:
                 store.set_plan_status("approved")
             store.pause_for_budget(exc, suggested_grant=_suggested_grant(self.gateway, exc))
             outcome.status, outcome.reason = "paused", str(exc)
+            return outcome
+        except ApprovalRequired as exc:
+            # 与预算熔断同一档：**它不是失败**。人还没看到审批单（甚至还没机会看），
+            # 落成 failed 会让「等待批准」在界面上表现为「跑挂了」，
+            # 而用户的第一反应是重试 —— 于是又开一张审批单。
+            #
+            # ⚠️ 这个分支必须排在 ``except Exception`` 前面。``ApprovalRequired``
+            # 刻意**不继承** ``KernelError``（见 permissions.py），就是不让下面那条
+            # 「一切内核错误都是失败」的兜底把它顺手吞掉；但它是 ``Exception``，
+            # 顺序写反了照样会被兜住。
+            if mutable is not None:
+                store.save_plan(mutable.plan)
+                store.set_plan_status("approved")
+            store.pause_for_approval(exc)
+            outcome.status, outcome.reason = "paused", exc.reason
             return outcome
         except Exception as exc:  # noqa: BLE001 —— 现场先落库，再让异常继续往上走
             if mutable is not None:
@@ -577,8 +616,16 @@ class KernelLoop:
         spec: AgentSpec,
         parallel: bool,
     ) -> list[CallOutcome]:
-        """执行同一轮的多个调用，**结果按调用序返回**。"""
-        prepared = [self._prepare(call) for call in calls]
+        """执行同一轮的多个调用，**结果按调用序返回**。
+
+        ⚠️ **整轮要么都执行、要么都不执行**。闸门（``_gate``）跑在发出任何
+        ``tool.call`` 之前：只要有一个调用需要人工批准，本轮就整体挂起，
+        一个副作用都不产生。这不是洁癖 —— assistant 那条消息里的 ``tool_calls``
+        是一个整体，只回填一半会让下一轮请求里出现「有调用没有结果」的配对，
+        端点会直接拒收整条请求。恢复时整轮重放，因此也不会出现「同一次调用跑两遍」。
+        """
+        prepared = [self._prepare(call, spec=spec) for call in calls]
+        self._gate(store, prepared)
 
         # 先把全部 ``tool.call`` 发出去：界面上「发起了 N 个调用」应当先于第一个结果
         # 出现，否则用户在慢工具上只会看到一片空白。
@@ -588,7 +635,58 @@ class KernelLoop:
                 "args": item.args, "permission": item.permission,
                 "raw_arguments": item.call.arguments,
             })
+        return self._run_batch(session, run=run, store=store, prepared=prepared,
+                               spec=spec, parallel=parallel)
 
+    def _gate(self, store: KernelStore, prepared: Sequence[CallOutcome]) -> None:
+        """权限闸门（US-406 / §10.1）：判定要批就把整轮挂起。
+
+        判据取**工具的静态** ``permission``（D5），不看模型说了什么 —— 让模型自称
+        「这次是只读的」等于没有分级，而一个被注入污染的模型会立刻这样自称。
+
+        ``granted`` 一次性从 store 取好再逐条判：每条各查一次库会在同一轮里问出
+        同一份数据 N 遍，且两遍之间可能因为一次批准而不同 —— 那会让同一轮的
+        N 个调用各自基于不同的世界状态被判定。
+        """
+        granted = store.approval_grants()
+        round_calls: list[PendingCall] = []
+        needs_approval = False
+        for item in prepared:
+            call_id = item.call.id or ""
+            if item.status != "ok":
+                # 已确定要被拒的（未注册 / 白名单外 / 参数坏）：它不会执行，也不需要批准。
+                # 但它仍属于本轮 —— 一并带上，恢复时走同一条通道被拒并回填理由，
+                # 否则那一轮的助手的 tool_calls 配对就永远差一条。
+                round_calls.append(PendingCall(
+                    call_id=call_id, tool_name=item.call.name, args=dict(item.args),
+                    permission=item.permission, reason=item.error, needs_approval=False,
+                ))
+                continue
+            spec = self.tools.get(item.call.name).spec
+            decision = authorize(
+                item.permission, tool_name=item.call.name, granted=granted,
+                scope=scope_of(item.args, spec.scope_arg),
+            )
+            round_calls.append(PendingCall(
+                call_id=call_id, tool_name=item.call.name, args=dict(item.args),
+                permission=item.permission, reason=decision.reason,
+                grant_key=decision.grant_key, needs_approval=decision.needs_approval,
+            ))
+            needs_approval = needs_approval or decision.needs_approval
+        if needs_approval:
+            raise ApprovalRequired(tuple(round_calls))
+
+    def _run_batch(
+        self,
+        session: Any,
+        *,
+        run: KernelRun,
+        store: KernelStore,
+        prepared: list[CallOutcome],
+        spec: AgentSpec,
+        parallel: bool,
+    ) -> list[CallOutcome]:
+        """真正执行一批已通过闸门的调用，发 ``tool.result``，返回同一批对象。"""
         runnable = [item for item in prepared if item.status == "ok"]
         use_parallel = (
             parallel
@@ -614,11 +712,66 @@ class KernelLoop:
             })
         return prepared
 
-    def _prepare(self, call: ToolCall) -> CallOutcome:
-        """解析参数并取权限等级。**解析失败不静默当空参数**（US-409 的约定）。
+    def execute_approved(
+        self,
+        session: Any,
+        *,
+        run: KernelRun,
+        store: KernelStore,
+        round_calls: Sequence[PendingCall],
+        spec: AgentSpec,
+        approval_id: int | None = None,
+    ) -> list[CallOutcome]:
+        """执行一轮**已获人工批准**的调用，并把结果写回对话（US-406）。
+
+        恢复的语义是「重放这一轮」，不是「重跑这个作业」：计划与消息都还在库里，
+        提示词不必重新拼，模型也不必重新问一次 —— 人批准的是**这一次调用**，
+        重问一次模型很可能给出另一组调用，那样批准的对象就悄悄换了。
+
+        ⚠️ 这里**不再过闸门**。已经批过了；再过一次只会因为「``dangerous`` 没有记忆」
+        而立刻再挂起，形成「批准 → 又要求批准」的死循环。但**参数仍重新校验**：
+        从挂起到批准之间可能过了几小时，工具的 schema 或白名单都可能已经变了。
+        """
+        prepared: list[CallOutcome] = []
+        for pending in round_calls:
+            call = ToolCall(
+                id=pending.call_id, name=pending.tool_name,
+                arguments=json.dumps(pending.args, ensure_ascii=False, sort_keys=True),
+            )
+            item = self._prepare(call, spec=spec)
+            # 只有真的经过人工放行的那些才挂审批单号。同一轮里搭车的只读调用
+            # 不需要批准，把它也记成「人批的」会让审批单看起来批了更多东西。
+            if pending.needs_approval:
+                item.approval_id = approval_id
+            prepared.append(item)
+
+        for item in prepared:
+            store.emit(EVENT_TOOL_CALL, {
+                "call_id": item.call.id, "tool": item.call.name,
+                "args": item.args, "permission": item.permission,
+                "raw_arguments": item.call.arguments,
+                "approved": True, "approval_id": item.approval_id,
+            })
+        executed = self._run_batch(session, run=run, store=store, prepared=prepared,
+                                   spec=spec, parallel=False)
+        for item in executed:
+            # 与 ``_loop`` 里的收尾逐字一致：回填顺序、落库时机都相同，
+            # 让「正常执行」与「批准后执行」在审计表与消息流里长得一样。
+            self._write_tool_result(store, item)
+            store.record_tool_call(item)
+        return executed
+
+    def _prepare(self, call: ToolCall, *, spec: AgentSpec) -> CallOutcome:
+        """解析参数、判白名单、取权限等级。**解析失败不静默当空参数**（US-409 的约定）。
 
         把「参数看不懂」当成「这次调用没有参数」，工具会带着默认行为跑起来 ——
         用户看到的是「工具执行成功了」，而它执行的是一件与模型意图不同的事。
+
+        ⚠️ **白名单也在准备阶段判，而不是留到 ``_invoke``**。它与「未注册 / 参数坏」
+        是同一类：**注定被拒的调用不该先惊动人**。留在执行期的话，闸门会为一次
+        必然被拒的调用弹出一张批准卡，人批准了却什么也没发生 —— 而批准卡一旦开始
+        出现「批了也没用」的项，人就会开始不看内容地点同意，审批疲劳就是这么来的。
+        这与 ``registry.invoke`` 里的次序（先白名单、再 schema）也保持一致。
         """
         try:
             permission = self.tools.get(call.name).spec.permission
@@ -626,6 +779,12 @@ class KernelLoop:
             return CallOutcome(
                 call=call, permission=UNKNOWN_PERMISSION, status="rejected", error=str(exc),
             )
+        try:
+            # 复用注册表自己的判定与措辞：两处各写一份白名单逻辑，迟早出现
+            # 「闸门认为可以、执行时被拒」或反之。
+            self.tools.ensure_allowed(call.name, spec.tools)
+        except ToolError as exc:
+            return CallOutcome(call=call, permission=permission, status="rejected", error=str(exc))
         try:
             args = call.parse_arguments()
         except ToolArgumentsError as exc:

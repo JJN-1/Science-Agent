@@ -320,7 +320,7 @@ class ToolSpec:
 | 3 | `feat(US-409)` 工具调用协议层 | ✅ 已完成 | 回归 **308 passed**（+33）；`test_tool_protocol.py` 33 条，做过**变异检查**（去掉 `_request_with` 的字段同步与 `_serialize` 的 tool_calls → 7 条如实失败）；未进熔断的能力不匹配有独立异常类型 |
 | 4 | `feat(US-404)` 工具注册表 | ✅ 已完成 | 回归 **366 passed**（+58）；新增 `test_tool_registry.py` / `test_agent_specs.py` / `test_tools_api.py` / DAO 三例；**变异检查 4/4 转红**（`tmp/mutation_us404.py`）；`tmp/migration_safety.py` 与 `tmp/smoke_sprint4.py`（真实 config.yaml + 真实库副本，脚本已加 US-404 段） |
 | 5 | `feat(US-405)` 内核循环 | ✅ 已完成 | 回归 **407 passed**（+41）；`test_kernel_loop.py` 33 条（不碰数据库：`KernelStore` 协议 + 假件，逐条断言 `tool_choice` 强制、并行峰值、按调用序回填、`(tool, args_hash)` 计数）；**变异检查 4/4 转红**（`tmp/mutation_us405.py`，含未变异对照组自检）；`tmp/migration_safety.py` 新增「新增列」核对（16 张老表 193 行一字不差 / 4 张新表 / `messages.tool_calls` 列齐备 / 幂等）；`tmp/smoke_sprint4.py` 加 US-405 段（真实库副本上跑通 react 与 plan_execute 两条路） |
-| 6 | `feat(US-406)` 权限与沙箱 | ☐ | — |
+| 6 | `feat(US-406)` 权限与沙箱 | ✅ 已完成 | 回归 **500 passed**（US-405 末 407，+93）；新增 `test_permissions.py`(19) / `test_sandbox.py`(25+1skip) / `test_fs_tools.py`(37) / `test_approval_flow.py`(10)；**变异检查 11/11 转红**（`tmp/mutation_us406.py`，含未变异对照组自检）；`tmp/smoke_sprint4.py` 新增 US-406 段（真实 config + 真实库副本：`GET /api/sandbox` 两张清单 / 6 个沙箱工具与权限徽标 / 文件工具写→读哈希一致、越界拦成 `AGENT-SANDBOX-001` / 危险操作整轮挂起→审批单→批准→命令真执行）；`config/default.yaml` 加 `sandbox:` 段；**无新迁移**（head 仍是 `a7d3f8c21b64`） |
 | 7 | `feat(US-407)` 执行控制 | ☐ | — |
 | 8 | `feat` 前端会话界面 | ☐ | — |
 | 9 | `test(US-408)` 内核冒烟 | ☐ | — |
@@ -407,6 +407,47 @@ class ToolSpec:
   `BudgetManager` 按 `agents.budget_steps` 判 Agent 级熔断，缺这一行，会话路径上
   只剩项目级闸门 ——「步数上限」在会话里会静默失效
 
+**第 6 步的九处契约选择**（后续步骤不要改）：
+
+- ⚠️ **`run_chat_job` 必须把 `agent_id` 解析出的契约交给循环**（`spec=chat.agent_spec`）。
+  不传的话 `run()` 回落到 `loop.spec`（启动时绑的 `CONVERSATION_SPEC`），
+  于是**同一个 run 里出现两份契约**：重放那一轮按 `executor` 的白名单执行，续跑那一轮
+  按会话内核的白名单判定。表现为「明明提权到 executor 了，下一步却说自己不许读文件」——
+  而 `agent_runs.agent_id` 写的是 `executor`，审计上看起来权限一直都在。
+  **`agent_id` 一旦被解析出来，它就必须是这次运行唯一的契约来源**（发现于第 6 步）
+- ⚠️ **白名单在「准备阶段」判，不只在执行期判**（`loop._prepare`）。它属于 `_gate` 早已
+  承认的那一类「**注定被拒**」（与未注册 / 参数坏同类）：先弹一张批准卡、人批准之后再告诉
+  他「你本来就没这个权限」，等于让人批准一件不会发生的事 —— 而批准卡一旦混进「批了也没用」
+  的项，人就开始不看内容地点同意。**审批疲劳正是 D5「`dangerous` 不留记忆」要防的那个东西的
+  源头**，不能在别处把它放进来。判定与措辞复用 `registry.ensure_allowed`，不另写一份
+- ⚠️ **整轮挂起、零副作用**：`_gate` 跑在任何 `tool.call` 之前，只要有一条要批，
+  本轮一条都不执行。不是洁癖 —— assistant 消息里的 `tool_calls` 是一个整体，只回填一半会让
+  下一轮出现「有调用没有结果」的配对，端点直接拒收整条请求。`approvals.detail` 因此
+  同时带 `pending`（界面上要看到的待批项）与 `round`（**恢复时的执行清单**，含搭车的只读调用）
+- ⚠️ **恢复 = 重放这一轮，不是重跑这个作业**（`execute_approved`）：不重新问模型 ——
+  重问很可能给出另一组调用，那样「人批准的对象」就悄悄换了；但**参数重新校验**，
+  因为从挂起到批准可能过了几小时，schema 与白名单都可能已经变。
+  ⚠️ 它**不再过闸门**：再过一次会因为 `dangerous` 没有记忆而立刻再挂起，
+  形成「批准 → 又要求批准」的死循环
+- ⚠️ **只有真的经过人工放行的那条调用才挂 `approval_id`**：同一轮搭车的只读调用被记成
+  「人批的」，会让审批单看起来批了更多东西 —— 事后翻审计的人据此高估了放行范围
+- ⚠️ **`SandboxViolation` 继承 `ToolError`，不是 `KernelError`**：后者会被 `_invoke`
+  兜成 `ok=False`，而那条通道的含义是「工具试过但失败了」—— 模型会以为是自己参数写错，
+  于是**反复重试一个它无权访问的路径**。越界是「调用方违规」，副作用为零，走 `rejected`
+- ⚠️ **`enforced` 与 `not_implemented` 必须成对出**（`GET /api/sandbox`，D6）。
+  只报能力 = 宣传单，用户会把真实实验交给它跑；只报边界 = 用户不知道哪些防护可以依赖。
+  本版未做（已在接口里写明）：进程树终止、子进程文件系统隔离、网络（靠「不提供网络工具」
+  而非内核级禁网）、受限令牌 / Job Object / 只读根文件系统
+- ⚠️ **会话路径的预算暂停恢复不能走 `run_stage`**。它的 `stage_id` 是 `chat`，
+  而 `chat` 不是一个注册阶段 —— 走老路会抛「未知阶段」并被兜底吞掉，用户看到的是
+  「批准成功了，但恢复失败」。这是 US-406 之前就存在的窟窿，已一并收掉：
+  会话的恢复回到 `kind=chat` 那条通道上（`_submit_chat_resume`）
+- ⚠️ **「按目录记忆」的机制在，但当前没有工具消费它**（与本节 §5 表格的措辞有落差，
+  以代码为准）：`grant_key` 形如 `tool_grant:<tool>[:<scope>]`，作用域从
+  `ToolSpec.scope_arg` 指名的参数里取；而**现有唯一的 `execute` 工具 `run_pipeline`
+  没有目录参数**，硬给它造一个只会变成没人读的字段。等真正的沙箱执行类工具（有目录语义的
+  `execute`）落地时，`scope_arg` 一填即生效，判定逻辑不必改
+
 
 ## 依赖与约束
 
@@ -422,10 +463,10 @@ class ToolSpec:
 |:--:|---|---|:--:|
 | 1 | 3 工具 × ≥5 步真实任务跑通 | `scripts/kernel_walkthrough.py` + 输出存档 | ☐ |
 | 2 | 全程流式可见 | 上述脚本收集的 `job_events` 序列（含 `tool.call`/`tool.result`） | ☐ |
-| 3 | 危险操作可批准 | `run_command` 触发审批 → 批准 → 继续执行的事件留证 | ☐ |
-| 4 | 预算超限可暂停并恢复 | 复用 S3 的预算熔断路径 + 内核循环下的等价用例 | ⚠️ 内核侧用例已就位（`test_budget_exceeded_pauses_instead_of_failing`、`test_budget_pause_returns_the_plan_to_approved`）；端到端恢复走第 7 步 |
+| 3 | 危险操作可批准 | `run_command` 触发审批 → 批准 → 继续执行的事件留证 | ✅ US-406：`tmp/smoke_sprint4.py` 在真实 config + 真实库副本上跑通整条链（挂起时零副作用 / `job.paused` 的 reason=dangerous / 审批单 kind=dangerous / 批准后命令真执行且 `tool_calls.approval_id` 记着是谁批的 / `dangerous` 不留记忆）；`test_approval_flow.py::test_full_chain_from_suspension_to_a_real_execution` 跨四层不打桩 |
+| 4 | 预算超限可暂停并恢复 | 复用 S3 的预算熔断路径 + 内核循环下的等价用例 | ⚠️ 内核侧用例已就位（`test_budget_exceeded_pauses_instead_of_failing`、`test_budget_pause_returns_the_plan_to_approved`）；US-406 顺带修掉「会话路径的预算暂停被错误地当成阶段重跑」的恢复通路；端到端续跑走第 7 步 |
 | 5 | 中断可恢复 | 取消 → 从 `kernel_checkpoints` 续跑，步骤序号连续 | ☐ |
-| 6 | `GET /api/tools` 返回全部工具及权限等级 | 接口快照 | ☐ |
+| 6 | `GET /api/tools` 返回全部工具及权限等级 | 接口快照 | ✅ US-406：7 个工具（`run_pipeline` + 6 个沙箱工具）各带 `permission` 与 `allowed_agents`；同一份清单另由 `GET /api/sandbox` 给出沙箱的 `enforced` / `not_implemented` 边界。界面上的权限徽标与执行时判定同源（都读运行中的注册表） |
 | 7 | `deterministic` 模式可用 | **同一输入连跑两次，计划与步骤序列逐项相等**（第 9 步落成 golden case，见下方说明） | ☐ |
 | 8 | 上下游不得在界面上混淆「模型声称」与「系统执行」 | 前端 `note` 与 `tool.call` 分卡渲染的截图（D12） | ☐ |
 

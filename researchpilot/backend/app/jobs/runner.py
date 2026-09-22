@@ -18,11 +18,38 @@ from app.jobs.events import (
     emit,
 )
 from app.observability.logging import get_logger
+from app.store.dao import approvals as approvals_dao
 from app.store.dao import jobs as jobs_dao
 from app.store.dao import runs as runs_dao
 from app.store.models import Job
 
 logger = get_logger("jobs.runner")
+
+#: 暂停原因（``job.paused`` 事件的 ``reason``）。前端按它决定弹哪种审批卡。
+PAUSE_BUDGET = "budget"
+#: run 是 paused、但名下找不到待批单时的兜底值。
+#: 宁可显示一个「不知道」，也不要默认成 ``budget`` —— 猜错的话用户会去加预算，
+#: 而真正该做的是去翻一眼审批单。
+PAUSE_UNKNOWN = "unknown"
+
+
+def _pause_reason(session: Session, run_id: int | None, status: str) -> str:
+    """这次暂停是为了什么 —— 从**该 run 名下**那张待批单的 ``kind`` 反推。
+
+    US-406 之后暂停有两种（预算熔断、危险操作待批），而这里的 ``reason`` 曾是写死的
+    ``"budget"``。不修的话，「等你批准执行这条命令」在界面上会显示成「预算熔断」：
+    用户去加预算，而真正要做的是看一眼那条命令。
+
+    按 ``run_id`` 而不是 ``project_id`` 查：同一个项目随时可能挂着好几张单子，
+    按项目查会答错「**这次**暂停是为了什么」。
+    """
+    if status != "paused" or run_id is None:
+        return ""
+    kinds = {row.kind for row in approvals_dao.list_for_run(session, run_id, "pending")}
+    if not kinds:
+        return PAUSE_UNKNOWN
+    return kinds.pop() if len(kinds) == 1 else "+".join(sorted(kinds))
+
 
 
 def _current_loop() -> asyncio.AbstractEventLoop | None:
@@ -233,7 +260,8 @@ class JobRunner:
                 self._settle_failed(session, job_id, exc, run_id,
                                     project_id=project_id, stage_id=stage_id)
                 return
-            self._settle_succeeded(session, job_id, status, run_id)
+            self._settle_succeeded(session, job_id, status, run_id,
+                                   reason=_pause_reason(session, run_id, status))
 
     def process_pending_once(self) -> int | None:
         """同步跑掉队列里的下一个作业，返回 job_id（无待办返回 None）。
@@ -259,15 +287,15 @@ class JobRunner:
         return run.status if run.status in ("succeeded", "paused", "failed") else "succeeded"
 
     def _settle_succeeded(self, session: Session, job_id: int, status: str,
-                          run_id: int | None) -> None:
+                          run_id: int | None, reason: str = "") -> None:
         if status == "paused":
             self._write(
                 session, job_id,
                 lambda: jobs_dao.finish(session, job_id, status="paused", run_id=run_id),
                 JOB_PAUSED,
-                {"status": "paused", "run_id": run_id, "reason": "budget"},
+                {"status": "paused", "run_id": run_id, "reason": reason or PAUSE_BUDGET},
             )
-            logger.info("job_paused", job_id=job_id, run_id=run_id)
+            logger.info("job_paused", job_id=job_id, run_id=run_id, reason=reason)
             return
         self._write(
             session, job_id,

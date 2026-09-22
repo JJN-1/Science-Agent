@@ -93,9 +93,15 @@ def test_startup_seeds_agent_whitelists_from_specs(client, session):
     # 步数/成本闸门会因为查不到 agents 行而静默失效）
     assert len(rows) == 9
     for spec in specs.STAGE_AGENT_SPECS:
-        assert rows[spec.id].tools == ["run_pipeline"]
+        assert rows[spec.id].tools == list(spec.tools), spec.id
         assert rows[spec.id].budget_steps == spec.max_steps
         assert rows[spec.id].budget_cost == spec.max_cost_usd
+    # US-406：``executor`` 白名单里多了沙箱工具，其余七个**仍然只有** run_pipeline。
+    # 两条都要断：只断前者的话，「顺手给所有 Agent 都加上」照样绿。
+    assert set(rows["executor"].tools) > {"run_pipeline"}
+    for spec in specs.STAGE_AGENT_SPECS:
+        if spec.id != "executor":
+            assert rows[spec.id].tools == ["run_pipeline"], spec.id
     kernel = rows[specs.CONVERSATION_SPEC.id]
     assert kernel.tools == list(specs.CONVERSATION_SPEC.tools)
     assert kernel.budget_steps == specs.CONVERSATION_SPEC.max_steps
