@@ -16,6 +16,8 @@ from alembic import command
 from sqlalchemy import inspect, text
 
 from app.store.dao import conversations as conversations_dao
+from app.store.dao import jobs as jobs_dao
+from app.store.dao import kernel_checkpoints as checkpoints_dao
 from app.store.dao import messages as messages_dao
 from app.store.dao import projects as projects_dao
 from app.store.dao import task_plans as task_plans_dao
@@ -317,6 +319,96 @@ def test_sprint4_migration_adds_tool_calls_and_message_column(tmp_path):
             assert rows[-1].tool_call_id == "c1"
             assert tool_calls_dao.get(session, audit_id).args == {"stage_ids": ["S1"]}
             assert tool_calls_dao.count_for_conversation(session, conversation_id) == 1
+        finally:
+            session.close()
+    finally:
+        engine.dispose()
+
+
+# ── migration 8：内核检查点 + 协作式取消的信箱 ──
+
+BEFORE_CHECKPOINTS = "a7d3f8c21b64"
+
+
+def test_sprint4_migration_adds_kernel_checkpoints_and_cancel_column(tmp_path):
+    """migration 8：加 `kernel_checkpoints` 表、给 `jobs` 加 `cancel_requested` 列。
+
+    「加一列 NOT NULL」是这一版最容易在**真实库**上炸的地方：老行没有值可填，
+    ``ALTER TABLE ADD COLUMN`` 会当场失败 —— 而单测若在一个空库上跑，永远看不到。
+    所以这里先塞一行旧作业，升级后再断言它取到了 ``false``。
+
+    另外这一列语义上是「有人请求中止」的信箱，所以顺带钉住：**既有行不该是 True**。
+    迁移给老作业凭空安一个 True，会让升级之后所有在跑的作业立刻自杀。
+    """
+    engine = make_engine(tmp_path / "app.db")
+    try:
+        command.upgrade(alembic_config(engine), BEFORE_CHECKPOINTS)
+        assert "kernel_checkpoints" not in _table_names(engine)
+        assert "cancel_requested" not in {
+            col["name"] for col in inspect(engine).get_columns("jobs")
+        }, "旧版本的 jobs 上不该有 cancel_requested 列"
+
+        project_id = _seed_project(engine, "迁移前")
+        session = make_session_factory(engine)()
+        try:
+            conversation = conversations_dao.create(
+                session, project_id=project_id, title="迁移前的会话",
+            )
+            session.commit()
+            conversation_id, plan_id = conversation.id, None
+        finally:
+            session.close()
+
+        # ⚠️ 这一行作业只能用**裸 SQL** 写。ORM 的 ``Job`` 永远是 head 的形状，
+        # 它会把 ``cancel_requested`` 也塞进 INSERT —— 而旧库上还没有这一列，
+        # 于是报「no column named cancel_requested」。而这篇测试的**全部要点**
+        # 正是「升级前那行老作业，升级后能不能取到 false」。
+        with engine.begin() as conn:
+            conn.execute(
+                text(
+                    "INSERT INTO jobs"
+                    " (project_id, kind, stage_id, status, params, created_at)"
+                    " VALUES (:pid, 'chat', NULL, 'running', '{}', :now)"
+                ),
+                {"pid": project_id, "now": datetime.now(UTC)},
+            )
+            job_id = int(
+                conn.execute(text("SELECT MAX(id) FROM jobs")).scalar_one()
+            )
+
+        before = _row_counts(engine, _table_names(engine))
+
+        upgrade_to_head(engine)
+
+        assert "kernel_checkpoints" in _table_names(engine)
+        assert "cancel_requested" in {
+            col["name"] for col in inspect(engine).get_columns("jobs")
+        }
+        assert _row_counts(engine, before.keys()) == before
+
+        session = make_session_factory(engine)()
+        try:
+            kept = jobs_dao.get(session, job_id)
+            assert kept.cancel_requested is False, "老作业不该被安上「已请求中止」"
+
+            checkpoints_dao.create(
+                session, conversation_id=conversation_id, plan_id=plan_id,
+                step_index=2, status="cancelled",
+                snapshot={"rounds": 3, "next_step_id": "s2"},
+            )
+            session.commit()
+        finally:
+            session.close()
+
+        upgrade_to_head(engine)  # 启动路径的无条件调用
+
+        session = make_session_factory(engine)()
+        try:
+            latest = checkpoints_dao.latest_for_conversation(session, conversation_id)
+            assert latest is not None and latest.status == "cancelled"
+            assert latest.snapshot["next_step_id"] == "s2"
+            assert checkpoints_dao.count_for_conversation(session, conversation_id) == 1
+            assert jobs_dao.get(session, job_id).cancel_requested is False
         finally:
             session.close()
     finally:

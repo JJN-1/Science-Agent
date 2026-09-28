@@ -280,6 +280,10 @@ class Job(Base):
     )
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
     params: Mapped[dict] = mapped_column(JSON, default=dict)
+    #: 协作式取消的信箱（US-407）。正在执行的工作线程无法被安全打断（同步 SQLAlchemy +
+    #: 外部模型调用），所以「取消」只能写成「置一个标记，让循环在下一个安全点自己停下」。
+    #: 只对内核作业（``kind=chat``）有意义 —— 阶段作业是同步编排，没有安全点可插。
+    cancel_requested: Mapped[bool] = mapped_column(default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
     started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
@@ -438,4 +442,40 @@ class ToolCall(Base):
         ForeignKey("approvals.id", ondelete="SET NULL"), nullable=True
     )
     duration_ms: Mapped[int] = mapped_column(Integer, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+
+class KernelCheckpoint(Base):
+    """内核检查点（US-407）：设计 §778 的「计划、步骤序号、快照，支持中断后恢复」。
+
+    与 ``stage_checkpoints`` 是**两种恢复粒度**，刻意分开：
+
+    - ``stage_checkpoints`` 按 ``(project_id, stage_id)``，服务「任一阶段可单独重跑」（§6.4）
+    - 这张按 ``conversation_id``，服务「一次会话跑到一半停下、从原地接着跑」
+
+    塞进同一张表会出现「两条 checkpoint 都叫 S5、不知道该从哪条续」——同一个阶段里
+    先后跑过多次会话是常态。
+
+    ``step_index`` 里是**给人看的序号**（设计原文的「步骤序号」），但**恢复定位不用它**：
+    ``PlanStep.id`` 是稳定标识而不是下标（US-403 的铁律），用下标恢复会在「计划中间插了
+    一步」之后把游标指到另一步上。真正的续跑点写在 ``snapshot["next_step_id"]``。
+
+    ``status`` 是「能不能续跑」的判据：``done`` 之后再点「继续」是重跑，
+    ``cancelled`` / ``paused`` 之后是续跑。不靠「有没有下一条」推断，是因为**暂停与取消
+    都不写终态行** —— 它们本来就要能接着跑。
+    """
+
+    __tablename__ = "kernel_checkpoints"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    conversation_id: Mapped[int] = mapped_column(
+        ForeignKey("conversations.id", ondelete="CASCADE"), index=True
+    )
+    #: ``react`` 模式没有计划，所以可空；计划行消失（会话被删）也不该抹掉「当时跑到哪」
+    plan_id: Mapped[int | None] = mapped_column(
+        ForeignKey("task_plans.id", ondelete="SET NULL"), nullable=True
+    )
+    step_index: Mapped[int] = mapped_column(Integer, default=0)
+    status: Mapped[str] = mapped_column(String(16), index=True)
+    snapshot: Mapped[dict] = mapped_column(JSON, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)

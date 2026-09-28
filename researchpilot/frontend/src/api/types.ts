@@ -184,7 +184,8 @@ export type JobStatus = 'queued' | 'running' | 'succeeded' | 'failed' | 'paused'
 export interface Job {
   id: number
   project_id: number
-  kind: 'stage' | 'pipeline' | string
+  /** ``chat`` 走内核循环（US-405）；它也是唯一支持「中止后从检查点续跑」的一类。 */
+  kind: 'stage' | 'pipeline' | 'chat' | string
   stage_id: string | null
   status: JobStatus | string
   run_id: number | null

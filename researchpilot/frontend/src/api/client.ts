@@ -74,9 +74,29 @@ export const api = {
   listJobs: (projectId: number) => request<Job[]>(`/projects/${projectId}/jobs`),
   getJobEvents: (jobId: number, afterSeq = 0) =>
     request<JobEvent[]>(`/jobs/${jobId}/events?after_seq=${afterSeq}`),
+  /**
+   * 中止作业。两条路，回执形状不同（US-407）：
+   * - 还在排队 → 直接摘掉，`cancelled: true`
+   * - **正在执行的会话作业** → 只受理中止请求（HTTP 202，`stop_requested: true`），
+   *   作业状态稍后才变成 `paused`（`job.paused` 的 `reason=cancelled`）。
+   *   别把 202 当成「已经停了」——线程还在跑，界面应当继续订阅作业流。
+   */
   cancelJob: (jobId: number) =>
-    request<{ job_id: number; status: string; cancelled: boolean }>(
-      `/jobs/${jobId}/cancel`,
+    request<{
+      job_id: number
+      status: string
+      cancelled?: boolean
+      stop_requested?: boolean
+    }>(`/jobs/${jobId}/cancel`, { method: 'POST' }),
+  /**
+   * 从最近的检查点继续跑这个会话（US-407）。
+   *
+   * 不追加用户消息：续跑是「接着上次的地方跑」。不能续时会以 409 抛出原因
+   * （已经跑完 / 没有检查点），调用方直接把 message 显示出来即可。
+   */
+  resumeConversation: (conversationId: number) =>
+    request<{ job_id: number; resume_from: string | null; reason: string }>(
+      `/conversations/${conversationId}/resume`,
       { method: 'POST' },
     ),
   listRuns: (projectId: number) => request<AgentRun[]>(`/projects/${projectId}/runs`),

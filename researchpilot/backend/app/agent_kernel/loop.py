@@ -45,6 +45,24 @@
 
 并行时每个调用**各自借一个 Session**：只读工具不改数据，独立 Session 没有副作用，
 而共享同一个 Session 跨线程使用是未定义行为。
+
+## 四、中止是协作式的，进度靠检查点（US-407）
+
+工作线程无法被安全打断（同步 SQLAlchemy + 外部模型调用，见 ``JobRunner.cancel`` 的同款
+理由）。所以「停止」实现成**信箱 + 安全点**：`POST /cancel` 只往 ``jobs.cancel_requested``
+置一个标记，循环在**每轮开头**读一次，读到就收尾退出。代价是「点停止之后可能还会再跑
+一轮」，收益是不会留下「线程还在写、台账已判死」的错乱状态。
+
+中止与暂停走**同一条出路**（``agent_runs.status = paused``）：两者都是「现在停住，
+之后可以接着跑」。落成 ``failed`` 的话用户唯一的出路是重来，而已经做过的几步就白做了。
+
+每轮结算时落一条检查点（状态、步骤序号、快照），它同时供三件事使用：崩溃后恢复、
+「从第几步继续」、以及「上次为什么停」。**续跑点的判据是 ``PlanStep.id`` 而不是序号**
+（US-403）——判定全部在 ``checkpoints.py`` 里，是纯函数。
+
+⚠️ ``max_steps`` 是**每次运行**的上限，不是每次会话的：续跑会新开一次运行，配额随之重置。
+会话级的累计上限要靠预算（``agent_steps``），所以这里每轮都记一步 ——
+在这之前会话路径一步都不记，``agent_steps`` 闸门形同虚设（阶段作业受限、聊天不受限）。
 """
 
 from __future__ import annotations
@@ -59,6 +77,7 @@ from typing import Any, Protocol
 
 import anyio
 
+from app.agent_kernel import checkpoints as kernel_checkpoints
 from app.agent_kernel import context as kernel_context
 from app.agent_kernel.errors import KernelError, LoopLimitError, StepFailureError, ToolError
 from app.agent_kernel.permissions import (
@@ -212,6 +231,19 @@ def args_hash(args: dict[str, Any]) -> str:
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
 
 
+class _CancelRequested(Exception):  # noqa: N818 —— 它是内部信号，不是错误
+    """「有人按了停止」在循环内部的传递方式（US-407）。
+
+    用异常而不是返回值，是为了让中止能在**任意深度的安全点**把控制权交回 ``run()``：
+    安全点在 ``_loop`` 的循环开头，而中途还隔着 ``_decide`` / ``_execute_batch``
+    好几层。逐层返回一个「我停了」标志，等于把这条判断抄进每个函数签名里。
+
+    它不是 ``KernelError``，也**刻意不是** —— 中止不是失败，不该被
+    ``except Exception`` 那条兜底当成失败落账（与 ``ApprovalRequired`` 同一条理由）。
+    它甚至不该逃出 ``run()``：那里有唯一的处理分支。
+    """
+
+
 class KernelStore(Protocol):
     """循环需要的外部世界。**刻意做成窄接口**：内核核心不 import ``app.store``。
 
@@ -258,11 +290,45 @@ class KernelStore(Protocol):
         又最不该依赖数据库状态的东西。
         """
 
-    def pause_for_approval(self, exc: ApprovalRequired) -> None:
+    def pause_for_approval(
+        self, exc: ApprovalRequired, *, checkpoint: kernel_checkpoints.Checkpoint,
+    ) -> None:
         """需要人工批准 → 暂停 + 审批单（D4：复用 approvals 表，``kind=dangerous``）。"""
 
-    def pause_for_budget(self, exc: BudgetExceeded, *, suggested_grant: float) -> None:
+    def pause_for_budget(
+        self, exc: BudgetExceeded, *, suggested_grant: float,
+        checkpoint: kernel_checkpoints.Checkpoint,
+    ) -> None:
         """预算熔断 → 暂停 + 审批单（复用既有语义，见 D4）。"""
+
+    def pause_for_cancel(self, *, checkpoint: kernel_checkpoints.Checkpoint) -> None:
+        """应人请求中止 → 暂停（**可续跑**）+ 检查点（US-407）。
+
+        与上面两个走同一条出路（``agent_runs.status = paused``）而不是落 ``failed``：
+        中止与失败对用户的下一步动作完全不同 —— 前者是「接着跑」，后者只能重来。
+        它**不开审批单**：中止是人的指令，没有什么需要再批一遍的。
+        """
+
+    def save_checkpoint(self, checkpoint: kernel_checkpoints.Checkpoint) -> None:
+        """落一条内核检查点（US-407）。
+
+        实现**必须提交**：检查点的全部用途都发生在「进程已经没了」之后
+        （崩溃恢复、中断续跑），留在未提交的事务里等于没写。
+        """
+
+    def mark_step(self, kind: str, content: dict[str, Any]) -> None:
+        """记一步（``agent_steps``）。
+
+        会话内核路径此前一步都不记，于是 ``agent_steps`` 这道闸门在会话里形同虚设 ——
+        同一个 Agent，走阶段作业会被限步，走聊天不受限，而且没有任何地方能看出来。
+        """
+
+    def cancel_requested(self) -> bool:
+        """有人请求中止这次运行吗（US-407）。
+
+        由 store 去查而不是循环自己去读 ``jobs``：内核核心不认识作业表，
+        这条分层与「内核不反向依赖 store」是同一条。
+        """
 
 
 # ── 循环 ────────────────────────────────────────
@@ -305,6 +371,7 @@ class KernelLoop:
         store: KernelStore,
         plan: Plan | None = None,
         spec: AgentSpec | None = None,
+        resume: kernel_checkpoints.ResumeDecision | None = None,
     ) -> LoopOutcome:
         """跑一次循环，把 ``agent_runs`` 那一行推到终态后返回。
 
@@ -312,10 +379,25 @@ class KernelLoop:
         复用 Sprint 3 已跑通的「暂停 → 审批 → 恢复」语义（D4）。其余内核错误
         原样上抛，作业层的兜底会落成 ``job.failed``，而 ``KernelError`` 的码就写在
         ``str(exc)`` 最前面（``errors.py`` 的约定），一路带到事件里。
+
+        ``resume``（US-407）是「这条会话该从哪接着跑」的判定结果（``decide_resume``
+        给出的那份）。它**不改变循环怎么跑** —— 计划里各步的状态本来就写在库里，
+        续跑点由 ``checkpoints.next_step_id`` 从计划算得。它带来的是三件别的事：
+        把「这是续跑」说进事件（否则一次续跑与一次全新运行在界面上长得一模一样）、
+        把上次的停因带进 ``outcome.reason``、以及让 ``_MutablePlan`` 直接落到那一步上。
+
+        ⚠️ ``max_steps`` 是**每次运行**的上限，续跑不继承上次已跑的轮数。
+        会话级的累计上限由预算（``agent_steps``）承担 —— 它按 ``agent_runs.steps``
+        累计，而那是每次运行各自的行。把两者混成一个数字，会让「为什么停」变得
+        无法回答（到底是本轮跑太久，还是这个会话总体跑太多）。
         """
         spec = spec or self.spec
         plan = plan if plan is not None else store.plan()
-        mutable = _MutablePlan(plan) if (plan is not None and plan.steps) else None
+        start_at = resume.start_step_id if resume is not None else None
+        mutable = (
+            _MutablePlan(plan, start_at=start_at)
+            if (plan is not None and plan.steps) else None
+        )
 
         if mutable is not None:
             mode, deterministic = mutable.plan.mode, mutable.plan.deterministic
@@ -333,10 +415,16 @@ class KernelLoop:
         outcome = LoopOutcome(
             mode=mode, plan_id=mutable.plan.plan_id if mutable else None,
         )
+        if resume is not None:
+            outcome.reason = f"续跑（{resume.reason or '上次未说明停因'}）"
         store.emit(EVENT_STAGE_START, {
             "run_id": run.run_id, "agent_id": run.agent_id, "stage_id": run.stage_id,
             "conversation_id": run.conversation_id, "mode": mode,
             "deterministic": deterministic, "plan_id": outcome.plan_id,
+            # 界面上「续跑」与「新跑」必须能分辨：一次续跑会把同一批步骤再走一遍，
+            # 不标注的话看起来就像系统自己重复执行了。
+            "resumed": resume is not None,
+            "resume_reason": resume.reason if resume is not None else "",
         })
         if mutable is not None:
             store.set_plan_status("executing")
@@ -346,13 +434,37 @@ class KernelLoop:
                 "steps": mutable.plan.to_steps_payload(),
             })
 
+        # 开跑就落一条检查点。**不能等到第一轮结束再落**：进程在第一次模型调用上
+        # 崩掉（或被杀）的概率一点都不低，而没有检查点就等于「这个会话从没跑过」——
+        # 用户看到的是自己刚发出去的消息石沉大海，连「上次停在哪」都答不上来。
+        #
+        # ``strikes`` 在这里建好、按引用交给 ``_loop``：暂停与中止的检查点要带上它，
+        # 而那些分支在 ``_loop`` 之外，拿不到它内部的变量。
+        strikes: dict[tuple[str, str], int] = {}
+        self._checkpoint(
+            store, run=run, mutable=mutable, outcome=outcome, mode=mode,
+            status=kernel_checkpoints.RUNNING, strikes=strikes, reason="运行已开始",
+        )
         try:
             outcome = self._loop(
                 session, run=run, store=store, mutable=mutable, spec=spec,
                 mode=mode, deterministic=deterministic,
                 max_steps=self.max_steps or spec.max_steps,
-                strikes={}, outcome=outcome,
+                strikes=strikes, outcome=outcome,
             )
+        except _CancelRequested:
+            # 与预算熔断同一档：**它不是失败**。人按了停止，而已经做过的步骤
+            # 全都还在计划里；落成 failed 会把「可以接着跑」变成「只能重来」。
+            if mutable is not None:
+                store.save_plan(mutable.plan)
+                store.set_plan_status("approved")
+            store.pause_for_cancel(checkpoint=self._build_checkpoint(
+                run=run, mutable=mutable, outcome=outcome, mode=mode,
+                status=kernel_checkpoints.CANCELLED, strikes=strikes,
+                reason="已按请求中止，可从检查点续跑",
+            ))
+            outcome.status, outcome.reason = "paused", "已按请求中止，可从检查点续跑"
+            return outcome
         except BudgetExceeded as exc:
             # 计划回到 approved 而不是 failed：它确实还没跑完，而且暂停后没有任何
             # worker 在跑它 —— 留在 executing 会让重规划接口被 ``has_running_plan``
@@ -360,7 +472,13 @@ class KernelLoop:
             if mutable is not None:
                 store.save_plan(mutable.plan)
                 store.set_plan_status("approved")
-            store.pause_for_budget(exc, suggested_grant=_suggested_grant(self.gateway, exc))
+            store.pause_for_budget(
+                exc, suggested_grant=_suggested_grant(self.gateway, exc),
+                checkpoint=self._build_checkpoint(
+                    run=run, mutable=mutable, outcome=outcome, mode=mode,
+                    status=kernel_checkpoints.PAUSED, strikes=strikes, reason=str(exc),
+                ),
+            )
             outcome.status, outcome.reason = "paused", str(exc)
             return outcome
         except ApprovalRequired as exc:
@@ -375,7 +493,13 @@ class KernelLoop:
             if mutable is not None:
                 store.save_plan(mutable.plan)
                 store.set_plan_status("approved")
-            store.pause_for_approval(exc)
+            store.pause_for_approval(
+                exc, checkpoint=self._build_checkpoint(
+                    run=run, mutable=mutable, outcome=outcome, mode=mode,
+                    status=kernel_checkpoints.PAUSED, strikes=strikes,
+                    reason=exc.reason,
+                ),
+            )
             outcome.status, outcome.reason = "paused", exc.reason
             return outcome
         except Exception as exc:  # noqa: BLE001 —— 现场先落库，再让异常继续往上走
@@ -405,6 +529,13 @@ class KernelLoop:
                 "plan_id": outcome.plan_id, "mode": mode, "status": "done",
                 "steps": mutable.plan.to_steps_payload(),
             })
+        # 跑完的检查点必须**落在终态事件之前**（同一条理由）。它是「这条会话已经收口」
+        # 的唯一凭据：少了它，用户点「继续」时系统只能看到最后一条 running，
+        # 于是把一份已经跑完的计划从头再跑一遍。
+        self._checkpoint(
+            store, run=run, mutable=mutable, outcome=outcome, mode=mode,
+            status=kernel_checkpoints.DONE, strikes=strikes, reason="运行结束",
+        )
         store.set_run_status("succeeded")
         store.emit(EVENT_STAGE_SUCCEEDED, {
             "run_id": run.run_id, "mode": mode, "rounds": outcome.rounds,
@@ -434,6 +565,11 @@ class KernelLoop:
         called: set[str] = set()
 
         while True:
+            # ── 安全点（US-407）──────────────────────
+            # 中止请求只在这里被看见，因此「按了停止之后最多还会再跑一轮」。
+            # 放在 ``max_steps`` 之前：既然要停，就先停，而不是先报一个步数超限。
+            if store.cancel_requested():
+                raise _CancelRequested()
             if outcome.rounds >= max_steps:
                 raise LoopLimitError(
                     f"已达步数上限 {max_steps} 轮仍未收敛（mode={mode}；"
@@ -453,43 +589,88 @@ class KernelLoop:
             calls = list(response.tool_calls or [])
             self._write_assistant(store, response)
 
+            #: 本轮调过的工具名，只用于记台账（``called`` 会在收口后被清空）
+            used: list[str] = []
+            #: ``react`` 模式下「模型停止调工具」就是终止条件，这里记一下而不是
+            #: 就地 ``break`` —— 最后一轮也必须留下检查点与步数，否则台账里
+            #: 的最后一轮永远缺一条，而「少的那条」恰好是决定「跑完了没有」的那条。
+            finished = False
+
             if not calls:
                 if mutable is None:
-                    if response.text.strip():
-                        break
-                    # 既没调工具也没说话，再问一次只会得到同样的空答复
-                    raise KernelError(
-                        "模型既未调用工具也未给出答复，循环无法推进", code="AGENT-LOOP-002",
-                    )
-                self._close_step(store, mutable, step, called, outcome)
-                called = set()
-                continue
-
-            prepared = self._execute_batch(
-                session, run=run, store=store, calls=calls, spec=spec,
-                parallel=self.parallel and not deterministic,
-            )
-            for item in prepared:
-                outcome.tool_calls += 1
-                if item.status == "rejected":
-                    outcome.rejected += 1
-                called.add(item.call.name)
-                # 回填与落库**按调用序**：乱序会让模型的因果推断错位 ——
-                # 它看到结果 2 在结果 1 前面，只能假设调用顺序与自己发起的顺序不同，
-                # 于是开始重排自己的推理步骤来「解释」这个顺序。
-                self._write_tool_result(store, item)
-                store.record_tool_call(item)
-
-            exceeded = self._bump_strikes(prepared, strikes)
-            if exceeded is not None:
-                if mutable is not None:
-                    mutable.fail_current()
-                    store.save_plan(mutable.plan)
-                raise StepFailureError(
-                    f"{exceeded.call.name}(args={exceeded.key[1]}) 连续 {SELF_HEAL_LIMIT} 次"
-                    f"失败，已终止该步转人工。最后一次错误：{exceeded.error}"
+                    if not response.text.strip():
+                        # 既没调工具也没说话，再问一次只会得到同样的空答复
+                        raise KernelError(
+                            "模型既未调用工具也未给出答复，循环无法推进",
+                            code="AGENT-LOOP-002",
+                        )
+                    finished = True
+                else:
+                    self._close_step(store, mutable, step, called, outcome)
+                    called = set()
+            else:
+                prepared = self._execute_batch(
+                    session, run=run, store=store, calls=calls, spec=spec,
+                    parallel=self.parallel and not deterministic,
                 )
+                for item in prepared:
+                    outcome.tool_calls += 1
+                    if item.status == "rejected":
+                        outcome.rejected += 1
+                    called.add(item.call.name)
+                    used.append(item.call.name)
+                    # 回填与落库**按调用序**：乱序会让模型的因果推断错位 ——
+                    # 它看到结果 2 在结果 1 前面，只能假设调用顺序与自己发起的顺序不同，
+                    # 于是开始重排自己的推理步骤来「解释」这个顺序。
+                    self._write_tool_result(store, item)
+                    store.record_tool_call(item)
+
+                exceeded = self._bump_strikes(prepared, strikes)
+                if exceeded is not None:
+                    if mutable is not None:
+                        mutable.fail_current()
+                        store.save_plan(mutable.plan)
+                    raise StepFailureError(
+                        f"{exceeded.call.name}(args={exceeded.key[1]}) 连续 {SELF_HEAL_LIMIT} 次"
+                        f"失败，已终止该步转人工。最后一次错误：{exceeded.error}"
+                    )
+
+            self._settle_round(
+                store, run=run, mutable=mutable, outcome=outcome, mode=mode,
+                step=step, used=used, strikes=strikes,
+            )
+            if finished:
+                break
         return outcome
+
+    def _settle_round(
+        self,
+        store: KernelStore,
+        *,
+        run: KernelRun,
+        mutable: _MutablePlan | None,
+        outcome: LoopOutcome,
+        mode: str,
+        step: PlanStep | None,
+        used: Sequence[str],
+        strikes: dict[tuple[str, str], int],
+    ) -> None:
+        """一轮收尾：先记一步账，再落一条检查点。
+
+        顺序不能反。``mark_step`` 会推 ``agent_runs.steps``，而 ``agent_steps``
+        预算闸门读的就是它 —— 先落检查点再记步，会让「因步数熔断而暂停」的那条
+        检查点里的步数比实际少一，续跑时对不上。
+        """
+        store.mark_step("kernel_round", {
+            "round": outcome.rounds, "mode": mode,
+            "step_id": step.id if step is not None else None,
+            "tools": list(used),
+        })
+        self._checkpoint(
+            store, run=run, mutable=mutable, outcome=outcome, mode=mode,
+            status=kernel_checkpoints.RUNNING, strikes=strikes,
+            reason=f"第 {outcome.rounds} 轮已结算",
+        )
 
     def _close_step(
         self,
@@ -859,6 +1040,59 @@ class KernelLoop:
     def _write_tool_result(store: KernelStore, item: CallOutcome) -> None:
         store.append("tool", item.content, tool_call_id=item.call.id or None)
 
+    # ── 检查点（US-407）──────────────────────────
+
+    @staticmethod
+    def _build_checkpoint(
+        *,
+        run: KernelRun,
+        mutable: _MutablePlan | None,
+        outcome: LoopOutcome,
+        mode: str,
+        status: str,
+        strikes: dict[tuple[str, str], int],
+        reason: str = "",
+    ) -> kernel_checkpoints.Checkpoint:
+        """拼一条检查点，**不落库**。
+
+        与 ``_checkpoint`` 分开，是因为暂停路径要把**没落库的那一份**交给 store：
+        由它补上「为什么停」（审批单号、熔断种类）后落库。在这里先落一次的话，
+        同一次暂停会留下两条检查点，而「最近一条」到底指哪条就成了个运气问题。
+        """
+        plan = mutable.plan if mutable is not None else None
+        # 续跑点从计划现算（``make_snapshot`` 内部也会算一遍），这里只是要它的序号 ——
+        # 序号是给人读的，定位用的是 id。
+        resume_at = kernel_checkpoints.next_step_id(plan)
+        return kernel_checkpoints.Checkpoint(
+            conversation_id=run.conversation_id,
+            plan_id=outcome.plan_id,
+            step_index=kernel_checkpoints.step_index_of(plan, resume_at),
+            status=status,
+            snapshot=kernel_checkpoints.make_snapshot(
+                plan, mode=mode, rounds=outcome.rounds,
+                steps_done=outcome.steps_done, skipped_steps=outcome.skipped_steps,
+                tool_calls=outcome.tool_calls, strikes=strikes, reason=reason,
+            ),
+        )
+
+    def _checkpoint(
+        self,
+        store: KernelStore,
+        *,
+        run: KernelRun,
+        mutable: _MutablePlan | None,
+        outcome: LoopOutcome,
+        mode: str,
+        status: str,
+        strikes: dict[tuple[str, str], int],
+        reason: str = "",
+    ) -> None:
+        """拼一条检查点并落库（``run()`` / 每轮收尾走这条路）。"""
+        store.save_checkpoint(self._build_checkpoint(
+            run=run, mutable=mutable, outcome=outcome, mode=mode,
+            status=status, strikes=strikes, reason=reason,
+        ))
+
 
 # ── 计划游标 ────────────────────────────────────
 
@@ -870,9 +1104,24 @@ class _MutablePlan:
     「批准即冻结」失效，检查点也就指不回当时那份计划了。
     """
 
-    def __init__(self, plan: Plan) -> None:
+    def __init__(self, plan: Plan, start_at: str | None = None) -> None:
         self.plan = plan
         self._index = 0
+        # 续跑（US-407）：直接落到检查点记的那一步上。
+        # ⚠️ 按 ``PlanStep.id`` 找，**不按下标** —— 计划中间插了一步的话，
+        # 下标会让游标停在另一步上，而循环不会报错，它会一本正经地把错的那一步跑完。
+        # 找不到就退回从头扫：计划确实变过，而 ``current_step`` 会跳过已完成的部分，
+        # 结果仍然是对的 —— 这里不该因为一个陈旧的标识把整个会话卡死。
+        if start_at:
+            for position, step in enumerate(plan.steps):
+                if step.id == start_at:
+                    self._index = position
+                    break
+            else:
+                logger.warning(
+                    "plan_resume_step_missing", step_id=start_at,
+                    steps=[s.id for s in plan.steps],
+                )
 
     def current_step(self) -> PlanStep | None:
         """第一个未完成（且未失败）的步骤；顺带把它标成 ``running``。"""

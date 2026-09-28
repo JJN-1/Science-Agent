@@ -27,14 +27,17 @@ logger = get_logger("jobs.runner")
 
 #: 暂停原因（``job.paused`` 事件的 ``reason``）。前端按它决定弹哪种审批卡。
 PAUSE_BUDGET = "budget"
+#: 人按了停止（US-407）。它与 ``failed`` 的区别是**可以接着跑** ——
+#: 界面上必须说成「已中止」，说成失败的话用户的第一反应是重来一遍。
+PAUSE_CANCELLED = "cancelled"
 #: run 是 paused、但名下找不到待批单时的兜底值。
 #: 宁可显示一个「不知道」，也不要默认成 ``budget`` —— 猜错的话用户会去加预算，
 #: 而真正该做的是去翻一眼审批单。
 PAUSE_UNKNOWN = "unknown"
 
 
-def _pause_reason(session: Session, run_id: int | None, status: str) -> str:
-    """这次暂停是为了什么 —— 从**该 run 名下**那张待批单的 ``kind`` 反推。
+def _pause_reason(session: Session, job_id: int, run_id: int | None, status: str) -> str:
+    """这次暂停是为了什么 —— 先看**该 run 名下**那张待批单的 ``kind``。
 
     US-406 之后暂停有两种（预算熔断、危险操作待批），而这里的 ``reason`` 曾是写死的
     ``"budget"``。不修的话，「等你批准执行这条命令」在界面上会显示成「预算熔断」：
@@ -42,13 +45,25 @@ def _pause_reason(session: Session, run_id: int | None, status: str) -> str:
 
     按 ``run_id`` 而不是 ``project_id`` 查：同一个项目随时可能挂着好几张单子，
     按项目查会答错「**这次**暂停是为了什么」。
+
+    US-407 之后多了第三种：**人按了停止**。它没有待批单（中止是人的指令，
+    没有什么要再批一遍的），所以查不到单子时要去作业自己的取消标记上找答案 ——
+    否则「已中止」会显示成 ``unknown``，而用户看到的会是一个不知所谓的暂停。
+
+    ⚠️ 读标记必须走 ``jobs_dao.cancel_requested``（列查询），**不能**用
+    ``jobs_dao.get(...).cancel_requested``：本函数的 session 就是执行作业那个，
+    它早在开跑时就把这行装进了身份映射，而 session 是 ``expire_on_commit=False`` ——
+    于是条件永远为假，reason 恒为 ``unknown``。这是与循环读信箱同一处、同一天
+    在真机上暴露出来的第二个缺口。
     """
     if status != "paused" or run_id is None:
         return ""
     kinds = {row.kind for row in approvals_dao.list_for_run(session, run_id, "pending")}
-    if not kinds:
-        return PAUSE_UNKNOWN
-    return kinds.pop() if len(kinds) == 1 else "+".join(sorted(kinds))
+    if kinds:
+        return kinds.pop() if len(kinds) == 1 else "+".join(sorted(kinds))
+    if jobs_dao.cancel_requested(session, job_id):
+        return PAUSE_CANCELLED
+    return PAUSE_UNKNOWN
 
 
 
@@ -170,6 +185,32 @@ class JobRunner:
         logger.info("job_cancelled", job_id=job_id)
         return True
 
+    def request_stop(self, job_id: int) -> bool:
+        """请求中止**正在执行**的会话作业（US-407）：置协作式取消标记，返回是否受理。
+
+        与 ``cancel`` 的分工是刻意的，两者服务的时刻完全不同：
+
+        - ``cancel``：作业**还没开跑**（还在队列里）—— 摘掉即可，效果是「当没发生过」
+        - ``request_stop``：作业**正在跑** —— 只能置标记，让循环在下一个安全点自己停
+
+        只认 ``kind=chat``：阶段作业跑在 ``Orchestrator`` 里，那条路径上没有安全点，
+        置了标记永远没人看。**「受理了但永远不会有反应」比直接拒绝更坏** ——
+        用户以为停了，实际上它还在跑。
+
+        这里**不打断线程、也不改作业状态**：循环读到标记后会自己收尾，把 ``agent_runs``
+        推到 ``paused``，作业随之为 ``job.paused``（``reason=cancelled``）。
+        用户看到的是「已中止，可以继续」，而不是「失败」。
+        """
+        with self._session_factory() as session:
+            job = jobs_dao.get(session, job_id)
+            if job is None or jobs_dao.is_terminal(job):
+                return False
+            if job.kind != "chat" or job.status != "running":
+                return False
+            jobs_dao.request_cancel(session, job_id)
+        logger.info("job_stop_requested", job_id=job_id)
+        return True
+
     def pending_count(self) -> int:
         return self._queue.qsize()
 
@@ -261,7 +302,7 @@ class JobRunner:
                                     project_id=project_id, stage_id=stage_id)
                 return
             self._settle_succeeded(session, job_id, status, run_id,
-                                   reason=_pause_reason(session, run_id, status))
+                                   reason=_pause_reason(session, job_id, run_id, status))
 
     def process_pending_once(self) -> int | None:
         """同步跑掉队列里的下一个作业，返回 job_id（无待办返回 None）。

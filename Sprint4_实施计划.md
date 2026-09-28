@@ -321,7 +321,7 @@ class ToolSpec:
 | 4 | `feat(US-404)` 工具注册表 | ✅ 已完成 | 回归 **366 passed**（+58）；新增 `test_tool_registry.py` / `test_agent_specs.py` / `test_tools_api.py` / DAO 三例；**变异检查 4/4 转红**（`tmp/mutation_us404.py`）；`tmp/migration_safety.py` 与 `tmp/smoke_sprint4.py`（真实 config.yaml + 真实库副本，脚本已加 US-404 段） |
 | 5 | `feat(US-405)` 内核循环 | ✅ 已完成 | 回归 **407 passed**（+41）；`test_kernel_loop.py` 33 条（不碰数据库：`KernelStore` 协议 + 假件，逐条断言 `tool_choice` 强制、并行峰值、按调用序回填、`(tool, args_hash)` 计数）；**变异检查 4/4 转红**（`tmp/mutation_us405.py`，含未变异对照组自检）；`tmp/migration_safety.py` 新增「新增列」核对（16 张老表 193 行一字不差 / 4 张新表 / `messages.tool_calls` 列齐备 / 幂等）；`tmp/smoke_sprint4.py` 加 US-405 段（真实库副本上跑通 react 与 plan_execute 两条路） |
 | 6 | `feat(US-406)` 权限与沙箱 | ✅ 已完成 | 回归 **500 passed**（US-405 末 407，+93）；新增 `test_permissions.py`(19) / `test_sandbox.py`(25+1skip) / `test_fs_tools.py`(37) / `test_approval_flow.py`(10)；**变异检查 11/11 转红**（`tmp/mutation_us406.py`，含未变异对照组自检）；`tmp/smoke_sprint4.py` 新增 US-406 段（真实 config + 真实库副本：`GET /api/sandbox` 两张清单 / 6 个沙箱工具与权限徽标 / 文件工具写→读哈希一致、越界拦成 `AGENT-SANDBOX-001` / 危险操作整轮挂起→审批单→批准→命令真执行）；`config/default.yaml` 加 `sandbox:` 段；**无新迁移**（head 仍是 `a7d3f8c21b64`） |
-| 7 | `feat(US-407)` 执行控制 | ☐ | — |
+| 7 | `feat(US-407)` 执行控制 | ✅ 已完成 | 回归 **528 passed, 1 skipped**（US-406 末 500，+28）；新增 `test_checkpoints.py` 27 条（纯函数判定 / 循环+真库 / HTTP 端到端三层）；**变异检查 9/9 转红**（`tmp/mutation_us407.py`，含未变异对照组自检与还原 sha256 复核）；`tmp/smoke_sprint4.py` 新增 US-407 段（真实 config + 真实库副本 + **真实作业通道**：预算熔断→暂停→批准追加额度→恢复；`POST /cancel` 受理 202 → `job.paused`(reason=cancelled) → `/resume` 续跑）；`tmp/migration_safety.py`（新表 `kernel_checkpoints` 逐表核对、新增列 `jobs.cancel_requested` 齐备、16 张老表 193 行一字不差、重跑幂等）；migration 8（head → `c3f9a2d47e18`）；**真机上暴露并修掉两处「读不到别人写的标记」**（见下方第 7 步说明） |
 | 8 | `feat` 前端会话界面 | ☐ | — |
 | 9 | `test(US-408)` 内核冒烟 | ☐ | — |
 
@@ -448,6 +448,39 @@ class ToolSpec:
   没有目录参数**，硬给它造一个只会变成没人读的字段。等真正的沙箱执行类工具（有目录语义的
   `execute`）落地时，`scope_arg` 一填即生效，判定逻辑不必改
 
+**第 7 步的五处契约选择**（后续步骤不要改）：
+
+- ⚠️ **跨线程写的标记必须用列查询读，不能用 `session.get`**（两处：循环读信箱
+  `jobs_dao.cancel_requested`、作业层反推暂停原因 `JobRunner._pause_reason`）。
+  `session.get` 先命中身份映射，而本项目**所有** session 都是
+  `expire_on_commit=False`（`store/db.py` 就写死的），那个对象提交后不失效 ——
+  于是「另一个线程写下的 `cancel_requested=True`」被同一个 id 的旧对象挡在外面，
+  循环永远读到 `False`。表现是**用户按了停止、界面一直「正在停止」、作业自己跑到底**；
+  第二处的表现是暂停原因退化成 `unknown`。
+  ⚠️ 单测此前**抓不到它**：那些用例都在**同一个 session** 里写和读，恰好从这条路旁边绕过去。
+  已补两条跨 session 的回归测试（`test_the_cancel_mailbox_is_read_across_sessions`、
+  `test_a_cancel_from_another_session_actually_halts_the_loop`）+ 两条对应变异。
+  **通则：任何「A 线程写、B 线程读」的列，读取端都不许走身份映射**
+- ⚠️ **中止是「暂停」，不是失败**；且**循环每轮都要 `mark_step`**。在 US-407 之前会话路径
+  **一步都不记**，`BudgetManager` 的 `agent_steps` 闸门在会话里形同虚设：同一个 Agent
+  走阶段作业会被限步、走聊天不受限，而且**没有任何地方看得出异常**（冒烟里它是靠
+  「本该暂停却一口气跑完」暴露的）。三条暂停出路（预算熔断 / 待批 / 人被中止）都要把计划
+  放回 `approved`：留在 `executing` 会让重规划接口被 `has_running_plan` 永远挡住
+- ⚠️ **续跑是「新的一次运行」，不是「接着上一次的运行」**：新 `agent_runs` 行、
+  `max_steps` 配额随之重置（会话级累计上限由 `agent_steps` 预算承担），
+  且 `/resume` **不追加用户消息** —— 上下文里已是完整现场，塞一句「继续」会让模型当成新指令
+  重新规划一遍。受理前先判一次（不能续就当场 409 并说明原因，而不是受理之后让作业转几圈再挂），
+  真正开跑时**再判一次**（从受理到执行之间隔着一条队列）
+- ⚠️ **`POST /cancel` 受理 ≠ 已停**：运行中的会话作业返回 `202 + stop_requested`，
+  由循环在下一个安全点自己收尾成 `job.paused`；**运行中的阶段作业仍然 409** ——
+  那条路径上没有安全点，受理一个永远不会生效的请求比直接拒绝更坏。
+  ⚠️ **`jobs.cancel_requested` 刻意不清除**：它身兼两职（循环的信箱 + 事后判「这次暂停是不是
+  因为中止」的凭据，`_pause_reason` 在循环返回**之后**才跑），清掉它「已中止」会退化成 `unknown`；
+  留着无副作用，因为续跑走的是**新的一行作业**
+- ⚠️ **`kernel_checkpoints` 与 `stage_checkpoints` 是两张表**（设计 §6.4 的
+  `stage_checkpoints` 归编排层、粒度是「哪个阶段」，内核这张归会话、粒度是「哪个计划步骤」）。
+  定位一律靠 `PlanStep.id`，**不靠下标** —— `step_index` 只给人读与「单调不减」的断言用
+
 
 ## 依赖与约束
 
@@ -464,8 +497,8 @@ class ToolSpec:
 | 1 | 3 工具 × ≥5 步真实任务跑通 | `scripts/kernel_walkthrough.py` + 输出存档 | ☐ |
 | 2 | 全程流式可见 | 上述脚本收集的 `job_events` 序列（含 `tool.call`/`tool.result`） | ☐ |
 | 3 | 危险操作可批准 | `run_command` 触发审批 → 批准 → 继续执行的事件留证 | ✅ US-406：`tmp/smoke_sprint4.py` 在真实 config + 真实库副本上跑通整条链（挂起时零副作用 / `job.paused` 的 reason=dangerous / 审批单 kind=dangerous / 批准后命令真执行且 `tool_calls.approval_id` 记着是谁批的 / `dangerous` 不留记忆）；`test_approval_flow.py::test_full_chain_from_suspension_to_a_real_execution` 跨四层不打桩 |
-| 4 | 预算超限可暂停并恢复 | 复用 S3 的预算熔断路径 + 内核循环下的等价用例 | ⚠️ 内核侧用例已就位（`test_budget_exceeded_pauses_instead_of_failing`、`test_budget_pause_returns_the_plan_to_approved`）；US-406 顺带修掉「会话路径的预算暂停被错误地当成阶段重跑」的恢复通路；端到端续跑走第 7 步 |
-| 5 | 中断可恢复 | 取消 → 从 `kernel_checkpoints` 续跑，步骤序号连续 | ☐ |
+| 4 | 预算超限可暂停并恢复 | 复用 S3 的预算熔断路径 + 内核循环下的等价用例 | ✅ US-407：`tmp/smoke_sprint4.py` 在**真实库副本 + 真实作业通道**上跑通整条链 —— 把会话内核的 `budget_steps` 压到 1，三步的计划跑到第 2 轮撞 `agent_steps` → `job.paused`(reason=budget) / 检查点 `running,running,paused`(序号 1,2,2) / 计划回 `approved` → 走真实审批接口批准追加额度 → 恢复跑完 b2、b3（序号 2,3,3,3，只增不减）。单测侧 `test_budget_exhaustion_pauses_and_can_be_resumed` 走**真的** `BudgetManager`（闸门读 `agent_runs.steps`，只有内核的 `mark_step` 推得动它，写假件等于没验） |
+| 5 | 中断可恢复 | 取消 → 从 `kernel_checkpoints` 续跑，步骤序号连续 | ✅ US-407：`POST /api/jobs/{id}/cancel` 受理为 202（受理 ≠ 已停）→ 循环在下一个安全点停、落 `cancelled` 检查点、`job.paused`(reason=cancelled) → `POST /api/conversations/{id}/resume` 返回 202 且 `resume_from=s2` → 计划收口；检查点序号 `1,2,2 → 2,3,3,3` **只增不减、从不回到 1**，且续跑后「三步各答一次」（3 条 assistant 消息）证明第 1 步没被重做 —— 重做在界面上只表现为「跑得有点久」，不会有任何报错。`tmp/smoke_sprint4.py` 与 `test_full_chain_cancel_then_resume_over_http` 各覆盖一次（前者走真实作业线程 + 真实 HTTP，后者跨内核/库/HTTP/作业通道四层不打桩） |
 | 6 | `GET /api/tools` 返回全部工具及权限等级 | 接口快照 | ✅ US-406：7 个工具（`run_pipeline` + 6 个沙箱工具）各带 `permission` 与 `allowed_agents`；同一份清单另由 `GET /api/sandbox` 给出沙箱的 `enforced` / `not_implemented` 边界。界面上的权限徽标与执行时判定同源（都读运行中的注册表） |
 | 7 | `deterministic` 模式可用 | **同一输入连跑两次，计划与步骤序列逐项相等**（第 9 步落成 golden case，见下方说明） | ☐ |
 | 8 | 上下游不得在界面上混淆「模型声称」与「系统执行」 | 前端 `note` 与 `tool.call` 分卡渲染的截图（D12） | ☐ |
@@ -485,3 +518,4 @@ golden case 就落在第 7 条上——**同一输入跑两次，`task_plans.ste
 | **`tools` 协议层改动波及既有调用路径**（US-409） | 新字段一律**可选**（`None` 表示不带工具），既有 `ctx.llm()` 调用点零改动；`degrade._request_with` 的字段同步补一条**独立单测**，防止再次静默丢字段 |
 | 进度落后（51 SP 偏大） | 裁剪顺序：**先砍并行调用 → 再砍上下文摘要化**；`deterministic` **不在裁剪序列内**（G2 第 7 条依赖它）。**工具调用协议层 + 工具注册表 + 调用循环 + 权限闸门必须保住** |
 | 内核做完但不知质量如何 | 第 7 条升级为 golden case；阶段二 S5 起补「压缩存活」与「真实工具链」两类探针（本次评估列出的两项长期缺口） |
+| ⚠️ **协作式取消的「受理」本身会撞 SQLite 写锁**（US-407 真机上发现） | worker 的写事务从「记模型用量」起一直开到本轮收口提交（`_settle_round` 的检查点），中间还夹着一整段工具执行 —— 这段窗口内另一个连接写 `jobs.cancel_requested` 会拿到 `database is locked`（等满 `busy_timeout` 后 500）。**常见时机（等模型回答）不在窗口内**，所以不阻塞验收。预案：把「写标记」做成短 `busy_timeout` + 退避重试并给出可读的 503；根治是让循环在工具执行前先提交（那是事务边界的改动，与「一遍一遍提交会不会留下半截现场」一起评估），或换掉 SQLite |

@@ -77,6 +77,42 @@ def is_terminal(job: Job | None) -> bool:
     return job is not None and job.status in JOB_TERMINAL_STATUSES
 
 
+def request_cancel(session: Session, job_id: int) -> Job | None:
+    """置协作式取消标记（US-407）。**不改作业状态**。
+
+    只写标记、不动状态，是因为「已请求取消」与「已经取消」是两件事：请求之后作业
+    还在跑（要在下一个安全点才停），把它当场写成 failed/paused 就会出现
+    「台账说停了、线程还在写」的错乱 —— 那正是原先拒绝取消运行中作业的理由。
+    状态由干活的那一方在真正停下时自己写（``_settle_succeeded``）。
+
+    **必须有独立的 ``commit``**：循环在**另一条线程**里用**另一个 session** 读这个标记，
+    不提交的话它永远读不到（与 US-405「消息必须先 commit 再入队」同一条约定）。
+    """
+    job = session.get(Job, job_id)
+    if job is None:
+        return None
+    job.cancel_requested = True
+    session.commit()
+    return job
+
+
+def cancel_requested(session: Session, job_id: int | None) -> bool:
+    """读取消标记。``job_id`` 为 ``None``（单测里的无作业运行）→ 恒为 False。
+
+    ⚠️ 必须是**列查询**，不能用 ``session.get(Job, …)``。标记由**另一个线程的另一个
+    session** 写下（``JobRunner.request_stop`` 在 HTTP 线程，循环在工作线程），而
+    ``session.get`` 会先命中身份映射：本项目所有 session 都是
+    ``expire_on_commit=False``，那个对象提交后**不会失效**，于是这里永远读到当初那份
+    ``cancel_requested=False``。表现是「按了停止，循环看不见」——用户看着「正在停止」，
+    作业却一路跑到底。单测抓不到它，是因为那些用例都在**同一个 session** 里写和读，
+    恰好从这条路的旁边绕了过去。
+    """
+    if job_id is None:
+        return False
+    # 只 SELECT 一列：不构造实体、不查身份映射，读到的就是库里的现值。
+    return bool(session.scalar(select(Job.cancel_requested).where(Job.id == job_id)))
+
+
 # ── 事件 ────────────────────────────────────────
 
 def next_seq(session: Session, job_id: int) -> int:

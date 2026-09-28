@@ -166,6 +166,22 @@ class MessageAccepted(BaseModel):
     job_id: int | None = None
 
 
+class ResumeAccepted(BaseModel):
+    """续跑回执（US-407）。
+
+    刻意**不复用** ``MessageAccepted``：续跑不产生任何消息，硬塞进同一个模型只能
+    要么给个 ``None``（类型上撒谎）、要么造一条假消息（审计上撒谎）。
+    而 ``resume_from`` 要说清楚「从哪一步接着跑」—— 用户点了「继续」之后最需要知道的
+    就是这件事，判断系统有没有接错地方全看它。
+    """
+
+    job_id: int
+    #: 续跑点（``PlanStep.id``）；``react`` 模式下没有计划，故可空
+    resume_from: str | None = None
+    #: 为什么判成「可以续」或「不可以续」——文案直接来自 ``decide_resume``
+    reason: str = ""
+
+
 class ConversationDetailOut(ConversationOut):
     messages: list[MessageOut] = []
     total_tokens: int = 0

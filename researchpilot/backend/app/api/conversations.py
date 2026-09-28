@@ -15,7 +15,9 @@ from app.api.schemas import (
     MessageAccepted,
     MessageCreate,
     MessageOut,
+    ResumeAccepted,
 )
+from app.orchestration.kernel_store import resume_decision
 from app.store.dao import conversations as conversations_dao
 from app.store.dao import messages as messages_dao
 from app.store.dao import projects as projects_dao
@@ -150,6 +152,50 @@ def append_message(
         params={"conversation_id": conversation_id},
     )
     return MessageAccepted(message=accepted, job_id=job.id)
+
+
+@router.post(
+    "/api/conversations/{conversation_id}/resume",
+    response_model=ResumeAccepted,
+    status_code=202,
+)
+def resume_conversation(
+    conversation_id: int,
+    request: Request,
+    session: Session = Depends(get_session),
+):
+    """从最近的检查点继续跑这个会话（US-407）。
+
+    **不追加用户消息**：续跑是「接着上次的地方跑」，不是「再说一句」。往上下文里塞一条
+    「继续」只会让模型以为来了个新指令，进而重新规划一遍 —— 而用户要的是把剩下那几步
+    做完。上下文里已经有完整的现场（计划、消息、工具结果），够它接着跑了。
+
+    **受理之前先判一次**「能不能续」：不能续的当场把原因说清楚（409），而不是受理之后
+    让作业转几圈再挂掉 —— 那时原因只藏在作业事件里，用户得自己翻。
+    真正开跑时**会再判一次**：从受理到执行之间隔着一条队列，这期间计划可能又被推进过。
+
+    续跑是一次**新的运行**（新的 ``agent_runs`` 行），所以 ``max_steps`` 配额随之重置。
+    会话级的累计上限由 ``agent_steps`` 预算承担。
+    """
+    conversation = conversations_dao.get(session, conversation_id)
+    if conversation is None:
+        raise HTTPException(status_code=404, detail="会话不存在")
+
+    decision = resume_decision(session, conversation_id)
+    if not decision.resumable:
+        raise HTTPException(status_code=409, detail=decision.reason)
+
+    job_runner = getattr(request.app.state, "job_runner", None)
+    if job_runner is None:
+        raise HTTPException(status_code=503, detail="内核未装配，无法续跑")
+
+    job = job_runner.submit(
+        session, project_id=conversation.project_id, kind="chat",
+        params={"conversation_id": conversation_id, "resume": True},
+    )
+    return ResumeAccepted(
+        job_id=job.id, resume_from=decision.start_step_id, reason=decision.reason,
+    )
 
 
 @router.get(

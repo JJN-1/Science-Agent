@@ -18,6 +18,7 @@ from typing import Any
 
 import pytest
 
+from app.agent_kernel import checkpoints as kernel_checkpoints
 from app.agent_kernel import context as kernel_context
 from app.agent_kernel import loop as kernel_loop
 from app.agent_kernel import planner
@@ -49,7 +50,7 @@ RUN = KernelRun(
 class FakeStore:
     """内存版 ``KernelStore``。记下每一次写入，供逐条断言。"""
 
-    def __init__(self, history=None, plan=None) -> None:
+    def __init__(self, history=None, plan=None, cancel=False) -> None:
         self.messages = list(history or [kernel_context.ContextMessage("user", "开工")])
         self._plan = plan
         self.events: list[tuple[str, dict]] = []
@@ -58,11 +59,20 @@ class FakeStore:
         self.run_status: list[tuple[str, str | None]] = []
         self.saved_plans: list[planner.Plan] = []
         self.paused: tuple[BudgetExceeded, float] | None = None
+        self.approvals: list[Any] = []
         #: 已生效的审批记忆键（US-406）。默认空 —— 也就是「什么都没批过」，
         #: 这正是权限测试最想要的那个初值。
         self.grants: set[str] = set()
-        #: 因需人工批准而挂起的那些（US-406）
-        self.approvals: list[Any] = []
+        #: 落下的内核检查点（US-407），按写入顺序
+        self.checkpoints: list[kernel_checkpoints.Checkpoint] = []
+        #: 记下的步（``agent_steps``，US-407）
+        self.steps: list[tuple[str, dict]] = []
+        #: 什么时候开始「有人按了停止」（US-407）。``0`` = 第一次询问就返回 True，
+        #: 用来断言「循环确实在安全点上读过这个信箱」而不是碰巧跑完了。
+        self.cancel_after: int | None = 0 if cancel else None
+        self.cancel_checks = 0
+        #: 因应人请求中止而暂停的次数（US-407）
+        self.cancels: list[kernel_checkpoints.Checkpoint] = []
 
     def history(self):
         return list(self.messages)
@@ -92,14 +102,32 @@ class FakeStore:
     def emit(self, event_type, payload):
         self.events.append((event_type, payload))
 
-    def pause_for_budget(self, exc, *, suggested_grant):
+    def pause_for_budget(self, exc, *, suggested_grant, checkpoint):
         self.paused = (exc, suggested_grant)
+        self.checkpoints.append(checkpoint)
 
     def approval_grants(self):
         return set(self.grants)
 
-    def pause_for_approval(self, exc):
+    def pause_for_approval(self, exc, *, checkpoint):
         self.approvals.append(exc)
+        self.checkpoints.append(checkpoint)
+
+    def pause_for_cancel(self, *, checkpoint):
+        self.cancels.append(checkpoint)
+        self.checkpoints.append(checkpoint)
+
+    def save_checkpoint(self, checkpoint):
+        self.checkpoints.append(checkpoint)
+
+    def mark_step(self, kind, content):
+        self.steps.append((kind, content))
+
+    def cancel_requested(self):
+        self.cancel_checks += 1
+        if self.cancel_after is None:
+            return False
+        return self.cancel_checks > self.cancel_after
 
     # 断言辅助
     def event_types(self) -> list[str]:
@@ -107,6 +135,9 @@ class FakeStore:
 
     def payloads(self, event_type: str) -> list[dict]:
         return [p for t, p in self.events if t == event_type]
+
+    def checkpoint_statuses(self) -> list[str]:
+        return [c.status for c in self.checkpoints]
 
 
 class FakeBudget:

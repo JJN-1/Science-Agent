@@ -5,7 +5,7 @@ import json
 import time
 from collections.abc import AsyncIterator
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Request
+from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session, sessionmaker
 from starlette.concurrency import run_in_threadpool
@@ -162,18 +162,37 @@ async def stream_job(
 
 
 @router.post("/api/jobs/{job_id}/cancel")
-def cancel_job(job_id: int, request: Request, session: Session = Depends(get_session)) -> dict:
+def cancel_job(
+    job_id: int,
+    request: Request,
+    response: Response,
+    session: Session = Depends(get_session),
+) -> dict:
+    """中止一个作业（US-407 起有两条路）。
+
+    - **还在排队**：直接摘掉并落 ``failed``（原有语义）—— 效果是「当它没来过」
+    - **正在执行且是会话（``kind=chat``）作业**：置协作式取消标记并返回 ``202``，
+      让内核在**下一个安全点**自己收尾。响应说的是「已受理中止请求」，
+      而**不是**「已经停了」：线程还在跑，此刻就落终态会留下
+      「线程还在写、台账已判死」的错乱状态。作业稍后变成 ``job.paused``（``reason=cancelled``）。
+
+    正在执行的**阶段作业**仍然 409：那条路径上没有安全点，置了标记也没人看 ——
+    受理一个永远不会生效的请求，比直接拒绝更坏。
+    """
     job = jobs_dao.get(session, job_id)
     if job is None:
         raise HTTPException(status_code=404, detail="作业不存在")
     if jobs_dao.is_terminal(job):
         raise HTTPException(status_code=409, detail=f"作业已结束（{job.status}）")
     runner = request.app.state.job_runner
-    if not runner.cancel(job_id):
-        # 正在执行中的作业不会被硬打断：同步编排跑在工作线程里，
-        # 强行取消只会留下「线程还在写、台账已判死」的错乱状态。
-        raise HTTPException(status_code=409, detail="作业正在执行，无法取消")
-    return {"job_id": job_id, "status": "failed", "cancelled": True}
+    if runner.cancel(job_id):
+        return {"job_id": job_id, "status": "failed", "cancelled": True}
+    if runner.request_stop(job_id):
+        response.status_code = 202
+        return {"job_id": job_id, "status": "stopping", "stop_requested": True}
+    # 正在执行中的阶段作业不会被硬打断：同步编排跑在工作线程里，
+    # 强行取消只会留下「线程还在写、台账已判死」的错乱状态。
+    raise HTTPException(status_code=409, detail="作业正在执行，无法取消")
 
 
 @router.get("/api/projects/{project_id}/jobs", response_model=list[JobOut])
