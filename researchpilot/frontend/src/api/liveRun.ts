@@ -1,4 +1,4 @@
-import type { AgentRun, AgentStep, JobStreamEvent } from './types'
+import type { AgentRun, AgentStep, JobStreamEvent, PlanStep } from './types'
 
 /**
  * 流内实时缓冲（US-304 §5）。
@@ -22,6 +22,60 @@ export interface LiveRun {
   startedAt: string
   /** 流降级为轮询时置位，界面据此说明「为什么不再实时了」。 */
   degraded: boolean
+  // ── 会话内核事件（US-405/406）：同样只做「看得见」，落库以重拉为准 ──
+  /** ``plan.updated`` 投影的计划；与数据库 TaskPlan 的 steps 形状一致。 */
+  plan: LivePlan | null
+  /** ``tool.call`` / ``tool.result`` 按 ``call_id`` 配对后的调用卡。 */
+  toolCalls: LiveToolCall[]
+  /** ``approval.required`` 投影的待批准卡（落库后由 approvals 表接手）。 */
+  approval: LiveApproval | null
+  /** ``assistant.delta`` 的当前草稿（每轮整段替换；收尾由重拉接管）。 */
+  assistantDraft: LiveAssistant | null
+  /** ``job.paused`` 的原因：budget / cancelled / tool_permission。 */
+  pauseReason: string | null
+}
+
+export interface LivePlan {
+  planId: number
+  mode: string
+  status: string
+  steps: PlanStep[]
+  /** ``plan.updated`` 不带标题/依据：实时卡显示占位标题，落库卡才有全文 */
+  title?: string
+  rationale?: string
+}
+
+export interface LiveToolCall {
+  callId: string
+  tool: string
+  args: Record<string, unknown>
+  permission: string
+  /** null = 还在执行（只收到 tool.call，没等到 tool.result） */
+  ok: boolean | null
+  status: string
+  durationMs: number | null
+  error: string | null
+  resultPreview: string | null
+  truncated: boolean
+}
+
+export interface LiveApproval {
+  approvalId: number
+  reason: string
+  pending: {
+    call_id: string
+    tool: string
+    args: Record<string, unknown>
+    permission: string
+    reason: string
+    needs_approval: boolean
+  }[]
+}
+
+export interface LiveAssistant {
+  text: string
+  provider: string
+  model: string
 }
 
 export function newLiveRun(jobId: number, stageId: string, agentId = ''): LiveRun {
@@ -35,6 +89,11 @@ export function newLiveRun(jobId: number, stageId: string, agentId = ''): LiveRu
     error: null,
     startedAt: new Date().toISOString(),
     degraded: false,
+    plan: null,
+    toolCalls: [],
+    approval: null,
+    assistantDraft: null,
+    pauseReason: null,
   }
 }
 
@@ -122,6 +181,33 @@ function withoutPending(steps: AgentStep[]): AgentStep[] {
   return steps.filter((s) => s.kind !== 'llm_pending')
 }
 
+// ── 会话内核事件（US-405/406）────────────────────
+
+function planOf(payload: Record<string, unknown>, fallback: LivePlan | null): LivePlan {
+  const steps = Array.isArray(payload.steps) ? (payload.steps as PlanStep[]) : []
+  return {
+    planId: typeof payload.plan_id === 'number' ? payload.plan_id : (fallback?.planId ?? -1),
+    mode: typeof payload.mode === 'string' ? payload.mode : (fallback?.mode ?? ''),
+    status: typeof payload.status === 'string' ? payload.status : (fallback?.status ?? ''),
+    steps,
+  }
+}
+
+function upsertToolCall(calls: LiveToolCall[], next: LiveToolCall): LiveToolCall[] {
+  const idx = calls.findIndex((c) => c.callId === next.callId)
+  if (idx === -1) return [...calls, next]
+  const merged = { ...calls[idx], ...next, args: next.args ?? calls[idx].args }
+  return [...calls.slice(0, idx), merged, ...calls.slice(idx + 1)]
+}
+
+/**
+ * 终态前的收尾：摘掉等待占位、丢掉草稿。计划的最终状态、工具结果、
+ * 助手消息都会由收尾重拉从数据库接手，缓冲里留着只会出现两份。
+ */
+function withTerminalShape(live: LiveRun): LiveRun {
+  return { ...live, steps: withoutPending(live.steps), assistantDraft: null }
+}
+
 /** 把一帧事件叠进实时缓冲。纯函数，便于单测与在 StrictMode 下重放。 */
 export function reduceLiveRun(live: LiveRun, event: JobStreamEvent): LiveRunResult {
   const payload = event.payload ?? {}
@@ -170,24 +256,104 @@ export function reduceLiveRun(live: LiveRun, event: JobStreamEvent): LiveRunResu
         done: false,
       }
     }
-    case 'stage.paused':
-      return { live, done: false } // 紧随其后的 job.paused 才是终态
+    case 'plan.updated':
+      return { live: { ...live, plan: planOf(payload, live.plan) }, done: false }
+    case 'tool.call': {
+      const callId = String(payload.call_id ?? '')
+      if (!callId) return { live, done: false }
+      const next: LiveToolCall = {
+        callId,
+        tool: String(payload.tool ?? ''),
+        args:
+          typeof payload.args === 'object' && payload.args !== null
+            ? (payload.args as Record<string, unknown>)
+            : {},
+        permission: String(payload.permission ?? ''),
+        ok: null,
+        status: 'running',
+        durationMs: null,
+        error: null,
+        resultPreview: null,
+        truncated: false,
+      }
+      return { live: { ...live, toolCalls: upsertToolCall(live.toolCalls, next) }, done: false }
+    }
+    case 'tool.result': {
+      const callId = String(payload.call_id ?? '')
+      if (!callId) return { live, done: false }
+      const existing = live.toolCalls.find((c) => c.callId === callId)
+      // 只收到 tool.result 而没见过对应 tool.call（订阅晚了、帧丢了）也照常成卡：
+      // 结果本身是完整的，args 之类补不上就留空，总比整张卡消失好。
+      const next: LiveToolCall = {
+        callId,
+        tool: String(payload.tool ?? existing?.tool ?? ''),
+        args: existing?.args ?? {},
+        permission: existing?.permission ?? '',
+        ok: payload.ok === true,
+        status: String(payload.status ?? ''),
+        durationMs: typeof payload.duration_ms === 'number' ? payload.duration_ms : null,
+        error: typeof payload.error === 'string' ? payload.error : null,
+        resultPreview:
+          typeof payload.result_preview === 'string' ? payload.result_preview : null,
+        truncated: payload.truncated === true,
+      }
+      return { live: { ...live, toolCalls: upsertToolCall(live.toolCalls, next) }, done: false }
+    }
+    case 'assistant.delta':
+      return {
+        live: {
+          ...live,
+          assistantDraft: {
+            text: String(payload.text ?? ''),
+            provider: String(payload.provider ?? ''),
+            model: String(payload.model ?? ''),
+          },
+        },
+        done: false,
+      }
+    case 'approval.required':
+      return {
+        live: {
+          ...live,
+          approval: {
+            approvalId: typeof payload.approval_id === 'number' ? payload.approval_id : -1,
+            reason: String(payload.reason ?? ''),
+            pending: Array.isArray(payload.pending)
+              ? (payload.pending as LiveApproval['pending'])
+              : [],
+          },
+        },
+        done: false,
+      }
+    case 'stage.paused': {
+      // 会话作业的暂停事件带 reason（budget / cancelled / tool_permission），
+      // 先记下来：紧随其后的 job.paused 里没有这个字段。
+      return {
+        live: {
+          ...live,
+          pauseReason: typeof payload.reason === 'string' ? payload.reason : live.pauseReason,
+        },
+        done: false,
+      }
+    }
     case 'stage.failed':
       return {
-        live: { ...live, steps: withoutPending(live.steps), error: String(payload.error ?? '阶段失败') },
+        live: { ...withTerminalShape(live), error: String(payload.error ?? '阶段失败') },
         done: false,
       }
     case 'job.succeeded':
       return {
-        live: { ...live, steps: withoutPending(live.steps), runId: runIdOf(payload, live.runId) },
+        live: {
+          ...withTerminalShape(live),
+          runId: runIdOf(payload, live.runId),
+        },
         done: true,
       }
     case 'job.paused':
       return {
         live: {
-          ...live,
+          ...withTerminalShape(live),
           status: 'paused',
-          steps: withoutPending(live.steps),
           runId: runIdOf(payload, live.runId),
         },
         done: true,
@@ -195,10 +361,9 @@ export function reduceLiveRun(live: LiveRun, event: JobStreamEvent): LiveRunResu
     case 'job.failed':
       return {
         live: {
-          ...live,
+          ...withTerminalShape(live),
           status: 'failed',
           error: String(payload.error ?? '作业失败'),
-          steps: withoutPending(live.steps),
           runId: runIdOf(payload, live.runId),
         },
         done: true,
@@ -206,10 +371,9 @@ export function reduceLiveRun(live: LiveRun, event: JobStreamEvent): LiveRunResu
     case 'job.not_found':
       return {
         live: {
-          ...live,
+          ...withTerminalShape(live),
           status: 'failed',
           error: String(payload.error ?? '作业不存在'),
-          steps: withoutPending(live.steps),
         },
         done: true,
       }

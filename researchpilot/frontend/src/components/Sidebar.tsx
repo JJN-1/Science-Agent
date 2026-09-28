@@ -1,15 +1,24 @@
 import { useCallback, useEffect, useState } from 'react'
 import { Link, useNavigate, useParams } from 'react-router-dom'
-import { App as AntdApp, Form, Input, Modal, Select } from 'antd'
+import { App as AntdApp, Form, Input, Modal, Select, Tooltip } from 'antd'
 import { api, ApiError } from '../api/client'
-import type { Project } from '../api/types'
+import type { Project, ToolInfo } from '../api/types'
+import { money } from './UsagePanel'
 import SettingsDialog from './SettingsDialog'
+
+const PERMISSION_LABEL: Record<string, string> = {
+  read: '只读',
+  execute: '执行',
+  dangerous: '危险',
+}
 
 export default function Sidebar() {
   const { message } = AntdApp.useApp()
   const { id } = useParams()
   const navigate = useNavigate()
   const [projects, setProjects] = useState<Project[]>([])
+  const [tools, setTools] = useState<ToolInfo[]>([])
+  const [cost, setCost] = useState<{ total: number; calls: number } | null>(null)
   const [open, setOpen] = useState(false)
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [form] = Form.useForm()
@@ -25,6 +34,29 @@ export default function Sidebar() {
   useEffect(() => {
     void load()
   }, [load, id])
+
+  // 工具清单与累计成本是全局资产，挂载一次即可；失败静默（侧栏不是报错的地方）
+  useEffect(() => {
+    let alive = true
+    const loadSide = async () => {
+      try {
+        const list = await api.listTools()
+        if (alive) setTools(list)
+      } catch {
+        // 注册表未装配（503）等：侧栏留空即可
+      }
+      try {
+        const summary = await api.usageSummary('provider')
+        if (alive) setCost({ total: summary.total_cost, calls: summary.total_calls })
+      } catch {
+        // 同上
+      }
+    }
+    void loadSide()
+    return () => {
+      alive = false
+    }
+  }, [])
 
   const handleCreate = async () => {
     const values = await form.validateFields()
@@ -57,6 +89,31 @@ export default function Sidebar() {
           <span className="title">（还没有项目）</span>
         </div>
       )}
+
+      {/* ── US-404：内核工具清单（数据源是运行中的注册表） ── */}
+      {tools.length > 0 && (
+        <>
+          <div className="side-label">tools · {tools.length}</div>
+          {tools.map((t) => (
+            <Tooltip
+              key={t.name}
+              title={`${t.description}（可调用：${t.allowed_agents.join('、') || '无'}）`}
+              placement="right"
+            >
+              <div className="side-item side-tool" style={{ cursor: 'default' }}>
+                <span className={`perm p-${t.permission}`}>{PERMISSION_LABEL[t.permission] ?? t.permission}</span>
+                <span className="title">{t.name}</span>
+              </div>
+            </Tooltip>
+          ))}
+        </>
+      )}
+      {cost !== null && (
+        <div className="side-cost">
+          累计 {money(cost.total)} · {cost.calls} 次调用
+        </div>
+      )}
+
       <div className="side-foot">
         <button
           className="btn"

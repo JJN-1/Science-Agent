@@ -176,6 +176,90 @@ export interface TierRoute {
   model: string
 }
 
+// ── US-401/402：会话与消息 ─────────────────────────
+
+export interface Conversation {
+  id: number
+  project_id: number
+  title: string
+  status: 'active' | 'archived' | string
+  created_at: string
+  updated_at: string
+}
+
+export interface Message {
+  id: number
+  conversation_id: number
+  role: 'user' | 'assistant' | 'tool' | string
+  content: string
+  /** role=tool 时指向发起调用的那条 assistant 消息的 tool_calls[].id */
+  tool_call_id: string | null
+  /** 本地估算值，仅供展示；真实用量在 llm_usage（刻意两个数） */
+  tokens: number
+  created_at: string
+  /**
+   * role=assistant 时模型提出的调用（扁平形状 ``{id, name, arguments}``，
+   * 与 ``ai.base.ToolCall.to_dict()`` 一致）。终端态重拉时要靠它配对 tool 消息。
+   */
+  tool_calls: { id: string; name: string; arguments: string }[] | null
+}
+
+export interface ConversationDetail extends Conversation {
+  messages: Message[]
+  total_tokens: number
+}
+
+/** 追加消息回执（D14）：202 只换值不动形状。 */
+export interface MessageAccepted {
+  message: Message
+  job_id: number | null
+}
+
+// ── US-403：任务计划 ──────────────────────────────
+
+/** 计划步骤状态机：pending → running → done / skipped；整计划另有 draft → approved → executing → done */
+export type PlanStepStatus = 'pending' | 'running' | 'done' | 'skipped' | 'failed' | string
+
+export interface PlanStep {
+  /** 稳定标识而非序号 —— 检查点靠它定位「从哪一步继续」，编辑时原样带回 */
+  id: string
+  title: string
+  intent: string
+  tool: string | null
+  params: Record<string, unknown>
+  status: PlanStepStatus
+}
+
+export interface TaskPlan {
+  id: number
+  conversation_id: number
+  version: number
+  status: 'draft' | 'approved' | 'executing' | 'done' | 'failed' | string
+  mode: 'plan_execute' | 'react' | string
+  deterministic: boolean
+  seed: number | null
+  title: string
+  rationale: string
+  steps: PlanStep[]
+  created_at: string
+  updated_at: string
+}
+
+// ── US-404：工具清单 ──────────────────────────────
+
+export interface ToolInfo {
+  name: string
+  description: string
+  /** 给模型看的 JSON Schema，前端只用来展示参数名 */
+  parameters: Record<string, unknown>
+  permission: 'read' | 'execute' | 'dangerous' | string
+  idempotent: boolean
+  timeout_s: number
+  result_max_bytes: number
+  /** 由 AgentSpec 反查：白名单是调用方的属性，不是工具自报 */
+  allowed_agents: string[]
+}
+
 // ── US-304：异步作业与事件流 ──────────────────────
 
 /** 作业状态机：queued → running → succeeded / failed / paused */

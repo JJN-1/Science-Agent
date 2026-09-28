@@ -2,10 +2,14 @@ import type {
   AgentRun,
   Approval,
   BlackboardItem,
+  Conversation,
+  ConversationDetail,
   Decision,
   Job,
   JobEvent,
   JobStreamEvent,
+  MessageAccepted,
+  PlanStep,
   ProbeResult,
   Project,
   ProviderHealth,
@@ -13,7 +17,9 @@ import type {
   ProviderTypes,
   RunDetail,
   StageInfo,
+  TaskPlan,
   TierRoute,
+  ToolInfo,
   UsageDim,
   UsageSummary,
 } from './types'
@@ -99,6 +105,46 @@ export const api = {
       `/conversations/${conversationId}/resume`,
       { method: 'POST' },
     ),
+  // ── Sprint 4：会话内核（US-401/402）──
+  listConversations: (projectId: number) =>
+    request<Conversation[]>(`/projects/${projectId}/conversations`),
+  createConversation: (projectId: number, title = '') =>
+    request<Conversation>('/conversations', {
+      method: 'POST',
+      body: JSON.stringify({ project_id: projectId, title }),
+    }),
+  /** 详情默认带回最近 200 条消息，Sprint 4 规模下够用。 */
+  getConversation: (conversationId: number) =>
+    request<ConversationDetail>(`/conversations/${conversationId}`),
+  /**
+   * 追加一条用户消息并受理一次内核运行（D14）：202 只承诺「已受理」，
+   * ``job_id`` 是 ``kind=chat`` 作业的真实 id —— 拿到它才能去订事件流。
+   */
+  sendMessage: (conversationId: number, content: string) =>
+    request<MessageAccepted>(`/conversations/${conversationId}/messages`, {
+      method: 'POST',
+      body: JSON.stringify({ content, role: 'user' }),
+    }),
+  // ── Sprint 4：任务计划（US-403）──
+  listTaskPlans: (conversationId: number) =>
+    request<TaskPlan[]>(`/conversations/${conversationId}/task-plans`),
+  /**
+   * 人工修改与批准共用一个入口：改内容（steps/title/rationale）只允许 draft
+   * 且 version 加一；``status: 'approved'`` 批准即冻结。steps 里省略 status
+   * 的步骤沿用既有状态 —— 编辑永远不会顺手把进度抹掉。
+   */
+  updateTaskPlan: (
+    planId: number,
+    data: {
+      steps?: Omit<PlanStep, 'status'>[] | PlanStep[]
+      title?: string
+      rationale?: string
+      status?: 'approved'
+    },
+  ) => request<TaskPlan>(`/task-plans/${planId}`, { method: 'PATCH', body: JSON.stringify(data) }),
+  // ── Sprint 4：工具与沙箱（US-404/406）──
+  listTools: () => request<ToolInfo[]>('/tools'),
+  getSandbox: () => request<{ enforced: string[]; not_implemented: string[] }>('/sandbox'),
   listRuns: (projectId: number) => request<AgentRun[]>(`/projects/${projectId}/runs`),
   getRun: (runId: number) => request<RunDetail>(`/runs/${runId}`),
   getBlackboard: (projectId: number) =>
@@ -114,11 +160,20 @@ export const api = {
     ),
   listApprovals: (projectId: number, status = 'pending') =>
     request<Approval[]>(`/approvals?project_id=${projectId}&status=${status}`),
+  /**
+   * 审批决定（US-206/406）。批准 ``dangerous`` / 会话预算单时会**派一个新 chat 作业**
+   * 恢复执行 —— 回执里的 ``job_id`` 就是它，调用方应立刻去订流；``resume_error``
+   * 非空说明批准生效了但恢复失败（如实展示，不吞）。
+   */
   decideApproval: (approvalId: number, action: 'approve' | 'reject') =>
-    request<{ approval_id: number; status: string; new_run_id?: number | null }>(
-      `/approvals/${approvalId}/${action}`,
-      { method: 'POST', body: JSON.stringify({ note: '' }) },
-    ),
+    request<{
+      approval_id: number
+      status: string
+      new_run_id?: number | null
+      job_id?: number
+      granted?: string[]
+      resume_error?: string
+    }>(`/approvals/${approvalId}/${action}`, { method: 'POST', body: JSON.stringify({ note: '' }) }),
   getProviders: () => request<ProviderHealth[]>('/settings/providers'),
   createProvider: (data: ProviderInput) =>
     request<{ provider: string; config: ProviderInput }>('/settings/providers', {

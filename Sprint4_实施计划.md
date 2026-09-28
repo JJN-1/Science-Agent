@@ -322,7 +322,7 @@ class ToolSpec:
 | 5 | `feat(US-405)` 内核循环 | ✅ 已完成 | 回归 **407 passed**（+41）；`test_kernel_loop.py` 33 条（不碰数据库：`KernelStore` 协议 + 假件，逐条断言 `tool_choice` 强制、并行峰值、按调用序回填、`(tool, args_hash)` 计数）；**变异检查 4/4 转红**（`tmp/mutation_us405.py`，含未变异对照组自检）；`tmp/migration_safety.py` 新增「新增列」核对（16 张老表 193 行一字不差 / 4 张新表 / `messages.tool_calls` 列齐备 / 幂等）；`tmp/smoke_sprint4.py` 加 US-405 段（真实库副本上跑通 react 与 plan_execute 两条路） |
 | 6 | `feat(US-406)` 权限与沙箱 | ✅ 已完成 | 回归 **500 passed**（US-405 末 407，+93）；新增 `test_permissions.py`(19) / `test_sandbox.py`(25+1skip) / `test_fs_tools.py`(37) / `test_approval_flow.py`(10)；**变异检查 11/11 转红**（`tmp/mutation_us406.py`，含未变异对照组自检）；`tmp/smoke_sprint4.py` 新增 US-406 段（真实 config + 真实库副本：`GET /api/sandbox` 两张清单 / 6 个沙箱工具与权限徽标 / 文件工具写→读哈希一致、越界拦成 `AGENT-SANDBOX-001` / 危险操作整轮挂起→审批单→批准→命令真执行）；`config/default.yaml` 加 `sandbox:` 段；**无新迁移**（head 仍是 `a7d3f8c21b64`） |
 | 7 | `feat(US-407)` 执行控制 | ✅ 已完成 | 回归 **528 passed, 1 skipped**（US-406 末 500，+28）；新增 `test_checkpoints.py` 27 条（纯函数判定 / 循环+真库 / HTTP 端到端三层）；**变异检查 9/9 转红**（`tmp/mutation_us407.py`，含未变异对照组自检与还原 sha256 复核）；`tmp/smoke_sprint4.py` 新增 US-407 段（真实 config + 真实库副本 + **真实作业通道**：预算熔断→暂停→批准追加额度→恢复；`POST /cancel` 受理 202 → `job.paused`(reason=cancelled) → `/resume` 续跑）；`tmp/migration_safety.py`（新表 `kernel_checkpoints` 逐表核对、新增列 `jobs.cancel_requested` 齐备、16 张老表 193 行一字不差、重跑幂等）；migration 8（head → `c3f9a2d47e18`）；**真机上暴露并修掉两处「读不到别人写的标记」**（见下方第 7 步说明） |
-| 8 | `feat` 前端会话界面 | ☐ | — |
+| 8 | `feat` 前端会话界面 | ✅ 已完成 | `tsc -b` + `vite build` + oxlint 0 错误（9 条既有警告）；后端回归 529 passed 不受影响；**真机留证**（vite dev + FastAPI + Edge 截图，`tmp/ui_*.png`）：会话创建/自动命名/发送 202/订流/失败对账全链路、`run_pipeline` execute 档首次执行→批准卡→批准→新 chat 作业恢复→工具卡完成态、计划卡 draft→批准冻结（`AGENT-PLAN-003` 如实转述 D7 拒绝）、侧栏工具清单 7 项带权限徽标 + 累计成本；**测试用 mock tool_script 与 plan 档临时改动已全部还原**（`tmp/patch_config_mock_script.py` / `restore_config.py` / `restore_plan_seed.py` 留证） |
 | 9 | `test(US-408)` 内核冒烟 | ☐ | — |
 
 **第 1 步的两处契约选择**（后续步骤不要改）：
@@ -501,7 +501,7 @@ class ToolSpec:
 | 5 | 中断可恢复 | 取消 → 从 `kernel_checkpoints` 续跑，步骤序号连续 | ✅ US-407：`POST /api/jobs/{id}/cancel` 受理为 202（受理 ≠ 已停）→ 循环在下一个安全点停、落 `cancelled` 检查点、`job.paused`(reason=cancelled) → `POST /api/conversations/{id}/resume` 返回 202 且 `resume_from=s2` → 计划收口；检查点序号 `1,2,2 → 2,3,3,3` **只增不减、从不回到 1**，且续跑后「三步各答一次」（3 条 assistant 消息）证明第 1 步没被重做 —— 重做在界面上只表现为「跑得有点久」，不会有任何报错。`tmp/smoke_sprint4.py` 与 `test_full_chain_cancel_then_resume_over_http` 各覆盖一次（前者走真实作业线程 + 真实 HTTP，后者跨内核/库/HTTP/作业通道四层不打桩） |
 | 6 | `GET /api/tools` 返回全部工具及权限等级 | 接口快照 | ✅ US-406：7 个工具（`run_pipeline` + 6 个沙箱工具）各带 `permission` 与 `allowed_agents`；同一份清单另由 `GET /api/sandbox` 给出沙箱的 `enforced` / `not_implemented` 边界。界面上的权限徽标与执行时判定同源（都读运行中的注册表） |
 | 7 | `deterministic` 模式可用 | **同一输入连跑两次，计划与步骤序列逐项相等**（第 9 步落成 golden case，见下方说明） | ☐ |
-| 8 | 上下游不得在界面上混淆「模型声称」与「系统执行」 | 前端 `note` 与 `tool.call` 分卡渲染的截图（D12） | ☐ |
+| 8 | 上下游不得在界面上混淆「模型声称」与「系统执行」 | 前端 `note` 与 `tool.call` 分卡渲染的截图（D12） | ✅ US-405 第 8 步：真机截图 `tmp/ui_approval.png`（助手消息的调用卡 `run_pipeline [执行]` 与叙述分卡、落库批准卡）与 `tmp/ui_after_approve.png`（批准恢复后工具卡完成态 + 结果折叠 + 助手文本收尾）；终态以数据库重拉为准，实时缓冲只做「看得见」 |
 
 **第 7 条的留证标准不能只是「开关存在」**（2026-09-20 加严）：设计 §12.5 要求
 「Golden Test：固定输入 + 固定断言；`temperature=0`；关键字段完全匹配」。内核层面的第一个
