@@ -43,6 +43,45 @@ def project_dir(policy, tmp_path) -> Path:
     return policy.ensure_project_dir(7)
 
 
+def make_dir_link(target: Path, link: Path) -> str | None:
+    """在 ``link`` 处造一个**真的**指向 ``target`` 的目录链接；造不出来返回 ``None``。
+
+    ⚠️ 为什么不能只用 ``os.symlink``（2026-09-29 实测教训）：
+
+    本机（Windows）``os.symlink(target, link, target_is_directory=True)`` 会**返回成功**，
+    但 ``lstat`` 显示它是个**普通空目录**（``S_ISDIR``，不是 ``S_ISLNK``）—— 静默退化。
+    于是「符号链接逃逸」这条用例变成**假场景**：根本没有链接，`resolve_within` 看到的是
+    沙箱内的合法路径，放行完全正确，而用例却要求它抛异常 —— 必然红，且红得像
+    「沙箱漏了」。它还会偶尔 skip（symlink 真抛 ``OSError`` 时），于是表现为**偶发失败**。
+
+    所以判据不是「symlink 没抛错」，而是**链接真的成立**：``realpath`` 必须展开到目标。
+    symlink 不成时退到 ``mklink /J``（目录联接，Windows 上不需要特权，同样是真重解析点），
+    它同样要过 ``realpath`` 校验。两条都不过 = 本机没有可用的构造手段，调用方 skip。
+    """
+    try:
+        os.symlink(target, link, target_is_directory=True)
+        if os.path.islink(link) and os.path.realpath(link) == os.path.realpath(target):
+            return "symlink"
+    except (OSError, NotImplementedError):
+        pass
+
+    if os.name == "nt" and not link.exists():
+        import subprocess
+
+        subprocess.run(["cmd", "/c", "mklink", "/J", str(link), str(target)],
+                       capture_output=True, text=True, errors="replace")
+        if link.exists() and os.path.realpath(link) == os.path.realpath(target):
+            return "junction"
+
+    if link.exists() and not os.path.islink(link):
+        # 退化成普通目录要清掉，免得污染同一个用例里的后续断言
+        try:
+            link.rmdir()
+        except OSError:
+            pass
+    return None
+
+
 # ── 越界：三种真实逃逸都要拦住 ──────────────────
 
 def test_resolves_a_plain_relative_path_inside_the_project(policy, project_dir):
@@ -87,18 +126,31 @@ def test_another_projects_directory_is_out_of_bounds(policy, project_dir):
 
 
 def test_symlink_escape_is_caught_after_resolution(policy, project_dir, tmp_path):
-    """符号链接逃逸：字符串里一个 ``..`` 都没有，只有 resolve 之后才看得出越界。"""
+    """符号链接逃逸：字符串里一个 ``..`` 都没有，只有 resolve 之后才看得出越界。
+
+    构造用 ``make_dir_link``（真链接或目录联接），并且**先自证场景成立**：
+    通过链接真的能读到沙箱外的文件。少了这一步，本机那种「symlink 静默退化成 mkdir」
+    会把用例变成「要求闸门拦住一个沙箱内路径」——失败现象看起来像沙箱漏了，
+    实际是测试没造出场景。
+    """
     outside = tmp_path / "outside"
     outside.mkdir()
     (outside / "secret.txt").write_text("机密", encoding="utf-8")
     link = project_dir / "link"
-    try:
-        os.symlink(outside, link, target_is_directory=True)
-    except (OSError, NotImplementedError):  # Windows 需要开发者模式或管理员
-        pytest.skip("当前环境不允许创建符号链接")
+    how = make_dir_link(outside, link)
+    if how is None:
+        pytest.skip("本机既建不出符号链接也建不出目录联接，无法构造这个场景")
+
+    # 自证：这个链接**真的**通到外面（否则下面那条断言就只是在要求闸门犯错）
+    assert (link / "secret.txt").read_text(encoding="utf-8") == "机密", (
+        f"{how} 建出来了却读不到外面的文件 —— 场景不成立，用例的断言会失真"
+    )
 
     with pytest.raises(SandboxViolation):
         resolve_within(policy, 7, "link/secret.txt")
+    # 链接目录本身也在界外
+    with pytest.raises(SandboxViolation):
+        resolve_within(policy, 7, "link")
 
 
 def test_empty_path_is_rejected(policy):
