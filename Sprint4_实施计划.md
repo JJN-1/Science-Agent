@@ -323,7 +323,7 @@ class ToolSpec:
 | 6 | `feat(US-406)` 权限与沙箱 | ✅ 已完成 | 回归 **500 passed**（US-405 末 407，+93）；新增 `test_permissions.py`(19) / `test_sandbox.py`(25+1skip) / `test_fs_tools.py`(37) / `test_approval_flow.py`(10)；**变异检查 11/11 转红**（`tmp/mutation_us406.py`，含未变异对照组自检）；`tmp/smoke_sprint4.py` 新增 US-406 段（真实 config + 真实库副本：`GET /api/sandbox` 两张清单 / 6 个沙箱工具与权限徽标 / 文件工具写→读哈希一致、越界拦成 `AGENT-SANDBOX-001` / 危险操作整轮挂起→审批单→批准→命令真执行）；`config/default.yaml` 加 `sandbox:` 段；**无新迁移**（head 仍是 `a7d3f8c21b64`） |
 | 7 | `feat(US-407)` 执行控制 | ✅ 已完成 | 回归 **528 passed, 1 skipped**（US-406 末 500，+28）；新增 `test_checkpoints.py` 27 条（纯函数判定 / 循环+真库 / HTTP 端到端三层）；**变异检查 9/9 转红**（`tmp/mutation_us407.py`，含未变异对照组自检与还原 sha256 复核）；`tmp/smoke_sprint4.py` 新增 US-407 段（真实 config + 真实库副本 + **真实作业通道**：预算熔断→暂停→批准追加额度→恢复；`POST /cancel` 受理 202 → `job.paused`(reason=cancelled) → `/resume` 续跑）；`tmp/migration_safety.py`（新表 `kernel_checkpoints` 逐表核对、新增列 `jobs.cancel_requested` 齐备、16 张老表 193 行一字不差、重跑幂等）；migration 8（head → `c3f9a2d47e18`）；**真机上暴露并修掉两处「读不到别人写的标记」**（见下方第 7 步说明） |
 | 8 | `feat` 前端会话界面 | ✅ 已完成 | `tsc -b` + `vite build` + oxlint 0 错误（9 条既有警告）；后端回归 529 passed 不受影响；**真机留证**（vite dev + FastAPI + Edge 截图，`tmp/ui_*.png`）：会话创建/自动命名/发送 202/订流/失败对账全链路、`run_pipeline` execute 档首次执行→批准卡→批准→新 chat 作业恢复→工具卡完成态、计划卡 draft→批准冻结（`AGENT-PLAN-003` 如实转述 D7 拒绝）、侧栏工具清单 7 项带权限徽标 + 累计成本；**测试用 mock tool_script 与 plan 档临时改动已全部还原**（`tmp/patch_config_mock_script.py` / `restore_config.py` / `restore_plan_seed.py` 留证） |
-| 9 | `test(US-408)` 内核冒烟 | ☐ | — |
+| 9 | `test(US-408)` 内核冒烟 | ✅ 已完成 | 新增 `researchpilot/scripts/kernel_walkthrough.py`（**自带临时数据目录 + 真 uvicorn + 真 HTTP/SSE**，一条命令跑完 **41 项检查全过**；存档 `tmp/kernel_walkthrough_events.json` 23.7 KB / 28 帧 / 40 条检查明细）；新增 `tests/test_kernel_golden.py` **4 条**（计划器逐项相等 / deterministic 送 `temperature=0.0` / **非确定性不许是 0.0** / 两个独立项目跑同一脚本 → 工具调用序列 + 事件序列 + **产物 sha256** + 助手消息四项逐项相等）；**变异检查 4/4 转红**（`tmp/mutation_us408.py`：温度恒为默认 / seed 随机 / `write_file` 不建父目录 / 助手消息带时间戳，含未变异对照组自检与还原 sha256 复核）；回归 **532 passed, 1 skipped**（第 8 步末 529，+4 条 golden，另一条此前的 skip 本轮实际执行）；`ruff check` 全绿（含新脚本） |
 
 **第 1 步的两处契约选择**（后续步骤不要改）：
 
@@ -494,19 +494,34 @@ class ToolSpec:
 
 | # | 条目 | 留证方式 | 状态 |
 |:--:|---|---|:--:|
-| 1 | 3 工具 × ≥5 步真实任务跑通 | `scripts/kernel_walkthrough.py` + 输出存档 | ☐ |
-| 2 | 全程流式可见 | 上述脚本收集的 `job_events` 序列（含 `tool.call`/`tool.result`） | ☐ |
+| 1 | 3 工具 × ≥5 步真实任务跑通 | `scripts/kernel_walkthrough.py` + 输出存档 | ✅ US-408：走查在**临时数据目录 + 真 uvicorn + 真 HTTP** 上跑通 3 工具 5 步任务（`list_dir` → `write_file` → `read_file` → **`run_command`** → `read_file`，权限档 read/write/dangerous 各一）；判定落在**沙箱里真有产物**上（`workspace/project-<id>/experiments/toy_result.json`，内容 `{"ok": true, "n": 42}` 与脚本写出的一致），而不是「工具返回了 ok」 |
+| 2 | 全程流式可见 | 上述脚本收集的 `job_events` 序列（含 `tool.call`/`tool.result`） | ✅ US-408：28 帧事件**带到达时刻**存档（`tmp/kernel_walkthrough_events.json`）—— 首帧 +9ms、终帧 +264ms（第 1 段）与 +4ms/+510ms（第 2 段），证明是边跑边到而非结束后回放；序号 `1..N` 无缺口、每条 `tool.call` 都先于它自己的 `tool.result`、末帧是终态事件；**跨「暂停 → 批准 → 恢复」两次作业（job 1 paused + job 2 succeeded）拼成一条完整任务序列** |
 | 3 | 危险操作可批准 | `run_command` 触发审批 → 批准 → 继续执行的事件留证 | ✅ US-406：`tmp/smoke_sprint4.py` 在真实 config + 真实库副本上跑通整条链（挂起时零副作用 / `job.paused` 的 reason=dangerous / 审批单 kind=dangerous / 批准后命令真执行且 `tool_calls.approval_id` 记着是谁批的 / `dangerous` 不留记忆）；`test_approval_flow.py::test_full_chain_from_suspension_to_a_real_execution` 跨四层不打桩 |
 | 4 | 预算超限可暂停并恢复 | 复用 S3 的预算熔断路径 + 内核循环下的等价用例 | ✅ US-407：`tmp/smoke_sprint4.py` 在**真实库副本 + 真实作业通道**上跑通整条链 —— 把会话内核的 `budget_steps` 压到 1，三步的计划跑到第 2 轮撞 `agent_steps` → `job.paused`(reason=budget) / 检查点 `running,running,paused`(序号 1,2,2) / 计划回 `approved` → 走真实审批接口批准追加额度 → 恢复跑完 b2、b3（序号 2,3,3,3，只增不减）。单测侧 `test_budget_exhaustion_pauses_and_can_be_resumed` 走**真的** `BudgetManager`（闸门读 `agent_runs.steps`，只有内核的 `mark_step` 推得动它，写假件等于没验） |
 | 5 | 中断可恢复 | 取消 → 从 `kernel_checkpoints` 续跑，步骤序号连续 | ✅ US-407：`POST /api/jobs/{id}/cancel` 受理为 202（受理 ≠ 已停）→ 循环在下一个安全点停、落 `cancelled` 检查点、`job.paused`(reason=cancelled) → `POST /api/conversations/{id}/resume` 返回 202 且 `resume_from=s2` → 计划收口；检查点序号 `1,2,2 → 2,3,3,3` **只增不减、从不回到 1**，且续跑后「三步各答一次」（3 条 assistant 消息）证明第 1 步没被重做 —— 重做在界面上只表现为「跑得有点久」，不会有任何报错。`tmp/smoke_sprint4.py` 与 `test_full_chain_cancel_then_resume_over_http` 各覆盖一次（前者走真实作业线程 + 真实 HTTP，后者跨内核/库/HTTP/作业通道四层不打桩） |
 | 6 | `GET /api/tools` 返回全部工具及权限等级 | 接口快照 | ✅ US-406：7 个工具（`run_pipeline` + 6 个沙箱工具）各带 `permission` 与 `allowed_agents`；同一份清单另由 `GET /api/sandbox` 给出沙箱的 `enforced` / `not_implemented` 边界。界面上的权限徽标与执行时判定同源（都读运行中的注册表） |
-| 7 | `deterministic` 模式可用 | **同一输入连跑两次，计划与步骤序列逐项相等**（第 9 步落成 golden case，见下方说明） | ☐ |
+| 7 | `deterministic` 模式可用 | **同一输入连跑两次，计划与步骤序列逐项相等**（第 9 步落成 golden case，见下方说明） | ✅ US-408：走查里两次确定性计划逐项相等（8 步 / seed=0 / plan_execute），两次内核运行的事件序列 **23 项逐项相等**、`tool_calls` 序列逐项相等；`tests/test_kernel_golden.py` 把它变成常驻回归（4 条：计划器相等 / deterministic 送 `temperature=0.0` / **非确定性必须不是 0.0**（否则「0.0」可能只是常量）/ 两个独立项目的调用序列 + 事件序列 + 产物 sha256 + 助手消息四项相等）。**变异 4/4 转红** —— golden 的断言是「两次相等」，对「两次一起错」不敏感，所以变异刻意只做「注入非确定性」，并额外用「非确定性温度」与「产物非空」两条护栏防单侧空转 |
 | 8 | 上下游不得在界面上混淆「模型声称」与「系统执行」 | 前端 `note` 与 `tool.call` 分卡渲染的截图（D12） | ✅ US-405 第 8 步：真机截图 `tmp/ui_approval.png`（助手消息的调用卡 `run_pipeline [执行]` 与叙述分卡、落库批准卡）与 `tmp/ui_after_approve.png`（批准恢复后工具卡完成态 + 结果折叠 + 助手文本收尾）；终态以数据库重拉为准，实时缓冲只做「看得见」 |
 
 **第 7 条的留证标准不能只是「开关存在」**（2026-09-20 加严）：设计 §12.5 要求
 「Golden Test：固定输入 + 固定断言；`temperature=0`；关键字段完全匹配」。内核层面的第一个
 golden case 就落在第 7 条上——**同一输入跑两次，`task_plans.steps` 与 `tool_calls` 序列
 逐项相等**。它同时也是 §12.5 在本项目的第一个可运行样本。
+
+### G2 结论（2026-09-29）
+
+**8/8 条 ✅**，但有一条边界必须写清楚，不能让「8/8」读成「连真实模型也验过了」：
+
+- 第 1、2 条的「真实任务」验的是**工具与作业链路的真实性** —— 真 HTTP、真作业线程、
+  真子进程执行、真文件落盘、真数据库事件；**模型侧用的是 `mock` + `tool_script`**
+  （确定性脚本，可离线复现）。
+- 换成真实模型需要在「设置 · 模型后端」里录入有效 Key：**G1-1 至今未通过**
+  （凭据 Key 是 8 字符占位、真调用 401）。补法：重录 Key 后复跑
+  `tmp/smoke_g1_real_s1.py`（阶段通道）；内核通道的**真实模型**验证只能人工跑
+  —— 走查脚本的输入是 `tool_script`（脚本化的工具调用），真实模型给不出这份脚本，
+  所以那条路是「在界面上对内核说一句话，看它自己决定调什么工具」。
+- 也就是说：**内核的「手」（工具、权限、作业、事件、确定性）已验收；
+  「脑」（真实模型）待用户的 Key。** 阶段二的 S1–S8 挂载不依赖后者，但真实任务演示需要它。
 
 ## 风险与裁剪预案
 
